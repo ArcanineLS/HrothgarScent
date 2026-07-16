@@ -530,6 +530,17 @@ public sealed class Configuration : IPluginConfiguration
   /// </summary>
   public bool RememberLastSeen { get; set; } = true;
 
+  /// <summary>
+  /// Dim a mark Hrothgar has not seen in this many days, so a record that has quietly stopped matching anybody
+  /// can be found and fixed. 0 never dims.
+  ///
+  /// 30 because that is well past "they are on holiday" and well short of "I have forgotten who this is". The
+  /// point is not to expire anything — nothing is ever deleted by time here — it is to make the one failure
+  /// marks CAN suffer visible: a rename or a world transfer silently orphans the record, and without this the
+  /// only symptom is a highlight that never appears again.
+  /// </summary>
+  public int MarkStaleDays { get; set; } = 30;
+
   // ---- History ----
 
   public bool KeepHistory { get; set; } = true;

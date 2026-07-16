@@ -336,6 +336,102 @@ public sealed class MarkStore
     // field until real time catches up. Rewriting is the cheap, self-healing answer.
     || now < last;
 
+  /// <summary>
+  /// Whether a mark has gone quiet — nothing has matched it in <see cref="Configuration.MarkStaleDays"/>.
+  ///
+  /// This is the honest answer to renames, and it is a REPORT rather than an action. A mark keyed on name and
+  /// world stops matching the moment either changes, and the only symptom is a highlight that never comes back;
+  /// nothing here can tell that apart from a player who simply stopped logging in. So it says "this one has
+  /// gone quiet" and hands the user a pencil, instead of guessing.
+  ///
+  /// Guessing is exactly what the prior art does, and its issue tracker is the case against it: the game itself
+  /// lies about names — a recording plugin swaps them for job names — so it fires rename alerts for every
+  /// player it has ever seen and writes "White Mage" into permanent history. A human confirming a rename cannot
+  /// do that.
+  ///
+  /// MEASURED FROM LastSeen ?? MarkedOn. A mark made from the friend list has never been seen at all, and
+  /// measuring a null as "1 January year 1" would make every such mark two thousand years stale the instant it
+  /// was created — dimmed on the very screen that made it. Falling back to when the user marked them reads
+  /// correctly for both: "you said to watch for this person a month ago and they have not turned up".
+  ///
+  /// The <c>&lt;= 0</c> guard is not defensive style. Without it, 0 means "stale after no days at all" — every
+  /// mark, always — which is the exact inverse of the "0 = never" the setting advertises.
+  /// </summary>
+  public static bool IsStale(MarkedPlayer mark)
+  {
+    var days = Plugin.Configuration.MarkStaleDays;
+    if (days <= 0)
+      return false;
+
+    return DateTimeOffset.Now - (mark.LastSeen ?? mark.MarkedOn) > TimeSpan.FromDays(days);
+  }
+
+  /// <summary>
+  /// Re-points a mark at who that player is now, keeping everything the user ever said about them.
+  ///
+  /// REMOVE THEN REINSERT, never mutate a key in place — which is free here only because
+  /// <see cref="MarkedPlayer"/> is immutable and the key is derived from its fields, so there is no way to
+  /// write a name without producing a new record. The prior art mutates the name on a cached instance and then
+  /// asks a sorted set to remove it: the search walks to where the NEW key belongs, finds a node placed by the
+  /// OLD one, fails, and the discarded return value means nobody notices. The stale node leaks, the re-add
+  /// inserts a duplicate, and its two indexes disagree about how many players exist — on the headline feature.
+  ///
+  /// Merges rather than overwrites if the new identity already has a mark: the user is saying these are one
+  /// person, so the flags union and the note that exists wins. Losing a note to a rename would be the one
+  /// unrecoverable outcome here, since the note is the only thing in the record nothing else could reproduce.
+  /// </summary>
+  public void Rename(WatcherKey key, string newName, uint newWorldId, string newWorldName)
+  {
+    if (string.IsNullOrWhiteSpace(newName))
+      return;
+
+    var newKey = new WatcherKey(newName, newWorldId);
+
+    lock (_gate)
+    {
+      if (!_entries.TryGetValue(key, out var mark))
+        return;
+
+      // Nothing moved. Bail before touching the dictionary rather than remove-and-reinsert the same row, which
+      // would work but would republish and dirty the file for nothing.
+      if (newKey == key)
+        return;
+
+      var moved = mark with { Name = newName, HomeWorldId = newWorldId, HomeWorldName = newWorldName };
+
+      if (_entries.TryGetValue(newKey, out var existing))
+        moved = moved with
+        {
+          Marks = existing.Marks | moved.Marks,
+          Note = existing.HasNote ? existing.Note : moved.Note,
+          Color = existing.Color ?? moved.Color,
+
+          // The earlier of the two: the user has been watching for this person since whichever came first.
+          MarkedOn = existing.MarkedOn < moved.MarkedOn ? existing.MarkedOn : moved.MarkedOn,
+
+          // The later, and the one whose zone goes with it: the freshest sighting is the true one.
+          LastSeen = Later(existing, moved)?.LastSeen,
+          LastSeenZone = Later(existing, moved)?.LastSeenZone ?? string.Empty,
+        };
+
+      _entries.Remove(key);
+      _entries[newKey] = moved;
+      Publish();
+    }
+
+    RequestFlush();
+    return;
+
+    static MarkedPlayer? Later(MarkedPlayer a, MarkedPlayer b)
+      => (a.LastSeen, b.LastSeen) switch
+      {
+        (null, null) => null,
+        (null, not null) => b,
+        (not null, null) => a,
+        var (x, y) => x >= y ? a : b,
+      };
+  }
+
   /// <summary>Forgets a player outright, whatever they were marked with. The config window's delete button.</summary>
   public void Remove(WatcherKey key)
   {

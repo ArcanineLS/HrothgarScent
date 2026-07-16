@@ -37,7 +37,30 @@ public sealed class ConfigWindow : Window
   /// window's minimum width.</summary>
   private const int RacesPerRow = 4;
 
+  /// <summary>ImGui id of the repair box. One constant, because OpenPopup and BeginPopup must agree exactly and
+  /// they sit in different methods.</summary>
+  private const string RepairPopupId = "##hrothgarscent-repair";
+
+  /// <summary>32 is the game's own character-name limit ("Firstname Lastname", 15 each plus the space); worlds
+  /// are far shorter. Bounds on a text box, not validation — WorldPalette does the validating.</summary>
+  private const int MarkNameMaxLength = 32;
+
+  private const int MarkWorldMaxLength = 32;
+
+  /// <summary>What a dimmed row means, in one place: the tooltip says it on the name, and both arms of that
+  /// tooltip need the same sentence.</summary>
+  private const string StaleHelp =
+    "Hrothgar not smell this one in a while. Maybe they stopped playing — or maybe they renamed or moved " +
+    "world, which loses the trail. Hit Renamed? to say who they are now.";
+
   private int _selectedTab;
+
+  /// <summary>Who the open repair box is about, and the two fields it is editing. Held across frames while the
+  /// popup is up; the key is what identifies the record, since the name being edited is the thing changing.</summary>
+  private WatcherKey _repairKey;
+
+  private string _repairName = string.Empty;
+  private string _repairWorld = string.Empty;
 
   public ConfigWindow()
     : base("HrothgarScent",
@@ -411,7 +434,7 @@ public sealed class ConfigWindow : Window
 
   // ---- Filters ----
 
-  private static void DrawFiltersTab()
+  private void DrawFiltersTab()
   {
     DrawHalvesSection();
     DrawWhoToShowSection();
@@ -568,7 +591,7 @@ public sealed class ConfigWindow : Window
   /// one row now, which also makes the contradiction — both at once — visible in one place instead of being a
   /// rule stated in a comment on two lists that could not see each other.
   /// </summary>
-  private static void DrawMarksSection()
+  private void DrawMarksSection()
   {
     UiTheme.SectionHeader("Marks", FontAwesomeIcon.Star);
 
@@ -591,6 +614,22 @@ public sealed class ConfigWindow : Window
       "Only for players you have marked, and only one line per person — overwritten, never a history. This is " +
       "the one thing Hrothgar writes down that you did not type, so it has its own switch. Turning it off " +
       "keeps what is already stored; use Forget to delete a person outright.");
+
+    ImGui.AlignTextToFramePadding();
+    ImGui.Text("Dim a mark unseen for:");
+    ImGui.SameLine();
+    var staleDays = Plugin.Configuration.MarkStaleDays;
+    ImGui.SetNextItemWidth(160f * ImGuiHelpers.GlobalScale);
+    if (UiTheme.SliderIntManual("##markStaleDays", ref staleDays, 0, 180))
+    {
+      Plugin.Configuration.MarkStaleDays = staleDays;
+      Plugin.Configuration.Save();
+    }
+    UiTheme.Tooltip("A mark Hrothgar has not matched in this long is dimmed, because it may have been orphaned " +
+                    "by a rename or a world transfer. Nothing is ever deleted by time. 0 never dims." +
+                    "\r\n\r\nDouble-click to type an exact value.");
+    ImGui.SameLine();
+    ImGui.Text("days");
 
     ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
 
@@ -629,6 +668,13 @@ public sealed class ConfigWindow : Window
         // ImGui ID shared between two rows makes their ticks the same tick.
         ImGui.PushID($"{mark.Name}#{mark.HomeWorldId}");
 
+        // Alpha only, never BeginDisabled: a stale row is the one row whose controls the user most needs —
+        // the pencil that fixes it is right there. Dimming says "this has gone quiet"; disabling would say
+        // "and you may not do anything about it".
+        var stale = MarkStore.IsStale(mark);
+        if (stale)
+          UiTheme.PushDimmed();
+
         ImGui.TableNextColumn();
         ImGui.AlignTextToFramePadding();
         ImGui.TextColored(mark.Color ?? Plugin.Configuration.ColorDefault, mark.FullName);
@@ -636,7 +682,11 @@ public sealed class ConfigWindow : Window
         // On the name, not in a column of its own: the table is already five wide in a 540px window, and this
         // is the answer to a question you only ask about one person at a time.
         if (mark.LastSeen is { } lastSeen)
-          UiTheme.Tooltip(ScentWindow.FormatLastSeen(lastSeen, mark.LastSeenZone));
+          UiTheme.Tooltip(stale
+            ? $"{ScentWindow.FormatLastSeen(lastSeen, mark.LastSeenZone)}\r\n\r\n" + StaleHelp
+            : ScentWindow.FormatLastSeen(lastSeen, mark.LastSeenZone));
+        else if (stale)
+          UiTheme.Tooltip($"Hrothgar never smell this one since you marked them.\r\n\r\n{StaleHelp}");
 
         ImGui.TableNextColumn();
         var focus = mark.IsFocused;
@@ -664,6 +714,27 @@ public sealed class ConfigWindow : Window
           UiTheme.Tooltip(mark.Note);
 
         ImGui.TableNextColumn();
+
+        // Popped BEFORE the buttons: the dim is a statement about the record, not about the controls that fix
+        // it, and a greyed-out Forget on a row you want gone reads as broken.
+        if (stale)
+          UiTheme.PopDimmed();
+
+        // A word, not a glyph. FontAwesomeIcon.Pencil does not exist — Dalamud ships FontAwesome 5 naming, where
+        // it is PencilAlt — and an icon button here would need its own font push and width measurement to sit
+        // level with the text button beside it. "Renamed?" also asks the question the row is posing.
+        if (ImGui.SmallButton("Renamed?"))
+        {
+          _repairKey = mark.Key;
+          _repairName = mark.Name;
+          _repairWorld = mark.HomeWorldName;
+          ImGui.OpenPopup(RepairPopupId);
+        }
+        UiTheme.Tooltip("They renamed, or moved world. Point this mark at whoever they are now.");
+
+        DrawRepairPopup(mark);
+
+        ImGui.SameLine();
         if (ImGui.SmallButton("Forget"))
           toRemove = mark.Key;
 
@@ -677,6 +748,67 @@ public sealed class ConfigWindow : Window
     // row count disagreeing with what it already told BeginTable this frame.
     if (toRemove is { } key)
       Plugin.Marks.Remove(key);
+  }
+
+  /// <summary>
+  /// The repair box: says who this mark is about now.
+  ///
+  /// Inside the row's PushID, so each row's pencil opens its own — unlike the Scent window's note editor, which
+  /// is hoisted out of its table because its anchor row can vanish from a live snapshot mid-edit. These rows
+  /// come from the store, and the store does not change under the user's own hands.
+  ///
+  /// Both halves of the key, and that is the point rather than a courtesy: a mark is (name, world), so a box
+  /// that could only fix a name would leave a world transfer orphaned forever — while cheerfully claiming to
+  /// repair renames.
+  /// </summary>
+  private void DrawRepairPopup(MarkedPlayer mark)
+  {
+    if (!ImGui.BeginPopup(RepairPopupId))
+      return;
+
+    var scale = ImGuiHelpers.GlobalScale;
+
+    ImGui.TextColored(UiTheme.AccentBlue, $"Who is {mark.FullName} now?");
+    ImGui.Separator();
+    UiTheme.TextWrappedColored(UiTheme.Muted,
+      "Hrothgar match on name and home world, so a rename or a transfer loses the trail. Tell Hrothgar the new " +
+      "one and everything you wrote comes with it.");
+    ImGui.Dummy(new Vector2(0, 4f * scale));
+
+    ImGui.SetNextItemWidth(220f * scale);
+    ImGui.InputTextWithHint("##repairName", "Name", ref _repairName, MarkNameMaxLength);
+
+    ImGui.SetNextItemWidth(220f * scale);
+    ImGui.InputTextWithHint("##repairWorld", "Home world", ref _repairWorld, MarkWorldMaxLength);
+
+    // Resolved rather than trusted: the key stores a world ID, and a name that resolves to nothing would make a
+    // mark that can never match anybody — the very failure this box exists to undo.
+    var worldId = WorldPalette.IdOf(_repairWorld);
+    var named = !string.IsNullOrWhiteSpace(_repairName);
+
+    if (!named)
+      UiTheme.TextWrappedColored(UiTheme.Warn, "Hrothgar need a name.");
+    else if (worldId is null)
+      UiTheme.TextWrappedColored(UiTheme.Warn, _repairWorld.Trim().Length == 0
+        ? "Hrothgar need a home world."
+        : $"Hrothgar not know a world called '{_repairWorld.Trim()}'.");
+
+    ImGui.Dummy(new Vector2(0, 4f * scale));
+
+    using (ImRaii.Disabled(!named || worldId is null))
+    {
+      if (ImGui.SmallButton("This is them") && worldId is { } id)
+      {
+        Plugin.Marks.Rename(_repairKey, _repairName.Trim(), id, _repairWorld.Trim());
+        ImGui.CloseCurrentPopup();
+      }
+    }
+
+    ImGui.SameLine();
+    if (ImGui.SmallButton("Cancel"))
+      ImGui.CloseCurrentPopup();
+
+    ImGui.EndPopup();
   }
 
   /// <summary>The first line of a note, for a one-line cell. A note is multi-line by design and a raw newline in

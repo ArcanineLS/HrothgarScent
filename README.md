@@ -93,6 +93,8 @@ Marks live in `marks.json`, beside your config. Manage them in **Filters → Mar
 
 Marks are matched on **name + home world**. They do **not** survive a rename or a world transfer — detecting those needs Lodestone scraping, which Hrothgar doesn't do.
 
+So instead of guessing, Hrothgar **dims** any mark it hasn't seen in a while and gives you a **Renamed?** button. Tell it who they are now and the note, colour and ticks all move across. Nothing is ever deleted by time — the dim is a question, not an expiry — and if you never see that player again, the mark stays exactly where it is.
+
 ### The one thing Hrothgar writes down that you didn't type
 
 **Last seen** — when and where Hrothgar last spotted a marked player near you. It's the one stored thing you didn't type yourself, so:
@@ -159,6 +161,7 @@ The config window (`/hscent config`) has a left icon rail: **General**, **Filter
 | Max players shown | 100 | `0` = unlimited. Truncation always keeps the **nearest**, whatever column you sorted by, so a watcher standing next to you can never be sorted off the list. |
 | Marks | Empty | Everyone you've focused, ignored, coloured or written a note about. Ignored players are hidden and never alert; ignore beats focus if a player carries both. Keyed by name + home world. See [Marks](#-marks--what-hrothgar-writes-down). |
 | Note when and where you last saw them | On | One overwritten line per marked player — never a history, never for anyone unmarked. The only thing stored that you didn't type; see [above](#the-one-thing-hrothgar-writes-down-that-you-didnt-type). |
+| Dim a mark unseen for | 30 days | Dims marks Hrothgar hasn't matched in this long, so an orphaned one can be found and fixed with **Renamed?**. Nothing is deleted by time. `0` never dims. |
 
 ### Colours
 
