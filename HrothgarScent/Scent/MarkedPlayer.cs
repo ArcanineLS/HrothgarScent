@@ -120,6 +120,24 @@ public sealed record MarkedPlayer(
   [JsonIgnore]
   public bool IsEmpty => Marks == MarkKind.None && !HasNote && Color is null;
 
+  /// <summary>
+  /// Whether this record has anything to SHOW for itself — a glyph on the row, a marker on the info bar.
+  ///
+  /// Not the same question as <see cref="IsEmpty"/>, and the gap between them is the whole reason this exists.
+  /// A record holding only a colour is deliberately kept (a colour is user-authored, and discarding it silently
+  /// would be data loss) but has nothing to draw: it is not focused, so the colour it carries renders nowhere,
+  /// and a glyph claiming otherwise would assert a mark the list itself denies.
+  ///
+  /// ONE PREDICATE, because three readers already drifted apart over it. The row glyph, the sort key and the
+  /// info bar's marker must agree exactly or a readout will say a thing the list beside it does not — and the
+  /// info bar is the one the user cannot cross-check, because it is on screen when the window is shut.
+  ///
+  /// Ignore is not consulted here. It is a suppression, and its holders each apply it at their own edge; see
+  /// NameplateService.OnNamePlateUpdate for why that stays true even when it is inconvenient.
+  /// </summary>
+  [JsonIgnore]
+  public bool HasVisibleMark => HasNote || IsFocused || IsIgnored;
+
   /// <summary>Display form, matching <see cref="ScentRow.FullName"/>.</summary>
   [JsonIgnore]
   public string FullName => string.IsNullOrEmpty(HomeWorldName) ? Name : $"{Name}@{HomeWorldName}";

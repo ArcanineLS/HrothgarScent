@@ -1308,8 +1308,16 @@ public sealed class ScentWindow : Window
       // Widened by exactly what the icon takes when it is on, measured rather than guessed. A fixed column
       // does not grow to fit its content — it clips it, with no ellipsis to admit it — so an icon added to a
       // width chosen for "WAR" would silently eat the text it sits beside.
+      //
+      // NoResize is what makes that width take effect, and it is the only column that carries it. The table is
+      // Resizable, and ImGui honours TableSetupColumn's width ONLY while a resizable column is initialising —
+      // after that the width is latched and this argument is ignored. So ticking the icons on would widen
+      // nothing and the abbreviation would clip, permanently, recoverable only by restarting the game. NoResize
+      // opts this one column out of that latch, at the cost of a drag handle on a 46px column that has nothing
+      // to drag. The other eight stay resizable.
       case ScentColumn.Job:
-        ImGui.TableSetupColumn("Job", ImGuiTableColumnFlags.WidthFixed | flags,
+        ImGui.TableSetupColumn("Job",
+          ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoResize | flags,
           46f * scale + (config.ShowJobIcons ? JobIconSize(scale, rowHeight) + 4f * scale : 0f), (uint)column);
         break;
 
@@ -1682,12 +1690,19 @@ public sealed class ScentWindow : Window
     if (!config.ShowJobIcons || row.JobId == 0)
       return;
 
-    if (!Plugin.Textures.TryGetFromGameIcon(new GameIconLookup(JobIconBase + row.JobId), out var shared)
-        || !shared.TryGetWrap(out var wrap, out _))
-      return;
-
     var size = JobIconSize(scale, rowHeight);
-    ImGui.Image(wrap.Handle, new Vector2(size, size));
+
+    // The failure path RESERVES THE SPACE rather than collapsing it. The column has already paid for the icon's
+    // width — SetupColumn asks only whether the feature is on, never whether a texture arrived — so returning
+    // early would put this one name hard against the cell's left edge while every other name in the column sits
+    // indented. Two ways that happens: for a beat while a texture streams in, and FOREVER for any job id with
+    // no icon behind it, which is exactly the case the non-throwing lookup was chosen to tolerate.
+    if (Plugin.Textures.TryGetFromGameIcon(new GameIconLookup(JobIconBase + row.JobId), out var shared)
+        && shared.TryGetWrap(out var wrap, out _))
+      ImGui.Image(wrap.Handle, new Vector2(size, size));
+    else
+      ImGui.Dummy(new Vector2(size, size));
+
     ImGui.SameLine(0, 4f * scale);
   }
 
@@ -1721,10 +1736,10 @@ public sealed class ScentWindow : Window
   /// <see cref="BuildView"/>, and the rule at ScentColumn.Job on keying a sort by what is rendered.
   /// </summary>
   private static (FontAwesomeIcon Glyph, Vector4 Color, string Tip)? MarkGlyph(MarkedPlayer mark, Configuration config)
-    => mark.HasNote ? (FontAwesomeIcon.StickyNote, mark.Color ?? config.ColorFocused, "Hrothgar wrote this one down.")
+    => !mark.HasVisibleMark ? null
+     : mark.HasNote ? (FontAwesomeIcon.StickyNote, mark.Color ?? config.ColorFocused, "Hrothgar wrote this one down.")
      : mark.IsIgnored ? (FontAwesomeIcon.EyeSlash, UiTheme.Muted, "Ignored. Never shown or announced.")
-     : mark.IsFocused ? (FontAwesomeIcon.Star, mark.Color ?? config.ColorFocused, "Focused.")
-     : null;
+     : (FontAwesomeIcon.Star, mark.Color ?? config.ColorFocused, "Focused.");
 
   /// <summary>
   /// The mark column's sort bucket: higher sorts first under a descending arrow.
@@ -1735,7 +1750,7 @@ public sealed class ScentWindow : Window
   /// sorts with the unmarked, exactly as it looks.
   /// </summary>
   private static int MarkSortKey(MarkedPlayer? mark)
-    => mark is null ? 0 : mark.HasNote ? 3 : mark.IsIgnored ? 2 : mark.IsFocused ? 1 : 0;
+    => mark is not { HasVisibleMark: true } ? 0 : mark.HasNote ? 3 : mark.IsIgnored ? 2 : 1;
 
   /// <summary>
   /// Right-aligns text within the current cell. GetContentRegionAvail inside a table cell reports the cell's

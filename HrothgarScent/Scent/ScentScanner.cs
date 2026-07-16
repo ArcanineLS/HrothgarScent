@@ -299,7 +299,11 @@ public sealed class ScentScanner : IDisposable
       // NOT ignored, and this is the ignore promise rather than a nicety: an ignored player IS a marked one, so
       // a plain "is there a mark" test would put "one you marked is here" on the info bar about the very person
       // the user said to never show or announce again. Ignore beats focus here as everywhere.
-      markedNearby |= marks.Find(row.Key) is { IsIgnored: false };
+      //
+      // HasVisibleMark, not mere existence: a record can hold only a colour, which draws nothing and sorts with
+      // the unmarked — so counting it here would have the info bar assert a mark the list denies, on the one
+      // surface the user cannot cross-check because the window is shut. One predicate, three readers.
+      markedNearby |= marks.Find(row.Key) is { IsIgnored: false, HasVisibleMark: true };
 
       if (row.IsWatching)
       {
@@ -335,9 +339,17 @@ public sealed class ScentScanner : IDisposable
         // state.Level: Level is a record of what has been ANNOUNCED, so a rung waiting on the cooldown would
         // leave the bar reporting a calm it cannot see. The bar is a readout, not an alert — it owes the truth
         // now, not the truth that was spoken.
-        var reached = config.StareLevelOf(state.AccumulatedMs);
-        if (reached > maxStare)
-          maxStare = reached;
+        //
+        // Ignored watchers are not counted. "One of them fixed on you" is a sentence about a person, and the
+        // ignore promise covers sentences: the alerts drop them, the table drops them, and the bar's marked
+        // glyph drops them, so this drops them too. The bare COUNT still includes them — that is older
+        // behaviour, shared with the eye column, and not this feature's to change.
+        if (!marks.IsIgnored(row.Key))
+        {
+          var reached = config.StareLevelOf(state.AccumulatedMs);
+          if (reached > maxStare)
+            maxStare = reached;
+        }
 
         current[row.Key] = state;
       }
@@ -382,9 +394,14 @@ public sealed class ScentScanner : IDisposable
     // matters — nothing else would ever tell the plates to drop the colour off someone who looked away. The
     // game never dirties a plate because its owner changed target, so without this the eye never moves.
     //
-    // Gated on the feature, because RequestRedraw is a game call and asking the game to rebuild every plate
-    // four times a second, to paint nothing, is rude to everyone else drawing on them.
-    if (config.NameplateMode != NameplateMode.Off && !SameWatchers(current, _previousWatchers))
+    // Gated on the SAME conditions the handler checks, because RequestRedraw is a game call and asking the
+    // game to rebuild every plate four times a second, to paint nothing, is rude to everyone else drawing on
+    // them. EnableWatchers included: without it, a user with the watcher half off but the nameplate mode on
+    // would force a full rebuild on every target change in a crowd, for a handler that returns on its second
+    // line. Turning the half back on needs no redraw from here — NameplateService.Sync re-attaches and its
+    // Subscribe fires one itself.
+    if (config.NameplateMode != NameplateMode.Off && config.EnableWatchers
+        && !SameWatchers(current, _previousWatchers))
       Plugin.Nameplates.Redraw();
 
     // Updated unconditionally, including when we chose not to record: otherwise every watcher already

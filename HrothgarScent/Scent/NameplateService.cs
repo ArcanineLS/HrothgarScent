@@ -46,7 +46,14 @@ public sealed class NameplateService : IDisposable
   /// </summary>
   public void Sync()
   {
+    // EnableWatchers belongs in HERE rather than only in the handler, and that is the difference between the
+    // half going quiet and the half going quiet everywhere. Detaching is what triggers the scrub: leave the
+    // handler attached and merely early-returning, and nothing ever asks the game to rebuild the plate — so the
+    // last frame's red name sits over a watcher's head for as long as they keep staring, while the eye column,
+    // the history and the info bar have all correctly gone silent. Subscribe and Unsubscribe own the redraw,
+    // and this is the only thing that reaches them.
     var wanted = Plugin.Configuration.NameplateMode != NameplateMode.Off
+              && Plugin.Configuration.EnableWatchers
               && !Plugin.ClientState.IsPvP
               && Plugin.ClientState.IsLoggedIn;
 
@@ -125,6 +132,10 @@ public sealed class NameplateService : IDisposable
 
     var color = PackRgba(config.ColorWatcher);
 
+    // One published read for the frame, exactly as the scan does. Immutable and volatile-read, so it is safe
+    // from here and cannot tear.
+    var marks = Plugin.Marks.Index;
+
     foreach (var handler in handlers)
     {
       // BEFORE touching anything else on the handler. PlayerCharacter and GameObject are documented to reach
@@ -135,10 +146,16 @@ public sealed class NameplateService : IDisposable
       if (!snapshot.ById.TryGetValue(handler.GameObjectId, out var row))
         continue;
 
-      // Your own plate. rows includes you, and IsWatching is TRUE for your own row whenever you target
-      // yourself — which is ordinary play, and would paint your own name red for it. Every other consumer of
-      // rows guards this the same way.
-      if (row.IsSelf || !row.IsWatching)
+      // IsSelf: rows includes you, and IsWatching is TRUE for your own row whenever you target yourself, which
+      // is ordinary play and would paint your own name red for it. Every other consumer of rows guards this.
+      //
+      // IsIgnored: "never shown or announced" is the oldest promise this plugin makes, and THIS is the surface
+      // where breaking it is loudest — a red name over a harasser's head, in the world, in front of everyone,
+      // while the table has dropped them and every other readout is silent. The snapshot deliberately carries
+      // ignored players: rows is unfiltered, so ById is too, and they count toward WatcherCount. Every
+      // consumer filters at its OWN edge, and this is that edge. Do not "simplify" this back into the scanner —
+      // WatcherCount feeds the eye column and the info bar, and filtering there would change both.
+      if (row.IsSelf || !row.IsWatching || marks.IsIgnored(row.Key))
         continue;
 
       handler.TextColor = color;
