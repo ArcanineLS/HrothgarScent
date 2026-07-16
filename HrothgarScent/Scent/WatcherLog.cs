@@ -29,6 +29,17 @@ public sealed class WatcherEntry
   /// <summary>Separate targeting episodes, not scans. Re-targeting inside one episode does not count twice.</summary>
   public int Count { get; set; }
 
+  /// <summary>
+  /// Total time this player has held us as their target, across every episode this session.
+  ///
+  /// CUMULATIVE, and that is what distinguishes it from <see cref="StareState.AccumulatedMs"/>, which is
+  /// episode-scoped and drives the escalation ladder. It sits beside <see cref="Count"/>, which counts
+  /// episodes, and answers the other half of the same question: not "how many times did they look" but "how
+  /// long, in total". Accrued by adding each scan's delta, so it can only ever be assigned to — never set from
+  /// an episode's figure, which would silently discard every previous episode.
+  /// </summary>
+  public long TotalStareMs { get; set; }
+
   /// <summary>Still targeting us as of the most recent scan.</summary>
   public bool IsCurrent { get; set; }
 }
@@ -62,7 +73,13 @@ public sealed class WatcherLog
   /// thread. Never creates entries — a player with no history who starts watching arrives via
   /// <see cref="RecordSighting"/>, which is what distinguishes a new episode from an ongoing one.
   /// </summary>
-  public void Sync(IReadOnlyList<ScentRow> rows, IReadOnlySet<WatcherKey> currentWatchers)
+  /// <param name="currentWatchers">
+  /// Who is watching, and each one's live <see cref="StareState"/>. A map rather than a set so this can accrue
+  /// <see cref="WatcherEntry.TotalStareMs"/> from the same per-scan delta the scanner already measured —
+  /// deriving it here instead would mean a second clock, and two clocks disagree. The scanner owns these
+  /// objects; nothing here keeps a reference to one.
+  /// </param>
+  public void Sync(IReadOnlyList<ScentRow> rows, IReadOnlyDictionary<WatcherKey, StareState> currentWatchers)
   {
     lock (_gate)
     {
@@ -71,7 +88,7 @@ public sealed class WatcherLog
 
       foreach (var entry in _entries.Values)
       {
-        var current = currentWatchers.Contains(entry.Key);
+        var current = currentWatchers.TryGetValue(entry.Key, out var stare);
         if (entry.IsCurrent != current)
         {
           entry.IsCurrent = current;
@@ -84,6 +101,10 @@ public sealed class WatcherLog
         if (current)
         {
           entry.LastSeen = now;
+
+          // += the scan's delta, never = the episode's total: this figure spans every episode, and assigning
+          // an episode-scoped number would silently erase every earlier stare the moment they looked back.
+          entry.TotalStareMs += stare!.DeltaMs;
           dirty = true;
         }
       }
@@ -270,6 +291,7 @@ public sealed class WatcherLog
         FirstSeen = entry.FirstSeen,
         LastSeen = entry.LastSeen,
         Count = entry.Count,
+        TotalStareMs = entry.TotalStareMs,
         IsCurrent = entry.IsCurrent,
       };
     }

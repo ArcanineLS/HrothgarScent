@@ -4,6 +4,7 @@ using System.Linq;
 using System.Numerics;
 using Dalamud.Configuration;
 using HrothgarScent.Scent;
+using Newtonsoft.Json;
 
 namespace HrothgarScent;
 
@@ -38,14 +39,19 @@ public static class ScentColumns
   public const uint Company = 6;
   public const uint Distance = 7;
   public const uint Race = 8;
+  public const uint Mark = 9;
 }
 
 /// <summary>
-/// A player the user never wants to see.
+/// LEGACY. A player the user never wants to see, as pre-marks builds stored it.
 ///
-/// Keyed by name+world, not GameObjectId: an id is recycled and changes on a zone, so an id-keyed ignore
-/// would expire the moment they walked away, and would eventually hide an innocent stranger who inherited
-/// the slot.
+/// A pure deserialisation carrier now: <see cref="Plugin.Marks"/> owns this fact, as one flag on a
+/// <see cref="MarkedPlayer"/>. Configuration.Migrate reads these once into the store and then nothing ever
+/// looks at them again — see the remarks on <see cref="Configuration.IgnoredPlayers"/> for why they are kept
+/// on disk rather than emptied.
+///
+/// Deliberately down to fields and a parameterless constructor. Its Matches and FullName went with the code
+/// that called them; MarkedPlayer carries both now. Do not add behaviour back to a carrier.
 /// </summary>
 [Serializable]
 public sealed class IgnoredPlayer
@@ -53,34 +59,11 @@ public sealed class IgnoredPlayer
   public string Name { get; set; } = string.Empty;
   public uint HomeWorldId { get; set; }
   public string HomeWorldName { get; set; } = string.Empty;
-
-  public IgnoredPlayer()
-  {
-  }
-
-  public IgnoredPlayer(string name, uint homeWorldId, string homeWorldName)
-  {
-    Name = name;
-    HomeWorldId = homeWorldId;
-    HomeWorldName = homeWorldName;
-  }
-
-  /// <summary>Ordinal, not case-insensitive: character names are case-exact, and two players on one world
-  /// can differ only in case.</summary>
-  public bool Matches(ScentRow row)
-    => row.HomeWorldId == HomeWorldId
-    && string.Equals(row.Name, Name, StringComparison.Ordinal);
-
-  /// <summary>Display form for the ignore-list table.</summary>
-  public string FullName => string.IsNullOrEmpty(HomeWorldName) ? Name : $"{Name}@{HomeWorldName}";
 }
 
 /// <summary>
-/// A player the user wants picked out of the crowd.
-///
-/// Keyed by name+world for the same reason <see cref="IgnoredPlayer"/> is: an id is recycled and changes on
-/// a zone, so an id-keyed focus would expire the moment they walked away, and would eventually highlight an
-/// innocent stranger who inherited the slot.
+/// LEGACY. A player the user wanted picked out of the crowd, as pre-marks builds stored it. A pure
+/// deserialisation carrier; see <see cref="IgnoredPlayer"/>.
 /// </summary>
 [Serializable]
 public sealed class FocusedPlayer
@@ -88,30 +71,6 @@ public sealed class FocusedPlayer
   public string Name { get; set; } = string.Empty;
   public uint HomeWorldId { get; set; }
   public string HomeWorldName { get; set; } = string.Empty;
-
-  public FocusedPlayer() { }
-
-  public FocusedPlayer(string name, uint homeWorldId, string homeWorldName)
-  {
-    Name = name;
-    HomeWorldId = homeWorldId;
-    HomeWorldName = homeWorldName;
-  }
-
-  /// <summary>Ordinal, not case-insensitive: character names are case-exact, and two players on one world
-  /// can differ only in case.</summary>
-  public bool Matches(ScentRow row)
-    => row.HomeWorldId == HomeWorldId
-    && string.Equals(row.Name, Name, StringComparison.Ordinal);
-
-  /// <summary>Matches a <see cref="WatcherKey"/> rather than a row, for the scanner's arrival edge check,
-  /// which owns keys and not rows.</summary>
-  public bool Matches(WatcherKey key)
-    => key.HomeWorldId == HomeWorldId
-    && string.Equals(key.Name, Name, StringComparison.Ordinal);
-
-  /// <summary>Display form for the focus-list table.</summary>
-  public string FullName => string.IsNullOrEmpty(HomeWorldName) ? Name : $"{Name}@{HomeWorldName}";
 }
 
 [Serializable]
@@ -126,7 +85,7 @@ public sealed class Configuration : IPluginConfiguration
 
   /// <summary>Config schema this build writes. Bumped when a persisted field's meaning changes, never for a
   /// plain addition — a new property with a default needs no migration.</summary>
-  public const int CurrentVersion = 1;
+  public const int CurrentVersion = 2;
 
   public int Version { get; set; } = 0;
 
@@ -152,8 +111,74 @@ public sealed class Configuration : IPluginConfiguration
     if (Version < 1)
       SetColumnHidden(ScentColumns.Race, !ShowRaceColumn);
 
+    if (Version < 2)
+    {
+      // The store refuses to write when marks.json was left by a newer build, or could not be read. Importing
+      // into memory anyway would look like it worked and evaporate on restart — and stamping the new version
+      // would make that permanent, because Migrate runs once and never again. Leave the version alone and retry
+      // next launch; everything above this point is idempotent, so re-running costs nothing.
+      if (Plugin.Marks.IsReadOnly)
+      {
+        Plugin.Log.Warning(
+          "Marks are read-only, so the focus and ignore lists were not imported; leaving config at version {Version} to retry",
+          Version);
+        return;
+      }
+
+      ImportListsIntoMarks();
+
+      // THE ORDER HERE IS THE WHOLE POINT, and it is not obvious. Save() below is synchronous, while the
+      // store's own writes are debounced by seconds — so stamping the version first would record "the
+      // migration happened" a full two seconds before marks.json existed. A crash in that window (a client
+      // crash right after a plugin update is a routine event) leaves a config that will never migrate again and
+      // no file to have migrated into: every focus and every ignore gone for good, and the players the user
+      // ignored back in their list, firing alerts at them.
+      //
+      // Gated on the result rather than fired and forgotten, because a write can also simply fail — a full
+      // disk, a permissions problem — and Flush swallows that to a log line. Refusing the stamp means the same
+      // thing as the IsReadOnly branch above: the legacy lists are still on disk, still authoritative, and the
+      // import is retried next launch. The import is additive, so a retry merges rather than duplicates.
+      if (!Plugin.Marks.Flush())
+      {
+        Plugin.Log.Warning(
+          "marks.json could not be written, so the import is not durable; leaving config at version {Version} to retry",
+          Version);
+        return;
+      }
+    }
+
     Version = CurrentVersion;
     Save();
+  }
+
+  /// <summary>
+  /// Folds the legacy focus and ignore lists into <see cref="Plugin.Marks"/>, which now owns both.
+  ///
+  /// THE LISTS ARE LEFT POPULATED, and that is not an oversight. This runs before <see cref="Save"/> writes
+  /// Version 2, while marks.json is written asynchronously — so emptying them here, saving, and then dying
+  /// before that write lands would destroy the user's focus and ignore lists permanently: Version would already
+  /// read 2, so Migrate would never run again, and there would be no marks.json to have imported. Leaving them
+  /// costs a few dead entries in the config file and makes both a crash and a downgrade non-events. It is
+  /// exactly what <see cref="ShowRaceColumn"/> already does one field up — read once, then simply never read
+  /// again.
+  ///
+  /// Additive rather than overwriting: a mark already carrying a note keeps it and merely gains the flag. A
+  /// player on both legacy lists lands as one record with both flags, which is what the two lists always meant
+  /// and could never say.
+  /// </summary>
+  private void ImportListsIntoMarks()
+  {
+    foreach (var entry in FocusedPlayers)
+      Plugin.Marks.Update(new WatcherKey(entry.Name, entry.HomeWorldId), entry.HomeWorldName,
+        mark => mark with { Marks = mark.Marks | MarkKind.Focus });
+
+    foreach (var entry in IgnoredPlayers)
+      Plugin.Marks.Update(new WatcherKey(entry.Name, entry.HomeWorldId), entry.HomeWorldName,
+        mark => mark with { Marks = mark.Marks | MarkKind.Ignore });
+
+    if (FocusedPlayers.Count + IgnoredPlayers.Count > 0)
+      Plugin.Log.Information("Imported {Focus} focused and {Ignore} ignored players into marks.json",
+        FocusedPlayers.Count, IgnoredPlayers.Count);
   }
 
   // ---- Window ----
@@ -163,6 +188,16 @@ public sealed class Configuration : IPluginConfiguration
   public bool HideInDuty { get; set; } = false;
   public bool HideInCutscene { get; set; } = true;
   public bool ShowSearchBar { get; set; } = true;
+
+  /// <summary>
+  /// Adds "Hrothgar remember" to the game's own right-click menu wherever it names a player.
+  ///
+  /// On by default — it is the one surface that reaches players the scanner cannot see at all, and a durable
+  /// mark only ever happens because the user deliberately clicked it. Opt-OUT rather than opt-in because
+  /// nothing is captured until that click; the toggle exists because injecting into the game's menus is
+  /// somebody else's screen real estate, and a plugin that does it without an off switch is a bad guest.
+  /// </summary>
+  public bool ShowContextMenuMark { get; set; } = true;
   public bool ShowWatcherHistory { get; set; } = true;
   public bool ShowDtr { get; set; } = true;
 
@@ -344,60 +379,35 @@ public sealed class Configuration : IPluginConfiguration
   public int MaxPlayersShown { get; set; } = 100;
 
   /// <summary>
-  /// Players the user never wants to see or hear about.
+  /// LEGACY. Superseded by <see cref="Plugin.Marks"/>, which now owns focus and ignore as two flags on one
+  /// record — see <see cref="MarkKind"/> for why they stayed independent flags rather than becoming a
+  /// tri-state.
   ///
-  /// Treat this list as immutable and swap the whole reference to change it — use
-  /// <see cref="AddIgnoredPlayer"/> and <see cref="RemoveIgnoredPlayer"/>, never Add or Remove directly.
-  /// The render thread edits the ignore list from the row menu and the config window, while the framework
-  /// thread enumerates it in AlertService, and List throws mid-enumeration the moment the other thread adds.
-  /// Reference assignment is atomic, so a reader always sees one whole version or the other. The setter is
-  /// public only because the config deserializer needs it.
+  /// Read by <see cref="ImportListsIntoMarks"/> on the one launch that migrates, and thereafter by exactly one
+  /// other caller: MarkStore.SeedFromLegacyLists, which rebuilds what it can when marks.json cannot be read at
+  /// all. That second reader is the reason these are kept — and deliberately left POPULATED after the import.
+  /// They go stale the moment anything is marked afterwards, but a stale ignore list still suppresses the
+  /// person the user asked never to see, and an empty one does not. Suppression fails safe or it is not a
+  /// promise. Leaving them also makes a downgrade to a pre-marks build harmless, since that build finds exactly
+  /// the lists it expects.
+  ///
+  /// The corollary is a real limitation, and it is the price of that safety: a player forgotten AFTER the
+  /// migration is still named here, so the recovery path can resurrect them. That only happens on a launch that
+  /// already told the user their marks file is unreadable, which is the one moment over-restoring beats
+  /// under-restoring.
+  ///
+  /// Do not wire new code to it. The setter is public only because the config deserialiser needs it.
   /// </summary>
   public List<IgnoredPlayer> IgnoredPlayers { get; set; } = [];
 
-  /// <summary>Copy-on-write; see the remarks on <see cref="IgnoredPlayers"/>. Does not save.</summary>
-  public void AddIgnoredPlayer(IgnoredPlayer player) => IgnoredPlayers = [.. IgnoredPlayers, player];
-
-  /// <summary>Copy-on-write; see the remarks on <see cref="IgnoredPlayers"/>. Does not save.</summary>
-  public void RemoveIgnoredPlayer(IgnoredPlayer player)
-    => IgnoredPlayers = [.. IgnoredPlayers.Where(existing => !ReferenceEquals(existing, player))];
-
   /// <summary>
-  /// Players the user wants to spot immediately.
+  /// LEGACY. Superseded by <see cref="Plugin.Marks"/>; see the remarks on <see cref="IgnoredPlayers"/>.
   ///
-  /// Treat this list as immutable and swap the whole reference to change it — use
-  /// <see cref="AddFocusedPlayer"/> and <see cref="RemoveFocusedPlayer"/>, never Add or Remove directly, under
-  /// the same discipline and for the same reason as <see cref="IgnoredPlayers"/>: the render thread edits it
-  /// from the row menu and the config window while the framework thread enumerates it in ScentScanner's
-  /// arrival edge check. Reference assignment is atomic, so a reader always sees one whole version or the
-  /// other. The setter is public only because the config deserializer needs it.
-  ///
-  /// Ignore beats focus wherever the two disagree. A player on both lists is not shown and not announced:
-  /// ScentWindow.BuildView drops ignored rows before focus is ever consulted, and AlertService filters them
-  /// out. One rule, stated once, rather than a precedence the user has to guess.
+  /// The old note here explained that ignore beats focus wherever the two disagree. That rule still holds and
+  /// now lives where it is applied — ScentWindow.BuildView drops ignored rows before focus is consulted, and
+  /// AlertService filters them out — but the two facts are one record's two flags rather than two lists.
   /// </summary>
   public List<FocusedPlayer> FocusedPlayers { get; set; } = [];
-
-  /// <summary>Copy-on-write; see the remarks on <see cref="FocusedPlayers"/>. Does not save.</summary>
-  public void AddFocusedPlayer(FocusedPlayer player) => FocusedPlayers = [.. FocusedPlayers, player];
-
-  /// <summary>Copy-on-write; see the remarks on <see cref="FocusedPlayers"/>. Does not save.</summary>
-  public void RemoveFocusedPlayer(FocusedPlayer player)
-    => FocusedPlayers = [.. FocusedPlayers.Where(existing => !ReferenceEquals(existing, player))];
-
-  /// <summary>Whether <paramref name="row"/> is on the focus list. Reads the reference once, so a concurrent
-  /// swap cannot tear the scan.</summary>
-  public bool IsFocused(ScentRow row)
-  {
-    var focused = FocusedPlayers;
-    foreach (var entry in focused)
-    {
-      if (entry.Matches(row))
-        return true;
-    }
-
-    return false;
-  }
 
   // ---- Colours ----
 
@@ -455,6 +465,48 @@ public sealed class Configuration : IPluginConfiguration
   public bool AlertForAlliance { get; set; } = false;
 
   /// <summary>
+  /// Say something again when a watcher has held you this long without looking away.
+  ///
+  /// 15 rather than something tighter, and the number is NOT free: a fresh watcher fires an alert at the
+  /// instant they target you, which burns <see cref="AlertCooldownSeconds"/> (default 10). An escalation
+  /// arriving inside that window is dropped, silently — so any default at or under the cooldown ships a
+  /// feature that never fires on a stock install and looks broken rather than absent. 15 clears the default
+  /// cooldown with room to spare.
+  ///
+  /// The cooldown is user-configurable up to 60s, so a user who raises it can still starve this. That is the
+  /// one-shared-cooldown design working as documented (see AlertService), not a bug here — the fix is a
+  /// priority-ordered alert bus, not a second cooldown.
+  ///
+  /// 0 disables the rung entirely; see <see cref="StareLevelOf"/>.
+  /// </summary>
+  public int StareSeconds { get; set; } = 15;
+
+  /// <summary>
+  /// Say something one last time when a watcher has held you this long. 0 disables the rung.
+  ///
+  /// Set BELOW <see cref="StareSeconds"/> it simply wins: <see cref="StareLevelOf"/> tests it first, so an
+  /// inverted pair costs the middle rung — the top one fires, at the lower number, and Stare becomes
+  /// unreachable. That is a strange thing to have configured but not a broken one, and it is why the check is
+  /// ordered top-down rather than trying to police the pair.
+  /// </summary>
+  public int FixateSeconds { get; set; } = 45;
+
+  /// <summary>Announce a watcher's escalation, not merely their arrival.</summary>
+  public bool AlertOnStareEscalation { get; set; } = true;
+
+  /// <summary>
+  /// Which rung <paramref name="accumulatedMs"/> has reached.
+  ///
+  /// Thresholds, not a range, and each guarded on being positive: 0 means "never fire this rung", and an
+  /// unguarded 0 would mean "fire immediately" — the exact inversion the design brief flagged in the stale-mark
+  /// sentinel. Read in descending order so the top rung wins when the two are set inside out.
+  /// </summary>
+  public StareLevel StareLevelOf(long accumulatedMs)
+    => FixateSeconds > 0 && accumulatedMs >= FixateSeconds * 1000L ? StareLevel.Fixation
+     : StareSeconds > 0 && accumulatedMs >= StareSeconds * 1000L ? StareLevel.Stare
+     : StareLevel.Glance;
+
+  /// <summary>
   /// Announce a focus-list player arriving in range, once per visit.
   ///
   /// Off by default, and not negotiable: an alert that starts firing on its own after an update, for a list the
@@ -462,6 +514,21 @@ public sealed class Configuration : IPluginConfiguration
   /// suppresses it, because arriving in range is a fact about the nearby list and not about who is watching.
   /// </summary>
   public bool AlertOnFocusArrival { get; set; } = false;
+
+  /// <summary>
+  /// Note when and where you last saw a player you have marked.
+  ///
+  /// On by default, and the default is the argument: you already told Hrothgar to remember this person, and
+  /// "when did I last run into them" is what remembering someone means. It only ever applies to players you
+  /// pointed at, it overwrites one line rather than keeping a history, and it never creates a record on its own
+  /// — see MarkStore.RecordSeen.
+  ///
+  /// The switch exists anyway, because this is the one thing the plugin writes down that you did not type. A
+  /// user who wants notes and nothing else is entitled to notes and nothing else. Off does not delete what is
+  /// already stored — see the Marks table's own button for that, since silently erasing data on a checkbox is
+  /// worse than keeping it.
+  /// </summary>
+  public bool RememberLastSeen { get; set; } = true;
 
   // ---- History ----
 
@@ -502,17 +569,19 @@ public sealed class Configuration : IPluginConfiguration
   /// WatchersFirst is ignored while the watcher half is off, and a stale view would keep watchers floated to
   /// the top of a list that no longer admits they exist.
   ///
-  /// The Count hashes catch adds and removes but not an in-place edit of an existing entry. That is sound only
-  /// because the UI can only add or remove from either list; if an edit affordance is ever added, bump a
-  /// revision counter on every mutation and hash that instead.
+  /// The focus and ignore Counts used to be hashed here. They are gone because the lists are gone — marks own
+  /// both facts now, and a mark's note, colour and flags are all edited IN PLACE, which no Count can see. This
+  /// note used to ask for a revision counter for exactly that; MarksIndex.Revision is it, and it is hashed by
+  /// ScentWindow.RebuildViewIfStale rather than here, so the revision and the entries it describes arrive as one
+  /// reference and cannot be read at two different versions. Do not add a mark term back to this method.
   ///
   /// HiddenColumnMask is deliberately NOT here. It changes which cells are drawn, never which rows survive or
   /// what order they are in, so rebuilding on it would be pure waste.
   /// </summary>
   public int FilterSignature() => HashCode.Combine(
     HashCode.Combine(HideSelf, HideParty, HideFriends, HideDead, HideAfk, HideLowLevel, MaxDistanceYalms, MaxPlayersShown),
-    HashCode.Combine(WatchersFirst, UseJobAbbreviations, IgnoredPlayers.Count, HiddenRaceMask),
-    HashCode.Combine(FocusedPlayers.Count, EnableNearbyList, EnableWatchers));
+    HashCode.Combine(WatchersFirst, UseJobAbbreviations, HiddenRaceMask),
+    HashCode.Combine(EnableNearbyList, EnableWatchers));
 
   public void Save() => Plugin.PluginInterface.SavePluginConfig(this);
 }

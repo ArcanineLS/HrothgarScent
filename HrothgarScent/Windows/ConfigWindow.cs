@@ -3,7 +3,10 @@ using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 using Dalamud.Utility;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility.Raii;
+using HrothgarScent.Scent;
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 
@@ -318,6 +321,13 @@ public sealed class ConfigWindow : Window
       "Show the search box on the Scent window's toolbar. Hiding it also stops whatever is typed in it from " +
       "filtering, so the list can never be filtered by a box you cannot see.");
 
+    ConfigCheckbox("Add 'Hrothgar remember' to the game's right-click menu",
+      () => Plugin.Configuration.ShowContextMenuMark,
+      v => Plugin.Configuration.ShowContextMenuMark = v,
+      "Adds an entry wherever the game shows a player's name — friend list, Party Finder, chat log, FC roster. " +
+      "It is the only way to mark someone the Scent window cannot see. Nothing is ever written down until you " +
+      "click it.");
+
     ConfigCheckbox("Show watcher history",
       () => Plugin.Configuration.ShowWatcherHistory,
       v => Plugin.Configuration.ShowWatcherHistory = v,
@@ -406,8 +416,7 @@ public sealed class ConfigWindow : Window
     DrawHalvesSection();
     DrawWhoToShowSection();
     DrawRacesSection();
-    DrawFocusListSection();
-    DrawIgnoreListSection();
+    DrawMarksSection();
   }
 
   private static void DrawHalvesSection()
@@ -550,48 +559,113 @@ public sealed class ConfigWindow : Window
             "Double-click to type an exact value.");
   }
 
-  private static void DrawFocusListSection()
+  /// <summary>
+  /// The marks table: one row per player the user pointed at, replacing the two near-identical Focus and Ignore
+  /// tables that stood here.
+  ///
+  /// One table, because there was only ever one kind of thing: both old lists were Name+HomeWorld records with
+  /// a single boolean of meaning, and their code was duplicated line for line. Focus and Ignore are two ticks on
+  /// one row now, which also makes the contradiction — both at once — visible in one place instead of being a
+  /// rule stated in a comment on two lists that could not see each other.
+  /// </summary>
+  private static void DrawMarksSection()
   {
-    UiTheme.SectionHeader("Focus list", FontAwesomeIcon.Star);
+    UiTheme.SectionHeader("Marks", FontAwesomeIcon.Star);
 
-    if (Plugin.Configuration.FocusedPlayers.Count == 0)
+    // Says so out loud rather than failing silently: a note typed into a read-only store vanishes at restart,
+    // and nothing else on screen would explain it. The store supplies the reason rather than this guessing one —
+    // a file from a newer build and a file that could not be read both land here, and the user's next move is
+    // completely different between them.
+    if (Plugin.Marks.ReadOnlyReason is { } reason)
+    {
+      UiTheme.TextWrappedColored(UiTheme.Warn, reason);
+      ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
+    }
+
+    // ABOVE the empty-marks return, deliberately. This is the plugin's one switch over data the user did not
+    // type, and it must be findable and settable BEFORE they have marked anybody — a privacy control you can
+    // only reach once the thing it governs has already happened is not a control.
+    ConfigCheckbox("Note when and where you last saw them",
+      () => Plugin.Configuration.RememberLastSeen,
+      v => Plugin.Configuration.RememberLastSeen = v,
+      "Only for players you have marked, and only one line per person — overwritten, never a history. This is " +
+      "the one thing Hrothgar writes down that you did not type, so it has its own switch. Turning it off " +
+      "keeps what is already stored; use Forget to delete a person outright.");
+
+    ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
+
+    var marks = Plugin.Marks.All();
+    if (marks.Count == 0)
     {
       UiTheme.TextWrappedColored(UiTheme.Muted,
-        "Right-click a player in the Scent window -> Focus this player.");
+        "Right-click a player in the Scent window -> Remember this player. Or right-click their name anywhere " +
+        "the game shows it — friend list, Party Finder, chat — and pick Hrothgar remember.");
       return;
     }
 
     UiTheme.TextWrappedColored(UiTheme.Muted,
-      "Coloured in the list and floated near the top. Matched on name and home world, so they stay focused " +
-      "across zones and sessions. Anyone also on the ignore list stays ignored — ignore wins.");
+      "Everyone Hrothgar wrote down, because you said so. Matched on name and home world, so they stay marked " +
+      "across zones and sessions. Ignore beats Focus if a player carries both. Hover a name for when you last " +
+      "ran into them.");
     ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
 
-    FocusedPlayer? toRemove = null;
+    WatcherKey? toRemove = null;
+    var scale = ImGuiHelpers.GlobalScale;
     var tableFlags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.NoSavedSettings | ImGuiTableFlags.SizingStretchProp;
-    if (ImGui.BeginTable("##focusListTable", 2, tableFlags))
+    if (ImGui.BeginTable("##marksTable", 5, tableFlags))
     {
       ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthStretch);
-      ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 70f * ImGuiHelpers.GlobalScale);
+      ImGui.TableSetupColumn("Focus", ImGuiTableColumnFlags.WidthFixed, 44f * scale);
+      ImGui.TableSetupColumn("Ignore", ImGuiTableColumnFlags.WidthFixed, 48f * scale);
+      ImGui.TableSetupColumn("Note", ImGuiTableColumnFlags.WidthStretch);
+      ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 70f * scale);
       ImGui.TableHeadersRow();
 
-      foreach (var focused in Plugin.Configuration.FocusedPlayers
-            .OrderBy(player => player.Name, StringComparer.Ordinal)
-            .ThenBy(player => player.HomeWorldId)
-            .ToList())
+      foreach (var mark in marks)
       {
         ImGui.TableNextRow();
 
         // Scope by name AND world: the same character name on two worlds is two different people, and an
-        // ImGui ID shared between two rows makes their buttons the same button.
-        ImGui.PushID($"{focused.Name}#{focused.HomeWorldId}");
+        // ImGui ID shared between two rows makes their ticks the same tick.
+        ImGui.PushID($"{mark.Name}#{mark.HomeWorldId}");
 
         ImGui.TableNextColumn();
         ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted(focused.FullName);
+        ImGui.TextColored(mark.Color ?? Plugin.Configuration.ColorDefault, mark.FullName);
+
+        // On the name, not in a column of its own: the table is already five wide in a 540px window, and this
+        // is the answer to a question you only ask about one person at a time.
+        if (mark.LastSeen is { } lastSeen)
+          UiTheme.Tooltip(ScentWindow.FormatLastSeen(lastSeen, mark.LastSeenZone));
 
         ImGui.TableNextColumn();
-        if (ImGui.SmallButton("Remove"))
-          toRemove = focused;
+        var focus = mark.IsFocused;
+        if (ImGui.Checkbox("##focus", ref focus))
+          Plugin.Marks.Update(mark.Key, mark.HomeWorldName, m => m with
+          {
+            Marks = focus ? m.Marks | MarkKind.Focus : m.Marks & ~MarkKind.Focus,
+          });
+
+        ImGui.TableNextColumn();
+        var ignore = mark.IsIgnored;
+        if (ImGui.Checkbox("##ignore", ref ignore))
+          Plugin.Marks.Update(mark.Key, mark.HomeWorldName, m => m with
+          {
+            Marks = ignore ? m.Marks | MarkKind.Ignore : m.Marks & ~MarkKind.Ignore,
+          });
+
+        ImGui.TableNextColumn();
+        ImGui.AlignTextToFramePadding();
+
+        // One line, never the whole note: this is a roster, not a reader. The cell clips it, the full text is
+        // one hover away, and the editor is where it can actually be changed.
+        ImGui.TextUnformatted(FirstLine(mark.Note));
+        if (mark.HasNote)
+          UiTheme.Tooltip(mark.Note);
+
+        ImGui.TableNextColumn();
+        if (ImGui.SmallButton("Forget"))
+          toRemove = mark.Key;
 
         ImGui.PopID();
       }
@@ -599,71 +673,21 @@ public sealed class ConfigWindow : Window
       ImGui.EndTable();
     }
 
-    if (toRemove != null)
-    {
-      // RemoveFocusedPlayer, not FocusedPlayers.Remove: the list is copy-on-write because ScentScanner
-      // enumerates it on the framework thread while this window is being drawn.
-      Plugin.Configuration.RemoveFocusedPlayer(toRemove);
-      Plugin.Configuration.Save();
-    }
+    // Deferred out of the loop: All() hands back a snapshot, but removing mid-draw would leave the table's own
+    // row count disagreeing with what it already told BeginTable this frame.
+    if (toRemove is { } key)
+      Plugin.Marks.Remove(key);
   }
 
-  private static void DrawIgnoreListSection()
+  /// <summary>The first line of a note, for a one-line cell. A note is multi-line by design and a raw newline in
+  /// a table cell renders as a box.</summary>
+  private static string FirstLine(string note)
   {
-    UiTheme.SectionHeader("Ignore list", FontAwesomeIcon.UserSlash);
+    if (string.IsNullOrEmpty(note))
+      return string.Empty;
 
-    if (Plugin.Configuration.IgnoredPlayers.Count == 0)
-    {
-      UiTheme.TextWrappedColored(UiTheme.Muted,
-        "Right-click a player in the Scent window -> Ignore this player.");
-      return;
-    }
-
-    UiTheme.TextWrappedColored(UiTheme.Muted,
-      "Never shown in the list, never alerted about. Matched on name and home world, so they stay ignored " +
-      "across zones and sessions.");
-    ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
-
-    IgnoredPlayer? toRemove = null;
-    var tableFlags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.NoSavedSettings | ImGuiTableFlags.SizingStretchProp;
-    if (ImGui.BeginTable("##ignoreListTable", 2, tableFlags))
-    {
-      ImGui.TableSetupColumn("Player", ImGuiTableColumnFlags.WidthStretch);
-      ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 70f * ImGuiHelpers.GlobalScale);
-      ImGui.TableHeadersRow();
-
-      foreach (var ignored in Plugin.Configuration.IgnoredPlayers
-            .OrderBy(player => player.Name, StringComparer.Ordinal)
-            .ThenBy(player => player.HomeWorldId)
-            .ToList())
-      {
-        ImGui.TableNextRow();
-
-        // Scope by name AND world: the same character name on two worlds is two different people, and an
-        // ImGui ID shared between two rows makes their buttons the same button.
-        ImGui.PushID($"{ignored.Name}#{ignored.HomeWorldId}");
-
-        ImGui.TableNextColumn();
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextUnformatted(ignored.FullName);
-
-        ImGui.TableNextColumn();
-        if (ImGui.SmallButton("Remove"))
-          toRemove = ignored;
-
-        ImGui.PopID();
-      }
-
-      ImGui.EndTable();
-    }
-
-    if (toRemove != null)
-    {
-      // RemoveIgnoredPlayer, not IgnoredPlayers.Remove: the list is copy-on-write because AlertService
-      // enumerates it on the framework thread while this window is being drawn.
-      Plugin.Configuration.RemoveIgnoredPlayer(toRemove);
-      Plugin.Configuration.Save();
-    }
+    var end = note.IndexOfAny(['\r', '\n']);
+    return end < 0 ? note : note[..end];
   }
 
   // ---- Colours ----
@@ -888,6 +912,94 @@ public sealed class ConfigWindow : Window
     config.Save();
   }
 
+  /// <summary>
+  /// The escalation ladder's two thresholds.
+  ///
+  /// Placed after the cooldown slider, deliberately: the two interact, and the interaction is the one thing a
+  /// user cannot deduce from either control alone. An escalation that lands inside the cooldown a fresh watcher
+  /// just spent is dropped, so a threshold under the cooldown is usually swallowed. The warning below says so
+  /// at the moment it becomes true, rather than in a tooltip nobody opens.
+  /// </summary>
+  private static void DrawStareSection()
+  {
+    var config = Plugin.Configuration;
+
+    ConfigCheckbox("Say again if they keep watching",
+      () => config.AlertOnStareEscalation,
+      v => config.AlertOnStareEscalation = v,
+      "One line when someone starts watching you is a glance. This adds a line when they are still watching " +
+      "later — the difference between someone cycling targets and someone fixed on you.");
+
+    using (ImRaii.Disabled(!config.AlertOnStareEscalation))
+    {
+      ImGui.AlignTextToFramePadding();
+      ImGui.Text("Say 'watching you':");
+      ImGui.SameLine();
+      var stare = config.StareSeconds;
+      ImGui.SetNextItemWidth(160f * ImGuiHelpers.GlobalScale);
+      if (UiTheme.SliderIntManual("##stareSeconds", ref stare, 0, 120))
+      {
+        config.StareSeconds = stare;
+        config.Save();
+      }
+
+      // Attached to the SLIDER, before the unit label takes the last-item slot. Tooltip helpers test ImGui's
+      // "was the last item hovered", so placing this after the SameLine/Text pair below would hang the only
+      // explanation of the 0 value — and of the double-click entry — off the two narrow words nobody hovers.
+      // TooltipEvenIfDisabled because the slider inherits the disabled flag from the scope above, which the
+      // plain helper answers "not hovered" to, forever.
+      UiTheme.TooltipEvenIfDisabled("How long they have to hold you before Hrothgar mentions it again. " +
+                                    "0 turns this rung off.\r\n\r\nDouble-click to type an exact value.");
+      ImGui.SameLine();
+      ImGui.Text("seconds in");
+
+      ImGui.AlignTextToFramePadding();
+      ImGui.Text("Say 'still watching':");
+      ImGui.SameLine();
+      var fixate = config.FixateSeconds;
+      ImGui.SetNextItemWidth(160f * ImGuiHelpers.GlobalScale);
+      if (UiTheme.SliderIntManual("##fixateSeconds", ref fixate, 0, 300))
+      {
+        config.FixateSeconds = fixate;
+        config.Save();
+      }
+
+      UiTheme.TooltipEvenIfDisabled("The last thing Hrothgar says about one stare. 0 turns this rung off. " +
+                                    "Set below the one above and it simply wins, at the lower number." +
+                                    "\r\n\r\nDouble-click to type an exact value.");
+      ImGui.SameLine();
+      ImGui.Text("seconds in");
+    }
+
+    // The trap, named where it happens. Both rungs share the one cooldown with the alert that fires the moment
+    // someone starts watching, so a threshold UNDER it is usually eaten by the alert that came first — the
+    // feature then looks broken rather than switched off.
+    //
+    // BOTH rungs are checked, not just the first. They are swallowed on identical terms, and warning about only
+    // one leaves the "turn the stare rung off and keep the fixation rung" configuration silently dead.
+    //
+    // Strictly less-than, matching AlertService's own `now - last < cooldownMs`: at exactly equal the alert
+    // DOES fire, so <= would warn about a configuration that works. "Usually", though — this is a prediction,
+    // not a proof. The cooldown is measured from the last alert of ANY kind, so in a crowd a rung under it can
+    // still slip through when the alert before it was itself swallowed. Hence "may never", not "will never".
+    if (config.AlertOnStareEscalation)
+    {
+      var dead = new List<string>(2);
+      if (config.StareSeconds > 0 && config.StareSeconds < config.AlertCooldownSeconds)
+        dead.Add($"'watching you' at {config.StareSeconds}s");
+      if (config.FixateSeconds > 0 && config.FixateSeconds < config.AlertCooldownSeconds)
+        dead.Add($"'still watching' at {config.FixateSeconds}s");
+
+      if (dead.Count > 0)
+        UiTheme.TextWrappedColored(UiTheme.Warn,
+          $"Hrothgar may stay quiet: {string.Join(" and ", dead)} sits inside the " +
+          $"{config.AlertCooldownSeconds:0}s cooldown that the first alert already spent, so it will usually be " +
+          "swallowed. Raise it above the cooldown, or lower the cooldown.");
+    }
+
+    ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
+  }
+
   // ---- Alerts ----
 
   private static void DrawAlertsTab()
@@ -936,6 +1048,7 @@ public sealed class ConfigWindow : Window
     UiTheme.Tooltip("Shortest gap between two alerts, so a crowd cannot spam you.");
 
     ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
+    DrawStareSection();
 
     ConfigCheckbox("Alert for party members",
       () => Plugin.Configuration.AlertForParty,
@@ -989,10 +1102,13 @@ public sealed class ConfigWindow : Window
       "permanent file of every stranger who ever glanced at you is nobody's idea of a good time.");
     ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
 
-    ConfigCheckbox("Keep history",
+    // "Keep history" read as a durability promise this setting does not make: it governs whether a watcher
+    // survives looking away, within the session, and nothing here outlives logout. The label now says the
+    // behaviour rather than a noun that implies a file.
+    ConfigCheckbox("Keep watchers after they look away",
       () => Plugin.Configuration.KeepHistory,
       v => Plugin.Configuration.KeepHistory = v,
-      "Remember watchers after they stop looking. Off keeps only the ones watching you right now.");
+      "Off keeps only the ones watching you right now. Either way the list is dropped on logout.");
 
     ImGui.AlignTextToFramePadding();
     ImGui.Text("Entries to keep:");

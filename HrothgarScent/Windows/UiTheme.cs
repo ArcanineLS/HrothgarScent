@@ -188,11 +188,20 @@ internal static class UiTheme
   }
 
   /// <summary>Grey "(?)" hint that shows <paramref name="text"/> on hover.</summary>
-  public static void HelpMarker(string text)
+  public static void HelpMarker(string text) => HelpMarker(Muted, "(?)", text);
+
+  /// <summary>
+  /// A help marker that can raise its voice.
+  ///
+  /// Same glyph, different colour: a marker that is merely available and one that is reporting a problem are
+  /// the same control in two states, not two controls. Callers measuring the line must measure
+  /// <paramref name="glyph"/> AND the leading gap this opens with — see DrawToolbar.
+  /// </summary>
+  public static void HelpMarker(Vector4 color, string glyph, string text)
   {
     ImGui.SameLine(0, 4f * ImGuiHelpers.GlobalScale);
-    ImGui.PushStyleColor(ImGuiCol.Text, Muted);
-    ImGui.TextUnformatted("(?)");
+    ImGui.PushStyleColor(ImGuiCol.Text, color);
+    ImGui.TextUnformatted(glyph);
     ImGui.PopStyleColor();
     Tooltip(text);
   }

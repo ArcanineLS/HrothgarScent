@@ -6,6 +6,7 @@ using System.Threading;
 using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Plugin.Services;
+using Lumina.Excel.Sheets;
 
 namespace HrothgarScent.Scent;
 
@@ -34,8 +35,8 @@ public sealed class ScentScanner : IDisposable
   /// <summary>The "no target" sentinel in the EntityId space, which the target id can surface as.</summary>
   private const ulong NoTargetSentinel = 0xE0000000;
 
-  /// <summary>Shared empty set for <see cref="Reset"/>, so tearing down allocates nothing.</summary>
-  private static readonly HashSet<WatcherKey> NoWatchers = [];
+  /// <summary>Shared empty map for <see cref="Reset"/>, so tearing down allocates nothing.</summary>
+  private static readonly Dictionary<WatcherKey, StareState> NoWatchers = [];
 
   private readonly WatcherLog _log;
   private readonly AlertService _alerts;
@@ -43,7 +44,21 @@ public sealed class ScentScanner : IDisposable
   private ScentSnapshot _snapshot = ScentSnapshot.Empty;
   private long _version;
   private long _lastScanTicks;
-  private HashSet<WatcherKey> _previousWatchers = [];
+  /// <summary>
+  /// Who was watching as of the previous scan, and how long each has held it.
+  ///
+  /// A map rather than a set because the value is the episode's accrued time — see <see cref="StareState"/>.
+  /// Presence still means exactly what it did (they were watching last scan, so they are not a fresh episode);
+  /// the value simply rides along, carried forward in place by the edge pass instead of a set being rebuilt
+  /// every tick. Framework-thread-owned, like everything else the scan mutates.
+  /// </summary>
+  private Dictionary<WatcherKey, StareState> _previousWatchers = [];
+
+  /// <summary>The territory <see cref="_zoneName"/> was resolved for. Framework-thread-owned; see
+  /// <see cref="ZoneName"/>.</summary>
+  private uint _zoneId;
+
+  private string _zoneName = string.Empty;
 
   /// <summary>
   /// Every nearby identity as of the previous scan — not just the focused ones.
@@ -129,7 +144,7 @@ public sealed class ScentScanner : IDisposable
       _lastScanTicks = now;
 
       // Competitive integrity, and a condition of Dalamud plugin acceptance: in PvP the data is not merely
-      // hidden, it is never collected. Gate #1 of four, kept separate from the login gate below so that no
+      // hidden, it is never collected. Gate #1 of five, kept separate from the login gate below so that no
       // single edit can collapse both.
       if (Plugin.ClientState.IsPvP)
       {
@@ -144,7 +159,10 @@ public sealed class ScentScanner : IDisposable
         return;
       }
 
-      Scan(me);
+      // now, not a fresh read inside Scan: the throttle above already decided this tick's instant, and the
+      // stare accrual must measure against the same one or the gaps it banks disagree with the gaps the
+      // throttle allowed.
+      Scan(me, now);
     }
     catch (Exception ex)
     {
@@ -155,7 +173,7 @@ public sealed class ScentScanner : IDisposable
     }
   }
 
-  private void Scan(IPlayerCharacter me)
+  private void Scan(IPlayerCharacter me, long now)
   {
     // Before anything reads the edge set, and on the thread that owns it.
     ApplyPendingForgets();
@@ -180,12 +198,13 @@ public sealed class ScentScanner : IDisposable
       var isSelf = pc.GameObjectId == myGid;
       var tag = pc.CompanyTag.TextValue;
 
-      // Read once and reuse. The property builds a fresh CustomizeData over the character's draw data and
-      // boxes it on every single access, so reaching through it twice would allocate twice per player per
-      // scan — a few hundred boxes a second in a crowd, for two bytes.
-      var customize = pc.CustomizeData;
-      var raceId = customize.Race;
-      var sex = customize.Sex;
+      // Customize is a Span straight over the character's draw data, so reading it allocates nothing at all.
+      // Its neighbour CustomizeData builds and boxes a fresh struct on every single access — a few hundred
+      // boxes a second in a crowd, for two bytes. Do not "simplify" this back to CustomizeData; the two read
+      // alike and only one of them is free.
+      var customize = pc.Customize;
+      var raceId = ReadCustomize(customize, CustomizeIndex.Race);
+      var sex = ReadCustomize(customize, CustomizeIndex.Gender);
 
       // Same-FC needs the world too: FC tags are not unique across worlds, so tag-only matching would paint
       // a same-named FC from another world as your own.
@@ -230,16 +249,30 @@ public sealed class ScentScanner : IDisposable
     // Edge-detect per identity, not on the count of watchers. A count only rises when the crowd grows, so
     // one watcher dropping as another appears in the same scan nets to zero and announces nobody — which is
     // exactly the arrival worth announcing.
-    var current = new HashSet<WatcherKey>();
+    var current = new Dictionary<WatcherKey, StareState>();
     var nearbyKeys = new HashSet<WatcherKey>(rows.Count);
     List<ScentRow>? fresh = null;
     List<ScentRow>? arrived = null;
+    List<(ScentRow Row, StareLevel Level, long HeldMs, StareState State)>? escalated = null;
     var config = Plugin.Configuration;
 
-    // One read of the copy-on-write reference for the whole loop; the render thread's Focus item can swap the
-    // list out from under it, and testing against whichever whole version we started with is exactly right.
-    var focusedPlayers = config.FocusedPlayers;
-    var wantFocusAlerts = config.AlertOnFocusArrival && config.EnableNearbyList && focusedPlayers.Count > 0;
+    // One read of the published index for the whole loop; the render thread republishes it whenever the user
+    // edits a mark, and testing against whichever whole version we started with is exactly right. The lookup
+    // per row is O(1) against the frozen dictionary, where the list it replaced was a linear scan per row.
+    var marks = Plugin.Marks.Index;
+    var wantFocusAlerts = config.AlertOnFocusArrival && config.EnableNearbyList && marks.Entries.Count > 0;
+
+    // Both hoisted out of the loop rather than read per row. The wall clock because every player seen in one
+    // scan was seen at one moment, and DateTimeOffset.Now per row would say otherwise; the zone name because
+    // it is one string for the whole scan by definition.
+    //
+    // DateTimeOffset, not the TickCount64 the stare accrual uses two lines up: that one counts milliseconds
+    // since the machine booted, which is the right clock for measuring a gap and useless for anything written
+    // to a file — it would read as nonsense the moment the machine restarts. And an offset rather than a bare
+    // DateTime, so a record written in one time zone still means what it said in another.
+    var wantLastSeen = config.RememberLastSeen && marks.Entries.Count > 0;
+    var seenAt = wantLastSeen ? DateTimeOffset.Now : default;
+    var zoneName = wantLastSeen ? ZoneName() : string.Empty;
 
     foreach (var row in rows)
     {
@@ -248,39 +281,79 @@ public sealed class ScentScanner : IDisposable
 
       nearbyKeys.Add(row.Key);
 
+      // Nearby, not watching: this asks "did I run into them", which is a question about being in the same
+      // place. Cheap for everyone who is not marked — one frozen-dictionary probe that answers no — and it
+      // cannot create a record for anyone. See MarkStore.RecordSeen.
+      if (wantLastSeen)
+        Plugin.Marks.RecordSeen(row.Key, zoneName, seenAt);
+
       if (row.IsWatching)
       {
-        current.Add(row.Key);
-        if (!_previousWatchers.Contains(row.Key))
+        // Carried forward in place, or begun. Presence in the previous map is still exactly the old edge test —
+        // absent means this is a new episode — and the value that rides along is what turns "someone looked at
+        // you" into "someone has been looking at you for thirty seconds".
+        if (_previousWatchers.TryGetValue(row.Key, out var state))
+        {
+          // Accrued from the gap between scans, never from now - FirstTicks: the scanner does not run while
+          // zoning, logged out or in PvP, so wall clock would bank a loading screen as staring.
+          state.DeltaMs = now - state.LastTicks;
+          state.LastTicks = now;
+          state.AccumulatedMs += state.DeltaMs;
+
+          // Monotonic: a rung climbs once per episode and only upward. That one byte IS the dedup, and it is
+          // why no throttle table is needed to keep a long stare from repeating itself.
+          //
+          // The rung is NOT spent here, and that is the whole subtlety. Committing it at the moment it is
+          // detected would burn it even when the alert never got said — a cooldown drop would silence that rung
+          // for the rest of the episode, permanently, because the level never climbs to it again. So the state
+          // rides along and AlertService spends it only once it knows the outcome. See NotifyStareEscalations.
+          var level = config.StareLevelOf(state.AccumulatedMs);
+          if (level > state.Level)
+            (escalated ??= []).Add((row, level, state.AccumulatedMs, state));
+        }
+        else
+        {
+          state = new StareState { FirstTicks = now, LastTicks = now };
           (fresh ??= []).Add(row);
+        }
+
+        current[row.Key] = state;
       }
 
       // Arrival, not focus-change: the test is against who was NEARBY last scan, so re-focusing someone already
       // standing there stays quiet. See _previousNearby.
-      if (wantFocusAlerts && !_previousNearby.Contains(row.Key) && IsFocused(focusedPlayers, row))
+      if (wantFocusAlerts && !_previousNearby.Contains(row.Key) && marks.IsFocused(row.Key))
         (arrived ??= []).Add(row);
     }
 
     _log.Sync(rows, current);
 
-    // RecordWhileClosed is honoured here rather than inside WatcherLog: the scan itself must keep running
-    // even with the window closed, because the info bar count comes from it. Only the remembering and the
-    // announcing are suppressed.
-    if (fresh is not null && (Plugin.Configuration.RecordWhileClosed || Plugin.IsMainWindowOpen))
-    {
+    // RecordWhileClosed is honoured here rather than inside WatcherLog: the scan itself must keep running even
+    // with the window closed, because the info bar count comes from it. Only the remembering is decided here —
+    // the announcing is AlertService's, where every other alert gate lives, and it applies the same setting.
+    //
+    // The log records regardless of EnableWatchers, because that toggle is UI only and switching the half back
+    // on has to bring its history with it.
+    if (fresh is not null && (config.RecordWhileClosed || Plugin.IsMainWindowOpen))
       foreach (var row in fresh)
         _log.RecordSighting(row);
 
-      // The log records regardless of EnableWatchers — the toggle is UI only, so switching the half back on has
-      // to bring its history with it. Only the announcement is the half's output, so only the announcement is
-      // suppressed, and it is suppressed inside AlertService where every other alert gate already lives.
-      _alerts.NotifyNewWatchers(fresh);
-    }
+    // Offered, not announced, and the ORDER HERE MEANS NOTHING — which is the entire point of the bus. It used
+    // to be the priority rule: three Notify calls in a fixed sequence, first one to speak took the cooldown,
+    // and the losers vanished with no trace. Priority now lives in SignalClass, where it can be read, and Pump
+    // decides once with all three in hand.
+    if (escalated is not null)
+      _alerts.RaiseStareEscalations(escalated);
 
-    // Watchers first, and always: the two share one cooldown, so whichever is announced first wins a tie. A
-    // stranger staring at you is the fact this plugin exists for; a friend walking into view is not.
+    if (fresh is not null)
+      _alerts.RaiseNewWatchers(fresh);
+
     if (arrived is not null)
-      _alerts.NotifyFocusArrivals(arrived);
+      _alerts.RaiseFocusArrivals(arrived);
+
+    // One decision per scan, with this scan's world handed to it: a signal raised a moment ago is re-checked
+    // against who is still watching and who is still here before it is allowed to speak.
+    _alerts.Pump(current, nearbyKeys);
 
     // Updated unconditionally, including when we chose not to record: otherwise every watcher already
     // present would re-fire the moment the window opened.
@@ -328,28 +401,72 @@ public sealed class ScentScanner : IDisposable
   /// Whether a target id refers to us.
   ///
   /// Both ids live in the GameObjectId space — TargetObjectId is not an EntityId, despite the name, and
-  /// comparing it against one silently never matches. The sentinel guards are belt-and-braces: which value
-  /// the game writes for "no target" could not be settled from the assemblies, but neither guard can cause
-  /// a false positive, because an exact match against our own id is still required.
+  /// comparing it against one silently never matches.
+  ///
+  /// <see cref="NoTargetSentinel"/> is confirmed, not guessed: Dalamud's own NamePlateUpdateHandler treats
+  /// exactly 0xE0000000 as the invalid-object id, skipping its lookup for a nameplate whose ObjectId is that
+  /// value. The 0 guard stays alongside it as belt-and-braces; neither can cause a false positive, because an
+  /// exact match against our own id is still required.
   /// </summary>
   private static bool IsWatching(ulong targetId, ulong myGameObjectId)
     => targetId != 0 && targetId != NoTargetSentinel && targetId == myGameObjectId;
 
   /// <summary>
-  /// Whether a scanned row is on the focus list. Takes the caller's already-read list reference rather than
-  /// reading Configuration again: the list is copy-on-write, and two reads inside one scan are two chances to
-  /// answer from two different versions of it.
+  /// The current zone's name, resolved once per zone rather than once per scan.
+  ///
+  /// CACHED, AND THE CACHING IS NOT ABOUT SPEED. GetExcelSheet itself throws — on a missing sheet, an
+  /// unsupported language, or a column-hash mismatch after a patch — and this is called from inside
+  /// <see cref="Scan"/>, whose handler answers a throw by dropping to the empty snapshot. Resolved per scan and
+  /// unguarded, one bad patch day would empty the nearby list on every tick, forever, over a cosmetic place
+  /// name. That is the trap RacePalette documents at length and guards the same way.
+  ///
+  /// So: try/catch, resolve only when the territory id actually moves, and fall back to empty. An empty zone
+  /// name is a real state the store handles, not a failure — see <see cref="MarkedPlayer.LastSeenZone"/>.
   /// </summary>
-  private static bool IsFocused(List<FocusedPlayer> focused, ScentRow row)
+  private string ZoneName()
   {
-    foreach (var entry in focused)
-    {
-      if (entry.Matches(row))
-        return true;
-    }
+    var id = Plugin.ClientState.TerritoryType;
+    if (id == _zoneId)
+      return _zoneName;
 
-    return false;
+    _zoneId = id;
+    _zoneName = ResolveZoneName(id);
+    return _zoneName;
   }
+
+  private static string ResolveZoneName(uint id)
+  {
+    try
+    {
+      // GetRowOrDefault, never GetRow: GetRow throws on a row the sheet does not have. ValueNullable, never
+      // .Value, for the same reason the scan's world and job reads use it — a row that has not loaded is not an
+      // exception, it is a Tuesday.
+      return Plugin.DataManager.GetExcelSheet<TerritoryType>()
+        .GetRowOrDefault(id)?.PlaceName.ValueNullable?.Name.ExtractText() ?? string.Empty;
+    }
+    catch (Exception ex)
+    {
+      Plugin.Log.Warning(ex, "Could not resolve the name of territory {Id}", id);
+      return string.Empty;
+    }
+  }
+
+  /// <summary>
+  /// One byte of a character's appearance, addressed by name rather than by offset.
+  ///
+  /// The bounds check is not defensive style. Customize answers a short or empty span for a character whose
+  /// draw data the client has not finished loading, and an unguarded index would throw inside
+  /// <see cref="Scan"/> — which <see cref="OnFrameworkUpdate"/> answers by resetting to the empty snapshot.
+  /// So one passer-by whose appearance is a frame late would blank the entire list, every scan, for as long
+  /// as they stood there.
+  ///
+  /// 0 rather than a guess, and rather than skipping the row: race 0 is the not-yet-loaded sentinel the rest
+  /// of the plugin already expects and deliberately never hides (see <see cref="Configuration.IsRaceHidden"/>).
+  /// Dropping the player instead would make someone who is merely still loading vanish from the list entirely,
+  /// which is a worse answer than "race unknown" and a change in behaviour rather than a fix.
+  /// </summary>
+  private static byte ReadCustomize(ReadOnlySpan<byte> customize, CustomizeIndex index)
+    => (int)index < customize.Length ? customize[(int)index] : (byte)0;
 
   /// <summary>
   /// Publishes the empty snapshot and forgets who was watching, for the states where nearby players are
@@ -375,6 +492,17 @@ public sealed class ScentScanner : IDisposable
 
     _previousWatchers.Clear();
     _previousNearby.Clear();
+
+    // Inside the guard, deliberately: a signal waiting on the bus describes people in a world that has just
+    // ended, and Pump would never speak it anyway once its subjects fail the re-check. Dropping it here is what
+    // makes that certain rather than incidental — nothing raised before a PvP boundary may survive it, and
+    // nothing raised before a zone may arrive four seconds into the next one.
+    //
+    // The catch in OnFrameworkUpdate also lands here, so a scan that throws between a Raise and its Pump
+    // discards that scan's signals. Correct rather than merely tolerable: the snapshot behind them is being
+    // thrown away too, and a stare escalation re-raises on the next good scan regardless.
+    _alerts.ClearPending();
+
     _log.Sync([], NoWatchers);
     Volatile.Write(ref _snapshot, ScentSnapshot.Empty);
   }

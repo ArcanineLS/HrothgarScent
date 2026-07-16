@@ -40,9 +40,54 @@ public sealed class ScentWindow : Window
     Company = 6,
     Distance = 7,
     Race = 8,
+    Mark = 9,
   }
 
-  private const int SearchMaxLength = 100;
+  /// <summary>
+  /// Bumped from 100: a grammar with several terms in it eats a hundred characters fast, and
+  /// <c>fc:Some Long Company Name world:Sargatanas !bob</c> is an ordinary query rather than an abusive one.
+  /// Still a bound, because this is a text box and unbounded input in one is how you find out about the
+  /// allocator.
+  /// </summary>
+  private const int SearchMaxLength = 256;
+
+  /// <summary>The help marker's glyph, in one place because its width is measured against it in DrawToolbar and
+  /// two spellings would silently mis-size the search box.</summary>
+  private const string SearchHelpGlyph = "(?)";
+
+  /// <summary>
+  /// The grammar, on a hover.
+  ///
+  /// Here rather than in a config panel, which is where the prior art puts its "How to Search" page — a search
+  /// syntax you have to open a settings window to read is a search syntax nobody reads. It sits one hover from
+  /// the box it describes.
+  /// </summary>
+  private const string SearchHelp =
+    "Bare words match the name. Hrothgar match anywhere in the word unless you say otherwise.\r\n\r\n" +
+    "world:sarg     home world\r\n" +
+    "fc:free co     free company tag\r\n" +
+    "job:whm        job, short or long name\r\n" +
+    "race:lala      race\r\n" +
+    "note:griefer   what you wrote about them\r\n" +
+    "note:*         anyone you wrote a note about\r\n" +
+    "note:!         anyone you did not\r\n\r\n" +
+    "sarg*  starts with      *sarg  ends with      =Bob Smith  exactly\r\n" +
+    "!bob   not              !world:sarg  not on that world\r\n\r\n" +
+    "Values can have spaces: fc:Free Company Name works.";
+
+  /// <summary>ImGui id of the mark editor popup. One constant because OpenPopup and BeginPopup must agree
+  /// exactly and they are in different methods.</summary>
+  private const string MarkEditorId = "##hrothgarscent-markeditor";
+
+  /// <summary>
+  /// Cap on a note. Not a storage worry — the whole file is kilobytes — but marks.json is written whole on
+  /// every edit, and an unbounded field is an invitation to paste a novel into a per-frame tooltip.
+  ///
+  /// int, not uint, and not by accident: InputTextMultiline's maxLength is Int32, and a uint here silently
+  /// resolves the call to the Span&lt;byte&gt; overload instead, which rejects the ref and reports the error
+  /// against the wrong argument entirely. Same family of trap as InputInt's format-before-flags.
+  /// </summary>
+  private const int MarkNoteMaxLength = 512;
 
   /// <summary>Ceiling for the "hide low level" filter — the throwaway alts and bots milling around aetherytes.</summary>
   private const byte LowLevelThreshold = 3;
@@ -94,6 +139,42 @@ public sealed class ScentWindow : Window
   /// a support ticket.</summary>
   private string _search = string.Empty;
 
+  /// <summary>
+  /// Field names in the search box that do not exist, as of the last rebuild.
+  ///
+  /// Kept so the toolbar can say so. A misspelled field matches everything rather than nothing — see
+  /// ScentQuery — which is the safe failure, but a silent one: the box would look like it worked and the filter
+  /// would look like it did nothing. This is what turns that into a sentence.
+  /// </summary>
+  private IReadOnlyList<string> _queryUnknownFields = [];
+
+  /// <summary>
+  /// A mark editor the row menu asked for, picked up and cleared by the next <see cref="Draw"/>.
+  ///
+  /// Deferred rather than opened where it is clicked. ImGui requires OpenPopup at the same ID scope as the
+  /// BeginPopup that shows it, and the row menu runs three scopes deep — inside a context popup, inside the
+  /// row's PushID, inside the table. Opening it there silently never appears.
+  /// </summary>
+  private WatcherKey? _editorRequest;
+
+  /// <summary>
+  /// Who the open mark editor is about.
+  ///
+  /// A key, never a GameObjectId and never a ScentRow: the editor outlives frames, and the row it was opened
+  /// from can leave the snapshot entirely while it is up — they zoned, they walked out of range, a filter
+  /// dropped them. The key still names the same person, which is the whole reason identity is Name+HomeWorld
+  /// here and not an id. See <see cref="WatcherKey"/>.
+  /// </summary>
+  private WatcherKey? _editorKey;
+
+  /// <summary>The editor's note buffer, held across frames while it is open so typing is not fighting the
+  /// store. Committed on change; see <see cref="DrawMarkEditor"/>.</summary>
+  private string _editorNote = string.Empty;
+
+  /// <summary>The world name to key a brand-new mark with, captured when the editor opened. The store needs it
+  /// to build a record, and the row it came from may be gone by the time the user types anything.</summary>
+  private string _editorWorldName = string.Empty;
+
   private ScentColumn _sortColumn;
   private bool _sortAscending;
 
@@ -144,7 +225,7 @@ public sealed class ScentWindow : Window
   }
 
   /// <summary>
-  /// Gate #2 of the four-way PvP defence, plus the user's own hide-while-busy choices.
+  /// Gate #2 of the five-way PvP defence, plus the user's own hide-while-busy choices.
   ///
   /// The PvP check is a competitive-integrity requirement and a condition of Dalamud plugin acceptance. It
   /// is deliberately not user-configurable and must never be given an option.
@@ -372,11 +453,163 @@ public sealed class ScentWindow : Window
     if (!hud)
       DrawFooter(snapshot, config, scale);
 
+    // AFTER the table, at the window's own ID scope. Both halves must live out here: OpenPopup only matches a
+    // BeginPopup at the same scope, and the row that asked for this is three scopes deep and gone by now. It is
+    // also outside every early return above, so the editor cannot be stranded open behind one.
+    DrawMarkEditorPopup(hud);
+
     MeasureDesiredHeight(hud, wanted, drawn);
 
     // Cleared here, not in the row loop: "nothing is hovered" is only knowable once every row has had its
     // chance to claim the cursor.
     ClearHoverFocusIfIdle();
+  }
+
+  /// <summary>
+  /// Opens and draws the mark editor, at the window's ID scope.
+  ///
+  /// Not in HUD mode. HUD is a read-only readout — no title bar, usually locked, sometimes click-through — and
+  /// a popup on it would be unreachable or unclosable. The row menu that would request one is disabled there, so
+  /// in practice nothing arrives; this clears the request anyway, as the backstop that keeps any future caller
+  /// from stranding a popup on a chrome-less overlay.
+  ///
+  /// Dropped rather than queued: a popup that ambushed the user on the next frame they left HUD would be a
+  /// surprise window, which is worse than nothing happening.
+  /// </summary>
+  private void DrawMarkEditorPopup(bool hud)
+  {
+    if (hud)
+    {
+      _editorRequest = null;
+      _editorKey = null;
+      return;
+    }
+
+    if (_editorRequest is { } request)
+    {
+      _editorRequest = null;
+      _editorKey = request;
+
+      // Seeded once, on open. Re-reading the store every frame would fight the user's own typing.
+      _editorNote = Plugin.Marks.Find(request)?.Note ?? string.Empty;
+      ImGui.OpenPopup(MarkEditorId);
+    }
+
+    if (_editorKey is not { } key)
+      return;
+
+    if (ImGui.BeginPopup(MarkEditorId))
+    {
+      DrawMarkEditor(key);
+      ImGui.EndPopup();
+    }
+    else
+    {
+      // ImGui closed it — the user clicked away. Drop the state so a stale key cannot reopen it later.
+      _editorKey = null;
+    }
+  }
+
+  /// <summary>
+  /// The mark editor: everything the user can say about one player, in one popup that dies when they click away.
+  ///
+  /// No window, no selection state, no navigation to back out of, and nothing to grey out while it loads —
+  /// the store is already in memory. This is the whole of the detail panel the prior art needs five nested tabs,
+  /// a second floating window and an async load-with-spinner to deliver.
+  /// </summary>
+  private void DrawMarkEditor(WatcherKey key)
+  {
+    var config = Plugin.Configuration;
+    var scale = ImGuiHelpers.GlobalScale;
+    var mark = Plugin.Marks.Find(key);
+
+    ImGui.TextColored(UiTheme.AccentBlue, $"Hrothgar remember {key.Name}");
+    ImGui.Separator();
+
+    // The world name for a record that does not exist yet comes from whatever opened the editor; an existing
+    // one carries its own, which is authoritative and may differ from a row that is no longer on screen.
+    var worldName = mark?.HomeWorldName ?? _editorWorldName;
+
+    var focus = mark?.IsFocused ?? false;
+    if (ImGui.Checkbox("Focus", ref focus))
+      Plugin.Marks.Update(key, worldName, m => m with
+      {
+        Marks = focus ? m.Marks | MarkKind.Focus : m.Marks & ~MarkKind.Focus,
+      });
+    UiTheme.Tooltip("Colour them and float them near the top of the list.");
+
+    ImGui.SameLine();
+
+    var ignore = mark?.IsIgnored ?? false;
+    if (ImGui.Checkbox("Ignore", ref ignore))
+      Plugin.Marks.Update(key, worldName, m => m with
+      {
+        Marks = ignore ? m.Marks | MarkKind.Ignore : m.Marks & ~MarkKind.Ignore,
+      });
+    UiTheme.Tooltip("Never show or announce them again. Beats Focus if they carry both.");
+
+    // Both at once is a contradiction the user is allowed to hold — the two flags stay independent so that
+    // un-ignoring gives the focus back — but it must not be silent, or the row simply vanishes and the Focus
+    // tick above looks broken.
+    if (focus && ignore)
+      UiTheme.TextWrappedColored(UiTheme.Muted, "Ignored, so Focus does nothing while both are ticked.");
+
+    ImGui.Dummy(new Vector2(0, 4f * scale));
+    ImGui.TextUnformatted("Note");
+
+    ImGui.SetNextItemWidth(-1);
+    if (ImGui.InputTextMultiline("##marknote", ref _editorNote, MarkNoteMaxLength,
+          new Vector2(0, ImGui.GetTextLineHeight() * 4f)))
+      Plugin.Marks.Update(key, worldName, m => m with { Note = _editorNote });
+    UiTheme.Tooltip("Only you ever see this. It is kept on disk until you delete it.");
+
+    ImGui.Dummy(new Vector2(0, 4f * scale));
+
+    // Colour FOLDS INTO the focus slot rather than becoming a sixth colour competing for the same cell — see
+    // DrawRow's name-colour chain. So it is only meaningful on a focused player, and saying so beats a swatch
+    // that silently does nothing.
+    var color = mark?.Color ?? config.ColorFocused;
+    if (ImGui.ColorEdit4("Colour", ref color, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.AlphaPreview))
+      Plugin.Marks.Update(key, worldName, m => m with { Color = color });
+
+    ImGui.SameLine();
+
+    // Mandatory, not a nicety: ColorEdit4 takes a non-null Vector4, so there is no path back to "no colour"
+    // through the widget itself. Without this the default is unreachable the moment the user touches the swatch.
+    using (ImRaii.Disabled(mark?.Color is null))
+    {
+      if (ImGui.SmallButton("Reset"))
+        Plugin.Marks.Update(key, worldName, m => m with { Color = null });
+    }
+    UiTheme.Tooltip("Back to the default focus colour.");
+
+    if (!focus)
+      UiTheme.TextWrappedColored(UiTheme.Muted, "Colour shows on focused players only.");
+
+    ImGui.Dummy(new Vector2(0, 4f * scale));
+    ImGui.Separator();
+
+    // Reads the live in-memory log, and does NOT persist it. How often someone stared at you is an observation
+    // about them, not something the user wrote — so it is shown here and forgotten at logout, exactly like the
+    // history pane it comes from. See WatcherLog.
+    var stares = Plugin.WatcherLog.Snapshot().FirstOrDefault(entry => entry.Key == key);
+    UiTheme.TextWrappedColored(UiTheme.Muted, stares is null
+      ? "Not seen looking at you this session."
+      : $"Looked at you {stares.Count}x this session.");
+
+    // The one durable observation, shown where it is made rather than only in a file. See MarkedPlayer.LastSeen.
+    if (mark?.LastSeen is { } lastSeen)
+      UiTheme.TextWrappedColored(UiTheme.Muted, FormatLastSeen(lastSeen, mark.LastSeenZone));
+
+    if (mark is not null)
+    {
+      if (ImGui.SmallButton("Forget this player"))
+      {
+        Plugin.Marks.Remove(key);
+        ImGui.CloseCurrentPopup();
+      }
+      UiTheme.Tooltip("Deletes the note, the colour and both ticks.");
+    }
   }
 
   /// <summary>The configured row cap, clamped where it is read. The value round-trips through a JSON file the
@@ -530,10 +763,27 @@ public sealed class ScentWindow : Window
       //
       // Measured, never assumed: GlobalScale and the Dalamud font size are INDEPENDENT user settings, so
       // "Watchers first" can be arbitrarily wide relative to any `N * scale` figure.
+      // The marker comes out of the box's budget, measured rather than guessed, and its leading gap with it:
+      // HelpMarker opens with its own SameLine(0, 4 * scale), so forgetting that term pushes the cog off the
+      // end of the line, where ImGui culls it silently — and a culled cog is the way back to the settings.
+      var marker = ImGui.CalcTextSize(SearchHelpGlyph).X + 4f * scale;
       var checkbox = ImGui.CalcTextSize("Watchers first").X + ImGui.GetFrameHeight() + style.ItemInnerSpacing.X;
-      var boxWidth = ImGui.GetContentRegionAvail().X - checkbox - cogWidth - style.ItemSpacing.X * 2f - 12f * scale;
+      var boxWidth = ImGui.GetContentRegionAvail().X - checkbox - cogWidth - marker
+        - style.ItemSpacing.X * 2f - 12f * scale;
       ImGui.SetNextItemWidth(MathF.Max(90f * scale, boxWidth));
-      ImGui.InputTextWithHint("##search", "Search...", ref _search, SearchMaxLength);
+      ImGui.InputTextWithHint("##search", "Search... (try world:)", ref _search, SearchMaxLength);
+
+      // Amber when the box names a field that does not exist, muted otherwise. An unknown field matches
+      // everyone rather than nobody — the safe failure — but it is a SILENT one: the filter looks like it did
+      // nothing and the box looks like it worked. This is the only thing on screen that says why.
+      if (_queryUnknownFields.Count > 0)
+        UiTheme.HelpMarker(UiTheme.Warn, SearchHelpGlyph,
+          $"Hrothgar not know {(_queryUnknownFields.Count == 1 ? "this" : "these")}: " +
+          $"{string.Join(", ", _queryUnknownFields)}:\r\n\r\nIgnored, so everyone still shows.\r\n\r\n" +
+          SearchHelp);
+      else
+        UiTheme.HelpMarker(SearchHelp);
+
       ImGui.SameLine();
     }
 
@@ -617,11 +867,17 @@ public sealed class ScentWindow : Window
   /// Filtering and sorting up to a couple of hundred rows every frame at render rate is pure waste: the data
   /// only changes once per rescan, four times a second by default. Rebuild when the snapshot version moves or
   /// the user changes a filter or a sort key, and render the cached list on every other frame.
+  ///
+  /// The mark index's revision is folded in HERE rather than inside FilterSignature, so that the revision and
+  /// the entries it describes arrive as one immutable reference — see MarksIndex. Hashing it from inside
+  /// Configuration would split the two reads across a class boundary, which is the tear the bundling exists to
+  /// prevent. It catches what a Count cannot: a note edited, a colour picked, a flag toggled on a record that
+  /// already existed, none of which move any count.
   /// </summary>
   private void RebuildViewIfStale(ScentSnapshot snapshot)
   {
     var signature = HashCode.Combine(EffectiveSearch, _sortColumn, _sortAscending,
-      Plugin.Configuration.FilterSignature());
+      Plugin.Configuration.FilterSignature(), Plugin.Marks.Index.Revision);
     if (snapshot.Version == _viewVersion && signature == _viewSignature)
       return;
 
@@ -633,12 +889,17 @@ public sealed class ScentWindow : Window
   private List<ScentRow> BuildView(ScentSnapshot snapshot)
   {
     var config = Plugin.Configuration;
-    var search = EffectiveSearch;
 
-    // One read of each copy-on-write reference. The row menu's Ignore and Focus items can swap either list out
-    // from under this loop, and enumerating whichever whole version we started with is exactly right.
-    var ignored = config.IgnoredPlayers;
-    var focused = config.FocusedPlayers;
+    // Parsed here rather than cached beside _search, and that is the cheap correct place: BuildView runs only
+    // when RebuildViewIfStale sees the signature move, i.e. once per change to the box — so this is already
+    // once-per-keystroke, with no second cache to fall out of step with the first.
+    var query = ScentQuery.Parse(EffectiveSearch);
+    _queryUnknownFields = query.UnknownFields;
+
+    // One read of the published index for the whole rebuild. The row menu and the editor republish it, and
+    // working from whichever whole version we started with is exactly right — the same discipline the two
+    // copy-on-write lists this replaced needed, with one reference instead of two that could disagree.
+    var marks = Plugin.Marks.Index;
 
     var filtered = new List<ScentRow>(snapshot.Rows.Count);
     foreach (var row in snapshot.Rows)
@@ -666,18 +927,15 @@ public sealed class ScentWindow : Window
         continue;
       if (config.MaxDistanceYalms > 0f && row.Distance > config.MaxDistanceYalms)
         continue;
-      if (search.Length > 0 && !row.Name.Contains(search, StringComparison.OrdinalIgnoreCase))
+
+      // Was a linear scan of the ignore list per row, i.e. O(rows x ignored) every rebuild. One frozen-dictionary
+      // probe now, and it is still ahead of the search because it is a promise rather than a preference.
+      if (marks.IsIgnored(row.Key))
         continue;
 
-      var isIgnored = false;
-      foreach (var entry in ignored)
-      {
-        if (!entry.Matches(row))
-          continue;
-        isIgnored = true;
-        break;
-      }
-      if (isIgnored)
+      // Last, and the only predicate here that is not a field read. The mark lookup is skipped entirely unless
+      // a note: term actually needs one.
+      if (query.IsActive && !query.Matches(row, query.NeedsMark ? marks.Find(row.Key) : null))
         continue;
 
       filtered.Add(row);
@@ -699,10 +957,10 @@ public sealed class ScentWindow : Window
 
     // Focused-first is a SECOND primary key, layered under watchers-first and over the column sort — the same
     // shape as WatchersFirst and for the same reason. Under, not over: someone looking at you outranks someone
-    // you asked to be told about, and a focused watcher satisfies both keys anyway. Costs nothing when the focus
-    // list is empty, which is every install's default, because the key is constant and OrderBy is stable.
-    ordered = focused.Count > 0
-      ? ordered.ThenByDescending(row => IsFocusedRow(focused, row))
+    // you asked to be told about, and a focused watcher satisfies both keys anyway. Costs nothing when nobody is
+    // marked, which is every install's default, because the key is constant and OrderBy is stable.
+    ordered = marks.Entries.Count > 0
+      ? ordered.ThenByDescending(row => marks.IsFocused(row.Key))
       : ordered;
 
     ordered = _sortColumn switch
@@ -723,6 +981,9 @@ public sealed class ScentWindow : Window
       ScentColumn.World => Then(ordered, row => row.HomeWorldName),
       ScentColumn.Company => Then(ordered, row => row.CompanyTag),
       ScentColumn.Distance => Then(ordered, row => row.Distance),
+
+      // Keyed on the glyph bucket, off the same index this rebuild read once. See MarkSortKey.
+      ScentColumn.Mark => Then(ordered, row => MarkSortKey(marks.Find(row.Key))),
       _ => Then(ordered, row => row.Name),
     };
 
@@ -737,24 +998,11 @@ public sealed class ScentWindow : Window
     {
       if (!row.IsSelf)
         _shownOthers++;
-      if (focused.Count > 0 && IsFocusedRow(focused, row))
+      if (marks.IsFocused(row.Key))
         _focusedKeys.Add(row.Key);
     }
 
     return result;
-  }
-
-  /// <summary>Whether a row is on the focus list. Takes the caller's already-read list reference: the list is
-  /// copy-on-write, and two reads inside one rebuild are two chances to answer from two versions of it.</summary>
-  private static bool IsFocusedRow(List<FocusedPlayer> focused, ScentRow row)
-  {
-    foreach (var entry in focused)
-    {
-      if (entry.Matches(row))
-        return true;
-    }
-
-    return false;
   }
 
   /// <summary>
@@ -784,10 +1032,17 @@ public sealed class ScentWindow : Window
   ///
   /// Reordering moves a column's display order, never its index, so the header stays free to drag.
   /// </summary>
+  /// <remarks>
+  /// APPENDED, never inserted. BeginTable copies column state BY INDEX when the count changes, so a column added
+  /// at the end leaves indices 0..7 untouched and only the new one gets fresh state — benign. Inserted in the
+  /// middle it would shift every column's state onto its neighbour, which is the exact failure the paragraph
+  /// above describes. Mark reads last on the row; it is the least urgent thing on it.
+  /// </remarks>
   private static readonly ScentColumn[] ColumnLayout =
   [
     ScentColumn.Watching, ScentColumn.Name, ScentColumn.Job, ScentColumn.Race,
     ScentColumn.Level, ScentColumn.World, ScentColumn.Company, ScentColumn.Distance,
+    ScentColumn.Mark,
   ];
 
   /// <summary>Columns that cannot be hidden, and therefore can never own a bit in HiddenColumnMask: the list
@@ -887,6 +1142,12 @@ public sealed class ScentWindow : Window
   private void DrawPlayerTable(ScentSnapshot snapshot, Configuration config, float scale, float height, bool hud,
     float rowHeight)
   {
+    // One read for the whole table, handed down to every row — the same discipline as rowHeight above it, and
+    // for a sharper reason: the render thread is this store's own writer, so a tick in the editor or the row
+    // menu republishes the index MID-FRAME. Reading it per row per cell would let one row's colour disagree
+    // with the next row's, and with the glyph in its own Mark cell.
+    var marks = Plugin.Marks.Index;
+
     if (_view.Count == 0)
     {
       DrawEmptyState(snapshot, config, hud, scale);
@@ -984,7 +1245,7 @@ public sealed class ScentWindow : Window
     }
 
     for (var i = 0; i < rows; i++)
-      DrawRow(_view[i], config, scale, columns, rowHeight);
+      DrawRow(_view[i], config, scale, columns, rowHeight, marks, hud);
 
     ImGui.EndTable();
 
@@ -1064,7 +1325,28 @@ public sealed class ScentWindow : Window
       case ScentColumn.Distance:
         ImGui.TableSetupColumn("Dist", ImGuiTableColumnFlags.WidthFixed | flags, 62f * scale, (uint)column);
         break;
+
+      // Measured under the icon font like the eye, and for the same reason: GlobalScale and the Dalamud font
+      // size are independent settings, so any literal here is a width that shrinks relative to its own glyph.
+      // NoHeaderLabel for the eye's reason too — the glyph needs no title over it, and the header's right-click
+      // menu still reads "Mark" via TableGetColumnName.
+      case ScentColumn.Mark:
+        ImGui.TableSetupColumn("Mark",
+          ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoHeaderLabel | flags,
+          MarkColumnWidth(scale), (uint)column);
+        break;
     }
+  }
+
+  /// <summary>The mark column's width; measured under the icon font, exactly like
+  /// <see cref="WatchingColumnWidth"/> and for the reason stated there.</summary>
+  private static float MarkColumnWidth(float scale)
+  {
+    Vector2 glyph;
+    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+      glyph = ImGui.CalcTextSize(FontAwesomeIcon.StickyNote.ToIconString());
+
+    return glyph.X + CellPadding(scale).X * 2f;
   }
 
   /// <summary>
@@ -1205,7 +1487,8 @@ public sealed class ScentWindow : Window
     specs.SpecsDirty = false;
   }
 
-  private void DrawRow(ScentRow row, Configuration config, float scale, ScentColumn[] columns, float rowHeight)
+  private void DrawRow(ScentRow row, Configuration config, float scale, ScentColumn[] columns, float rowHeight,
+    MarksIndex marks, bool hud)
   {
     // Height pinned, not inherited. The eye cell is icon-font and the rest are text-font, and the two line
     // heights do not match — so an unpinned row changed height depending on whether that player was looking at
@@ -1215,6 +1498,11 @@ public sealed class ScentWindow : Window
     ImGui.TableNextRow(ImGuiTableRowFlags.None, rowHeight);
 
     var focused = _focusedKeys.Count > 0 && _focusedKeys.Contains(row.Key);
+
+    // One probe for the whole row, off the index this frame was handed. Every cell below that cares about the
+    // mark reads THIS, so the name colour, the row tint and the Mark glyph can never describe three different
+    // versions of the same record.
+    var mark = marks.Find(row.Key);
 
     // RowBg1 sits above the zebra stripe, so the tint is visible on both stripe phases; on RowBg0 it would
     // disappear entirely under every other row.
@@ -1229,7 +1517,10 @@ public sealed class ScentWindow : Window
     }
     else if (focused && config.HighlightFocusedRow)
     {
-      var tint = config.ColorFocused;
+      // The marked colour folds in here too, for the same reason and with the same default; see the name-colour
+      // chain below. Inserted into the existing if/else-if rather than added as a third TableSetBgColor call —
+      // two washes on one row average into a colour that is neither.
+      var tint = mark?.Color ?? config.ColorFocused;
       tint.W = config.FocusedRowTintAlpha;
       ImGui.TableSetBgColor(ImGuiTableBgTarget.RowBg1, ImGui.GetColorU32(tint));
     }
@@ -1267,7 +1558,12 @@ public sealed class ScentWindow : Window
           // Focus sits ABOVE the relationship colours and BELOW nothing: it is the one colour on this row the
           // user chose per player, by hand. The eye column already carries watcher state, so the name colour
           // stays free of it and no precedence fight arises between the two.
-          var nameColor = focused ? config.ColorFocused
+          //
+          // A per-player colour FOLDS INTO this slot rather than adding a level to the chain: ColorFocused is
+          // the default for the slot, and a marked player's own colour replaces it. It does not become a sixth
+          // contender — "a fourth warm colour on one line is four things shouting", and this row already has
+          // four. A colour on an unfocused player therefore shows nothing here, deliberately; the editor says so.
+          var nameColor = focused ? mark?.Color ?? config.ColorFocused
             : row.IsParty ? config.ColorParty
             : row.IsFriend ? config.ColorFriend
             : row.IsSameFreeCompany ? config.ColorSameFc
@@ -1282,7 +1578,7 @@ public sealed class ScentWindow : Window
           // a dead player's right-click target down to one small icon.
           if (ImGui.BeginPopupContextItem("##rowctx"))
           {
-            DrawRowContextMenu(row, config, focused);
+            DrawRowContextMenu(row, focused, hud);
             ImGui.EndPopup();
           }
 
@@ -1328,11 +1624,65 @@ public sealed class ScentWindow : Window
           ImGui.TableNextColumn();
           TextRight($"{row.Distance:F1}y");
           break;
+
+        // Probed here, per row, per frame, straight off the published index — never mirrored into a set beside
+        // the view the way _focusedKeys is. That pattern is for a render-only lookup; this one is ALSO the sort
+        // key, and a key that disagreed with the glyph beside it would sort by something not on screen. One
+        // read, one truth, and a frozen-dictionary probe is cheaper than the mirror would be.
+        case ScentColumn.Mark:
+        {
+          ImGui.TableNextColumn();
+          if (mark is null)
+            break;
+
+          // Note beats ignore beats focus — most specific first, and only one glyph either way. Focus already
+          // says itself in the name colour, so it only claims this cell when nothing louder is on the record.
+          // Null when the record has nothing to show on a row; see MarkGlyph.
+          if (MarkGlyph(mark, config) is not { } badge)
+            break;
+
+          UiTheme.Icon(badge.Glyph, badge.Color);
+          UiTheme.Tooltip(mark.HasNote ? $"{badge.Tip}\n{mark.Note}" : badge.Tip);
+          break;
+        }
       }
     }
 
     ImGui.PopID();
   }
+
+  /// <summary>
+  /// Which single glyph stands for a mark, and what it says. Null when the record has nothing to show for
+  /// itself on this row.
+  ///
+  /// One glyph, never a row of them. This cell is a column in a nine-column table on a window whose whole
+  /// argument is that the list is readable at a glance; a badge per flag would make it a second list.
+  ///
+  /// FOUR outcomes, not three, and the fourth is the one that is easy to miss: a record can hold a colour and
+  /// nothing else — <see cref="MarkedPlayer.IsEmpty"/> deliberately treats a colour as worth keeping, and
+  /// unticking Focus on a coloured player leaves exactly that. It is not focused, not ignored, has no note, and
+  /// a star tooltipped "Focused." would be the row asserting something false. It gets no glyph; the editor is
+  /// where a colour with nothing to show is explained.
+  ///
+  /// Shared by the cell and the sort key so the two cannot drift — see the sort switch in
+  /// <see cref="BuildView"/>, and the rule at ScentColumn.Job on keying a sort by what is rendered.
+  /// </summary>
+  private static (FontAwesomeIcon Glyph, Vector4 Color, string Tip)? MarkGlyph(MarkedPlayer mark, Configuration config)
+    => mark.HasNote ? (FontAwesomeIcon.StickyNote, mark.Color ?? config.ColorFocused, "Hrothgar wrote this one down.")
+     : mark.IsIgnored ? (FontAwesomeIcon.EyeSlash, UiTheme.Muted, "Ignored. Never shown or announced.")
+     : mark.IsFocused ? (FontAwesomeIcon.Star, mark.Color ?? config.ColorFocused, "Focused.")
+     : null;
+
+  /// <summary>
+  /// The mark column's sort bucket: higher sorts first under a descending arrow.
+  ///
+  /// Keyed on the GLYPH, not on the note's text — the same rule as Job and Race, for the same reason. The cell
+  /// renders one icon or none, so those buckets are the only order that is actually on screen; sorting by note
+  /// text would order rows by a string the column never shows. A colour-only record draws nothing and therefore
+  /// sorts with the unmarked, exactly as it looks.
+  /// </summary>
+  private static int MarkSortKey(MarkedPlayer? mark)
+    => mark is null ? 0 : mark.HasNote ? 3 : mark.IsIgnored ? 2 : mark.IsFocused ? 1 : 0;
 
   /// <summary>
   /// Right-aligns text within the current cell. GetContentRegionAvail inside a table cell reports the cell's
@@ -1439,7 +1789,7 @@ public sealed class ScentWindow : Window
   /// a chat target — so both would be a button that does nothing, or an unsupported hook that gets the user
   /// banned. Link in chat posts the game's own player link instead, and the game's real menu has Tell in it.
   /// </summary>
-  private static void DrawRowContextMenu(ScentRow row, Configuration config, bool focused)
+  private void DrawRowContextMenu(ScentRow row, bool focused, bool hud)
   {
     ImGui.TextColored(UiTheme.AccentBlue, $"Hrothgar smell {row.Name}");
     ImGui.Separator();
@@ -1468,40 +1818,56 @@ public sealed class ScentWindow : Window
 
     ImGui.Separator();
 
+    // Marks, not two lists. Every item below writes one record through MarkStore.Update, which deletes the row
+    // outright once nothing is left on it — that is what keeps the durable store bounded by what the user
+    // actually did, and it is why none of this needs a Save() call: the store owns its own file.
     if (focused)
     {
       if (ImGui.Selectable("Unfocus"))
-      {
-        // RemoveFocusedPlayer, not FocusedPlayers.Remove: the list is copy-on-write because the framework
-        // thread enumerates it in ScentScanner's arrival check while this runs, and List throws the moment the
-        // other side edits. Matched by name+world rather than by reference, because the entry this row
-        // corresponds to was built from a different scan and is a different object.
-        foreach (var entry in config.FocusedPlayers.Where(entry => entry.Matches(row)).ToList())
-          config.RemoveFocusedPlayer(entry);
-        config.Save();
-      }
-      UiTheme.Tooltip("Stop picking them out. Manage the whole list in the config window's Filters tab.");
+        Plugin.Marks.Update(row.Key, row.HomeWorldName, mark => mark with { Marks = mark.Marks & ~MarkKind.Focus });
+      UiTheme.Tooltip("Stop picking them out. Any note or colour stays — manage everything in the config " +
+                      "window's Filters tab.");
     }
     else
     {
       if (ImGui.Selectable("Focus this player"))
-      {
-        config.AddFocusedPlayer(new FocusedPlayer(row.Name, row.HomeWorldId, row.HomeWorldName));
-        config.Save();
-      }
+        Plugin.Marks.Update(row.Key, row.HomeWorldName, mark => mark with { Marks = mark.Marks | MarkKind.Focus });
       UiTheme.Tooltip("Colour them, float them near the top, and — if you switch it on in Alerts — say so when " +
-                      "they come into range. Undo it in the config window's Filters tab.");
+                      "they come into range. Undo it here or in the config window's Filters tab.");
     }
 
     if (ImGui.Selectable("Ignore this player"))
+      Plugin.Marks.Update(row.Key, row.HomeWorldName, mark => mark with { Marks = mark.Marks | MarkKind.Ignore });
+    UiTheme.Tooltip("Never show or announce them again. Beats Focus if they carry both. Undo it in the config " +
+                    "window's Filters tab.");
+
+    ImGui.Separator();
+
+    // Disabled rather than hidden in HUD, and not merely dropped: DrawMarkEditorPopup refuses to open on a
+    // chrome-less overlay, so an enabled item here would be a control that swallows every click in silence
+    // while Target and Ignore beside it work fine — which reads as the plugin being broken, not as a mode
+    // restriction. Same shape as the toolbar's dead-sort arm.
+    using (ImRaii.Disabled(hud))
     {
-      // AddIgnoredPlayer, not IgnoredPlayers.Add: the list is copy-on-write because the framework thread
-      // enumerates it in AlertService while this runs, and List throws the moment the other side adds.
-      config.AddIgnoredPlayer(new IgnoredPlayer(row.Name, row.HomeWorldId, row.HomeWorldName));
-      config.Save();
+      // Deferred, never opened here: OpenPopup must be called at the same ID scope as BeginPopup, and this runs
+      // inside the row's PushID inside the table inside a context popup. Draw picks the flag up after the table
+      // has closed. See _editorKey.
+      if (ImGui.Selectable("Remember this player..."))
+      {
+        _editorRequest = row.Key;
+
+        // Captured now, while the row is in hand. A brand-new record needs a world name, and by the time the
+        // user types anything this row may be long gone from the snapshot.
+        _editorWorldName = row.HomeWorldName;
+      }
     }
-    UiTheme.Tooltip("Never show or announce them again. Beats Focus if they are on both lists. Undo it in the " +
-                    "config window's Filters tab.");
+
+    // TooltipEvenIfDisabled, not Tooltip: ImGui stamps the disabled flag onto the item at submission, so the
+    // plain helper answers "not hovered" forever after — killing the tooltip in the one state whose entire job
+    // is to explain where the control went.
+    UiTheme.TooltipEvenIfDisabled(hud
+      ? "Needs the full window — leave HUD mode to write a note."
+      : "Write a note, pick a colour, set focus and ignore — all in one place.");
   }
 
   /// <summary>
@@ -1735,7 +2101,15 @@ public sealed class ScentWindow : Window
         ImGui.TableNextColumn();
         ImGui.AlignTextToFramePadding();
         ImGui.TextUnformatted(entry.Count.ToString());
-        UiTheme.Tooltip("Separate times they started watching you. Re-targeting without looking away does not count twice.");
+
+        // The dwell goes in the count's tooltip rather than in a column of its own. A fifth column is what the
+        // eye wants and the layout cannot pay for: this table is SizingStretchProp inside a window whose minimum
+        // is 420px, and the fixed columns already claim most of it — one more would collapse the stretching Who
+        // column into an ellipsis at large font scales. The two facts belong together anyway: how many times,
+        // and for how long.
+        UiTheme.Tooltip(
+          "Separate times they started watching you. Re-targeting without looking away does not count twice." +
+          (entry.TotalStareMs >= 1000 ? $"\nWatching you {FormatDwell(entry.TotalStareMs)} in total." : string.Empty));
 
         if (showWhen)
         {
@@ -1774,4 +2148,41 @@ public sealed class ScentWindow : Window
   /// </summary>
   private static string FormatWhen(DateTime when)
     => (DateTime.Now - when).TotalHours >= 24 ? when.ToString("dd MMM") : when.ToString("HH:mm:ss");
+
+  /// <summary>
+  /// When and where a marked player was last around, in words.
+  ///
+  /// Relative near the present and absolute past a week, because that is how the answer is actually used:
+  /// "yesterday" is what you want to hear about someone you nearly remember, and "14 Mar" is what you want
+  /// about someone you do not. A bare date for this morning reads as ancient history; a bare "412 days ago"
+  /// reads as a machine.
+  /// </summary>
+  internal static string FormatLastSeen(DateTimeOffset lastSeen, string zone)
+  {
+    var ago = DateTimeOffset.Now - lastSeen;
+    var when = ago < TimeSpan.Zero ? "just now"                       // a clock that moved; do not print "in -3h"
+      : ago.TotalMinutes < 2 ? "just now"
+      : ago.TotalHours < 1 ? $"{(int)ago.TotalMinutes} minutes ago"
+      : ago.TotalHours < 2 ? "an hour ago"
+      : ago.TotalDays < 1 ? $"{(int)ago.TotalHours} hours ago"
+      : ago.TotalDays < 2 ? "yesterday"
+      : ago.TotalDays < 7 ? $"{(int)ago.TotalDays} days ago"
+      : lastSeen.ToString("dd MMM yyyy");
+
+    return string.IsNullOrEmpty(zone) ? $"Last seen {when}." : $"Last seen {when}, in {zone}.";
+  }
+
+  /// <summary>
+  /// A total stare time, in words. Coarse on purpose, like <see cref="FormatWhen"/>: this is a sentence in a
+  /// tooltip, not a stopwatch, and the figure is only ever accurate to a rescan interval anyway.
+  /// </summary>
+  private static string FormatDwell(long totalMs)
+  {
+    var seconds = totalMs / 1000;
+    if (seconds < 60)
+      return $"{seconds}s";
+
+    var minutes = seconds / 60;
+    return minutes < 60 ? $"{minutes}m {seconds % 60}s" : $"{minutes / 60}h {minutes % 60}m";
+  }
 }

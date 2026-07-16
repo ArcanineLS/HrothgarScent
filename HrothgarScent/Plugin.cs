@@ -11,7 +11,9 @@
 //                 https://github.com/thakyZ/PeepingTom
 
 using System;
+using System.Linq;
 using Dalamud.Game.Command;
+using Dalamud.Game.Gui.ContextMenu;
 using Dalamud.Game.Gui.Dtr;
 using Dalamud.Interface.GameFonts;
 using Dalamud.Interface.ManagedFontAtlas;
@@ -47,10 +49,22 @@ public sealed class Plugin : IDalamudPlugin
   [PluginService] public static IDataManager DataManager { get; private set; } = null!;
   [PluginService] public static IPluginLog Log { get; private set; } = null!;
 
+  /// <summary>Dalamud's own atomic, crash-recovering file service — the sanctioned way to keep a file beside
+  /// the config without hand-rolling durability. Backs <see cref="Marks"/>; see MarkStore.Load.</summary>
+  [PluginService] public static IReliableFileStorage FileStorage { get; private set; } = null!;
+
+  /// <summary>The game's own right-click menu. Gate #5 of the PvP defence lives on this one — see
+  /// <see cref="OnMenuOpened"/>.</summary>
+  [PluginService] public static IContextMenu ContextMenu { get; private set; } = null!;
+
   public static Configuration Configuration { get; private set; } = null!;
   public static ScentScanner Scanner { get; private set; } = null!;
   public static WatcherLog WatcherLog { get; private set; } = null!;
   public static AlertService Alerts { get; private set; } = null!;
+
+  /// <summary>The durable record of players the user pointed at. The counterpart to <see cref="WatcherLog"/>,
+  /// which is the record of players who pointed at them, and which is never written down.</summary>
+  public static MarkStore Marks { get; private set; } = null!;
 
   public readonly WindowSystem WindowSystem = new("HrothgarScent");
   private ScentWindow ScentWindow { get; init; }
@@ -93,6 +107,11 @@ public sealed class Plugin : IDalamudPlugin
   {
     Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
 
+    // Before Migrate, which folds the legacy focus and ignore lists into it, and before the windows below read
+    // either. Blocking on purpose: see MarkStore.Load.
+    Marks = new MarkStore();
+    Marks.Load();
+
     // Before anything reads it. The windows are built below and DrawPlayerTable honours HiddenColumnMask on its
     // first frame, so a config still holding only the legacy ShowRaceColumn would show the wrong columns once and
     // then persist that as the user's choice.
@@ -133,6 +152,8 @@ public sealed class Plugin : IDalamudPlugin
     ClientState.Login += OnLogin;
     ClientState.Logout += OnLogout;
 
+    ContextMenu.OnMenuOpened += OnMenuOpened;
+
     _dtrEntry = CreateDtrEntry();
     if (_dtrEntry is not null)
       _dtrEntry.OnClick = OnDtrClick;
@@ -165,6 +186,8 @@ public sealed class Plugin : IDalamudPlugin
     ClientState.Login -= OnLogin;
     ClientState.Logout -= OnLogout;
 
+    ContextMenu.OnMenuOpened -= OnMenuOpened;
+
     PluginInterface.UiBuilder.Draw -= DrawUI;
     PluginInterface.UiBuilder.OpenMainUi -= ToggleMainUI;
     PluginInterface.UiBuilder.OpenConfigUi -= ToggleConfigUI;
@@ -184,6 +207,10 @@ public sealed class Plugin : IDalamudPlugin
     _configWindow = null;
 
     Scanner.Dispose();
+
+    // After the scanner stops, so nothing can queue another write behind this one. Bounded internally: a hung
+    // disk must not wedge a synchronous unload.
+    Marks.Flush();
 
     UiTheme.HeaderFont?.Dispose();
     UiTheme.HeaderFont = null;
@@ -320,6 +347,126 @@ public sealed class Plugin : IDalamudPlugin
     }
   }
 
+  /// <summary>
+  /// Addons whose right-click menu is about a player we may mark.
+  ///
+  /// An ALLOWLIST, and not optional. OnMenuOpened fires for every context menu in the game, and
+  /// MenuTargetDefault reads its fields lazily off a persistent AgentContext — so on a menu with no player in
+  /// it, it happily reports whoever was right-clicked last. Without this, "Hrothgar remember" appears on an
+  /// unrelated menu and records the wrong person.
+  ///
+  /// null is the world/nameplate menu — right-clicking a player in the world itself. The blacklist is
+  /// deliberately absent: its target cannot be read as a MenuTargetDefault, so the item would never work there
+  /// anyway, and the guards below make it silently not appear rather than appear and misfire.
+  /// </summary>
+  private static readonly string?[] PlayerMenuAddons =
+  [
+    null, "LookingForGroup", "PartyMemberList", "FriendList", "FreeCompany", "SocialList", "ContactList",
+    "ChatLog", "_PartyList", "LinkShell", "CrossWorldLinkshell", "ContentMemberList", "BeginnerChatList",
+  ];
+
+  /// <summary>
+  /// Adds "Hrothgar remember" to the game's own right-click menu, wherever it names a player.
+  ///
+  /// This is the one surface that reaches players the scanner never can — the friend list, Party Finder, the
+  /// chat log, an FC roster — because they are not in the object table at all. It is also why the durable store
+  /// is defensible: the deliberate right-click that creates a mark IS the consent that justifies keeping it.
+  ///
+  /// Framework thread, raised by Dalamud. Dalamud wraps both this handler and the click callback, so an
+  /// exception here cannot take the game down; the try/catch is to stop a per-open log flood, not for safety.
+  /// </summary>
+  private void OnMenuOpened(IMenuOpenedArgs args)
+  {
+    // GATE #5 of the PvP defence, and its own statement rather than a clause on something else — see the note
+    // at ScentScanner's gate #1 on why these are kept separate. This one cannot lean on the others: gates #1-#4
+    // are backstopped by the scanner publishing an empty snapshot in PvP, and this reads the MARK STORE, which
+    // is fully populated in PvP like anywhere else. The friend list and Party Finder are both reachable from
+    // inside a PvP instance, and an unfiltered handler would reach the world menu — i.e. enemy players.
+    if (ClientState.IsPvP)
+      return;
+
+    try
+    {
+      if (!Configuration.ShowContextMenuMark)
+        return;
+
+      // UiBuilder's own "should we be decorating the game right now" answer — respects the user hiding the UI.
+      if (!PluginInterface.UiBuilder.ShouldModifyUi)
+        return;
+
+      if (args.MenuType != ContextMenuType.Default)
+        return;
+
+      if (!PlayerMenuAddons.Contains(args.AddonName))
+        return;
+
+      if (args.Target is not MenuTargetDefault target)
+        return;
+
+      if (target.TargetName is not { Length: > 0 } name)
+        return;
+
+      // ValueNullable, never .Value, and never a RowId == 0 test on its own. The game's own field here is a
+      // SIGNED 16-bit id, so "none" arrives sign-extended as 4294967295 rather than as 0 — and .Value throws on
+      // a row that has not loaded. One nullable check covers the zero, the sentinel and the unloaded row at
+      // once. Same rule as ScentScanner's world and job reads.
+      if (target.TargetHomeWorld.ValueNullable is not { } world)
+        return;
+
+      var worldId = target.TargetHomeWorld.RowId;
+      var worldName = world.Name.ExtractText();
+
+      // Marking yourself is never what anyone meant, and every other path already excludes self.
+      if (Objects.LocalPlayer is { } me
+          && me.HomeWorld.RowId == worldId
+          && string.Equals(me.Name.TextValue, name, StringComparison.Ordinal))
+        return;
+
+      // TargetContentId is deliberately not read — not even to discard. Dalamud bans collecting ACCOUNT ids
+      // outright; ContentId is per-character and is not banned, so this is conservative posture rather than
+      // compliance, and it is stated as such in the README. Never touch TargetObject either: it calls into the
+      // object table internally, which this thread may be on but this handler has no business doing.
+      var key = new WatcherKey(name, worldId);
+      var marked = Marks.Find(key) is not null;
+
+      args.AddMenuItem(new MenuItem
+      {
+        Name = marked ? "Hrothgar forget" : "Hrothgar remember",
+        PrefixChar = 'H',
+        PrefixColor = ChatTagColor,
+
+        // Primitives only. Capturing args or target would capture a pointer into a context the game reuses,
+        // and every field would re-read whatever it holds by the time the user clicks — the same staleness
+        // ScentRow's no-Address rule exists to prevent, one level out.
+        OnClicked = _ => ToggleMarkFromMenu(key, worldName),
+      });
+    }
+    catch (Exception ex)
+    {
+      Log.Warning(ex, "Building the context menu item failed");
+    }
+  }
+
+  /// <summary>
+  /// The context menu's click. Toggles the whole record: remember creates it, forget deletes it outright.
+  ///
+  /// Deliberately coarse. The menu is a one-click surface with no room to explain itself, and a half-state
+  /// there would need a second click to mean anything; the note, the colour and the flags all live in the
+  /// editor, which is where a choice belongs.
+  /// </summary>
+  private static void ToggleMarkFromMenu(WatcherKey key, string worldName)
+  {
+    if (Marks.Find(key) is not null)
+    {
+      Marks.Remove(key);
+      ChatGui.Print($"Hrothgar forget {key.Name}.", ChatTag, ChatTagColor);
+      return;
+    }
+
+    Marks.Update(key, worldName, mark => mark with { Marks = mark.Marks | MarkKind.Focus });
+    ChatGui.Print($"Hrothgar remember {key.Name}.", ChatTag, ChatTagColor);
+  }
+
   private void OnLogin()
   {
     if (Configuration.OpenOnLogin)
@@ -329,10 +476,16 @@ public sealed class Plugin : IDalamudPlugin
   /// <summary>
   /// The watcher log is per-session by design, so it dies with the session. The type and code arguments are
   /// the game's logout reason; nothing here varies by it.
+  ///
+  /// The two stores part company here, and the asymmetry IS the design: the watcher log — everyone who looked
+  /// at you, gathered without their say — is destroyed, while the marks — the people you deliberately pointed
+  /// at — are pushed to disk. Durable because the user authored it; ephemeral because the stranger did not
+  /// consent to it.
   /// </summary>
   private void OnLogout(int type, int code)
   {
     WatcherLog.Clear();
+    Marks.Flush();
     ScentWindow.IsOpen = false;
   }
 }
