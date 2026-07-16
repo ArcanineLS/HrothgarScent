@@ -230,7 +230,7 @@ public sealed class ScentWindow : Window
   }
 
   /// <summary>
-  /// Gate #2 of the five-way PvP defence, plus the user's own hide-while-busy choices.
+  /// Gate #2 of the seven-way PvP defence, plus the user's own hide-while-busy choices.
   ///
   /// The PvP check is a competitive-integrity requirement and a condition of Dalamud plugin acceptance. It
   /// is deliberately not user-configurable and must never be given an option.

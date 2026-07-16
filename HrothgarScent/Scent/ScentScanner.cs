@@ -144,7 +144,7 @@ public sealed class ScentScanner : IDisposable
       _lastScanTicks = now;
 
       // Competitive integrity, and a condition of Dalamud plugin acceptance: in PvP the data is not merely
-      // hidden, it is never collected. Gate #1 of five, kept separate from the login gate below so that no
+      // hidden, it is never collected. Gate #1 of seven, kept separate from the login gate below so that no
       // single edit can collapse both.
       if (Plugin.ClientState.IsPvP)
       {

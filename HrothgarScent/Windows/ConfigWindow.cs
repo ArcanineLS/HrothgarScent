@@ -632,6 +632,13 @@ public sealed class ConfigWindow : Window
       "the one thing Hrothgar writes down that you did not type, so it has its own switch. Turning it off " +
       "keeps what is already stored; use Forget to delete a person outright.");
 
+    ConfigCheckbox("Note duties you clear together",
+      () => Plugin.Configuration.RememberDutyClears,
+      v => Plugin.Configuration.RememberDutyClears = v,
+      "When you clear a duty, Hrothgar adds a line to the note of anyone in it you had already marked. Only " +
+      "them — clearing a duty with a stranger is not a reason to remember them. It goes in the note, so you " +
+      "can edit or delete it like anything else you wrote.");
+
     ImGui.AlignTextToFramePadding();
     ImGui.Text("Dim a mark unseen for:");
     ImGui.SameLine();
@@ -1238,7 +1245,93 @@ public sealed class ConfigWindow : Window
       "Alerts fire once per person, not per glance — someone who keeps re-targeting you inside the cooldown " +
       "stays quiet. Whoever you have chosen not to hear about is filtered out BEFORE the cooldown, so a " +
       "party member can never burn the alert that a stranger in the same moment deserved.");
+
+    DrawJournalSection();
   }
+
+  /// <summary>
+  /// The last few things the alert path decided, and why.
+  ///
+  /// HERE, at the bottom of the Alerts tab, directly under the dead-rung warning — which is a static
+  /// PREDICTION of silence that admits its own limits ("a prediction, not a proof... hence 'may never'"). This
+  /// is the observation that closes that loop, so it belongs beside it rather than on a rail entry of its own:
+  /// a diagnostic is not a peer of Filters and Colours.
+  ///
+  /// Not the Watchers tab, though it is tempting — the journal carries focus arrivals, which belong to the
+  /// NEARBY half, and that tab is the watcher half's territory.
+  /// </summary>
+  private static void DrawJournalSection()
+  {
+    ImGui.Dummy(new Vector2(0, 6f * ImGuiHelpers.GlobalScale));
+    UiTheme.SectionHeader("What Hrothgar decided", FontAwesomeIcon.ListUl);
+
+    var entries = Plugin.Journal.Snapshot();
+    if (entries.Count == 0)
+    {
+      UiTheme.TextWrappedColored(UiTheme.Muted,
+        "Nothing yet. When Hrothgar says something — or stays quiet when you expected otherwise — the reason " +
+        "shows up here. Kept in memory for this session only.");
+      return;
+    }
+
+    UiTheme.TextWrappedColored(UiTheme.Muted,
+      "Newest first. A missing alert usually means a rule you forgot you set, and this is the rule saying so. " +
+      "Kept in memory for this session only, and never the name of anyone you ignored.");
+    ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
+
+    var scale = ImGuiHelpers.GlobalScale;
+    var tableFlags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.NoSavedSettings
+                   | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.ScrollY;
+
+    if (ImGui.BeginTable("##journal", 4, tableFlags, new Vector2(0f, 160f * scale)))
+    {
+      ImGui.TableSetupColumn("When", ImGuiTableColumnFlags.WidthFixed, 62f * scale);
+      ImGui.TableSetupColumn("What", ImGuiTableColumnFlags.WidthFixed, 96f * scale);
+      ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 30f * scale);
+      ImGui.TableSetupColumn("Why", ImGuiTableColumnFlags.WidthStretch);
+      ImGui.TableHeadersRow();
+
+      foreach (var entry in entries)
+      {
+        ImGui.TableNextRow();
+
+        ImGui.TableNextColumn();
+        ImGui.AlignTextToFramePadding();
+        ImGui.TextColored(UiTheme.Muted, entry.When.ToString("HH:mm:ss"));
+
+        ImGui.TableNextColumn();
+        ImGui.TextUnformatted(ClassLabel(entry.Class));
+
+        // The count IS the payload, and deliberately so: it is the whole of what a suppressed entry may say.
+        // A name here would put an ignored player back on screen, one tab from where the user erased them.
+        ImGui.TableNextColumn();
+        ImGui.TextColored(UiTheme.Muted, entry.Subjects.ToString());
+
+        ImGui.TableNextColumn();
+        var (label, color) = OutcomeLabel(entry.Outcome);
+        ImGui.TextColored(color, entry.Detail.Length > 0 ? $"{label} — {entry.Detail}" : label);
+      }
+
+      ImGui.EndTable();
+    }
+  }
+
+  private static string ClassLabel(SignalClass signalClass) => signalClass switch
+  {
+    SignalClass.StareEscalation => "Still watching",
+    SignalClass.NewWatcher => "New watcher",
+    _ => "Marked arrived",
+  };
+
+  private static (string Label, Vector4 Color) OutcomeLabel(SignalOutcome outcome) => outcome switch
+  {
+    SignalOutcome.Said => ("said", UiTheme.Good),
+    SignalOutcome.Waiting => ("waiting", UiTheme.Warn),
+    SignalOutcome.SwitchedOff => ("not said", UiTheme.Muted),
+    SignalOutcome.Filtered => ("not said", UiTheme.Muted),
+    SignalOutcome.NoLongerTrue => ("dropped", UiTheme.Muted),
+    _ => ("dropped", UiTheme.Muted),
+  };
 
   // ---- Watchers ----
 

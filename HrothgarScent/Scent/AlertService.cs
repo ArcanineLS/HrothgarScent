@@ -196,10 +196,14 @@ public sealed class AlertService
         || (!config.RecordWhileClosed && !Plugin.IsMainWindowOpen))
     {
       Spend(escalations);
+      Plugin.Journal.Record(SignalClass.StareEscalation, SignalOutcome.SwitchedOff, escalations.Count,
+        WhyOff(SignalClass.StareEscalation, config));
       return;
     }
 
     var marks = Plugin.Marks.Index;
+    var filtered = 0;
+
     foreach (var escalation in escalations)
     {
       var row = escalation.Row;
@@ -214,11 +218,16 @@ public sealed class AlertService
           || marks.IsIgnored(row.Key))
       {
         escalation.State.Level = escalation.Level;
+        filtered++;
         continue;
       }
 
       Offer(SignalClass.StareEscalation, row, escalation.Level, escalation.HeldMs, escalation.State);
     }
+
+    if (filtered > 0)
+      Plugin.Journal.Record(SignalClass.StareEscalation, SignalOutcome.Filtered, filtered,
+        "you asked not to hear about them");
   }
 
   /// <summary>
@@ -234,9 +243,15 @@ public sealed class AlertService
     if (!config.EnableWatchers
         || (!config.AlertInChat && !config.AlertWithSound)
         || (!config.RecordWhileClosed && !Plugin.IsMainWindowOpen))
+    {
+      Plugin.Journal.Record(SignalClass.NewWatcher, SignalOutcome.SwitchedOff, fresh.Count,
+        WhyOff(SignalClass.NewWatcher, config));
       return;
+    }
 
     var marks = Plugin.Marks.Index;
+    var filtered = 0;
+
     foreach (var row in fresh)
     {
       // Filter first, bus second, and never the reverse. A party member the user chose not to be alerted about
@@ -246,10 +261,17 @@ public sealed class AlertService
           || (row.IsFriend && !config.AlertForFriends)
           || (row.IsAlliance && !config.AlertForAlliance)
           || marks.IsIgnored(row.Key))
+      {
+        filtered++;
         continue;
+      }
 
       Offer(SignalClass.NewWatcher, row);
     }
+
+    if (filtered > 0)
+      Plugin.Journal.Record(SignalClass.NewWatcher, SignalOutcome.Filtered, filtered,
+        "you asked not to hear about them");
   }
 
   /// <summary>
@@ -265,19 +287,31 @@ public sealed class AlertService
     if (!config.AlertOnFocusArrival
         || !config.EnableNearbyList
         || (!config.AlertInChat && !config.AlertWithSound))
+    {
+      Plugin.Journal.Record(SignalClass.FocusArrival, SignalOutcome.SwitchedOff, arrived.Count,
+        WhyOff(SignalClass.FocusArrival, config));
       return;
+    }
 
     var marks = Plugin.Marks.Index;
+    var filtered = 0;
+
     foreach (var row in arrived)
     {
       // AlertForParty/Friends/Alliance are deliberately NOT consulted. Those exist because your party targets
       // you constantly and the watcher alert would be unusable without them; the focus list is hand-built, one
       // name at a time, so a focused friend is a friend the user explicitly asked to be told about.
       if (marks.IsIgnored(row.Key))
+      {
+        filtered++;
         continue;
+      }
 
       Offer(SignalClass.FocusArrival, row);
     }
+
+    if (filtered > 0)
+      Plugin.Journal.Record(SignalClass.FocusArrival, SignalOutcome.Filtered, filtered, "on the ignore list");
   }
 
   /// <summary>
@@ -341,23 +375,47 @@ public sealed class AlertService
     // setting it has no business touching.
     if (cooldownMs <= 0)
     {
-      var spoke = false;
+      List<SignalClass>? said = null;
       foreach (var (signalClass, signal) in _pending)
-        spoke |= Emit(signalClass, signal, config);
+      {
+        if (Emit(signalClass, signal, config))
+          (said ??= []).Add(signalClass);
+      }
 
-      // Only on a real line. A window burned by an alert nobody heard would silence the next one that could
-      // have been.
-      if (spoke)
-        _lastAlertTicks = now;
+      // ONLY what actually reached the user, never the whole dictionary. Clearing unconditionally looks
+      // harmless — with no cooldown, what could it be waiting for? — and reintroduces the exact bug this bus
+      // was built to end. Emit returns false when nothing was output, which is reachable with chat off and a
+      // sound call that failed. A stare survives that (it re-raises), but a new watcher and an arrival are
+      // edges the scanner computes ONCE: dropped here, they are gone silently and for good.
+      //
+      // Nothing is stranded by keeping them. Prune drops a class whose outputs are switched off, and the TTL
+      // expires anything that cannot be said in time — so this retries only while there is still a reason to.
+      if (said is null)
+        return;
 
-      // Cleared either way: with no cooldown there is nothing to wait for, so anything that could not be said
-      // now could not be said at all, and keeping it would deliver it late the moment a setting came back on.
-      _pending.Clear();
+      _lastAlertTicks = now;
+
+      foreach (var signalClass in said)
+      {
+        Plugin.Journal.Record(signalClass, SignalOutcome.Said, _pending[signalClass].Subjects.Count,
+          string.Empty);
+        _pending.Remove(signalClass);
+      }
+
       return;
     }
 
     if (_lastAlertTicks is { } last && now - last < cooldownMs)
+    {
+      // Journalled once per class per scan, not once per subject, and only for the classes actually held up —
+      // this is the entry that answers "why did nothing happen just now", which is the question the whole
+      // feature exists for.
+      foreach (var (signalClass, signal) in _pending)
+        Plugin.Journal.Record(signalClass, SignalOutcome.Waiting, signal.Subjects.Count,
+          $"cooldown, {(cooldownMs - (now - last)) / 1000f:0.0}s left");
+
       return;
+    }
 
     var winner = Pick(now);
     if (!_pending.TryGetValue(winner, out var winning))
@@ -369,7 +427,14 @@ public sealed class AlertService
       return;
 
     _lastAlertTicks = now;
+    Plugin.Journal.Record(winner, SignalOutcome.Said, winning.Subjects.Count, string.Empty);
     _pending.Remove(winner);
+
+    // The classes that lost this window. Without this the journal would show what WAS said and stay silent
+    // about what was not — which is the half the user came for.
+    foreach (var (signalClass, signal) in _pending)
+      Plugin.Journal.Record(signalClass, SignalOutcome.Waiting, signal.Subjects.Count,
+        "something more urgent went first");
   }
 
   /// <summary>
@@ -398,11 +463,20 @@ public sealed class AlertService
       if (!IsClassEnabled(signalClass, config))
       {
         Spend(signal);
+        Plugin.Journal.Record(signalClass, SignalOutcome.SwitchedOff, signal.Subjects.Count,
+          "a switch for this is off");
         (doomed ??= []).Add(signalClass);
         continue;
       }
 
       List<WatcherKey>? gone = null;
+
+      // Counted per class, never journalled per subject: a filtered 24-man alliance would otherwise be
+      // twenty-four rows every scan, which is the whole ring twice a second. The count IS the entry.
+      var ignored = 0;
+      var expired = 0;
+      var stale = 0;
+
       foreach (var (key, subject) in signal.Subjects)
       {
         // Ignored since it was raised: a refusal, so spend the rung and drop them.
@@ -410,6 +484,7 @@ public sealed class AlertService
         {
           SpendOne(subject);
           (gone ??= []).Add(key);
+          ignored++;
           continue;
         }
 
@@ -418,12 +493,27 @@ public sealed class AlertService
         if (now - subject.RaisedTicks >= ttlMs)
         {
           (gone ??= []).Add(key);
+          expired++;
           continue;
         }
 
         if (!StillTrue(signalClass, key, subject, watching, nearby))
+        {
           (gone ??= []).Add(key);
+          stale++;
+        }
       }
+
+      // Count only, and the ignore branch is exactly why. Naming a suppressed player here would print them
+      // back into the same window whose Filters tab is where the user went to erase them — the oldest promise
+      // in the plugin, broken by the feature built to catch broken promises. The count answers the question
+      // ("something was eaten, and this rule ate it") without reopening the roster.
+      if (ignored > 0)
+        Plugin.Journal.Record(signalClass, SignalOutcome.Filtered, ignored, "on the ignore list");
+      if (expired > 0)
+        Plugin.Journal.Record(signalClass, SignalOutcome.Expired, expired, "waited too long to still be news");
+      if (stale > 0)
+        Plugin.Journal.Record(signalClass, SignalOutcome.NoLongerTrue, stale, "stopped before it could be said");
 
       if (gone is not null)
         foreach (var key in gone)
@@ -464,6 +554,30 @@ public sealed class AlertService
       return false;
 
     return subject.State is null || ReferenceEquals(live, subject.State);
+  }
+
+  /// <summary>
+  /// WHICH switch is off, in the user's words.
+  ///
+  /// The whole point of the journal is that "a rule you forgot you set ate it" is the common case, so naming
+  /// the rule IS the feature — "switched off" alone would only restate the silence. Ordered so the answer is
+  /// the one the user is most likely to have forgotten.
+  /// </summary>
+  private static string WhyOff(SignalClass signalClass, Configuration config)
+  {
+    if (!config.AlertInChat && !config.AlertWithSound)
+      return "both chat and sound are off";
+
+    if (signalClass == SignalClass.FocusArrival)
+      return !config.EnableNearbyList ? "the nearby half is off" : "arrival alerts are off";
+
+    if (!config.EnableWatchers)
+      return "the watcher half is off";
+
+    if (!config.RecordWhileClosed && !Plugin.IsMainWindowOpen)
+      return "the window is shut and 'record while closed' is off";
+
+    return signalClass == SignalClass.StareEscalation ? "escalation alerts are off" : "a switch for this is off";
   }
 
   /// <summary>
@@ -632,7 +746,16 @@ public sealed class AlertService
   /// and Prune's re-check would drop them anyway on the next scan — but "anyway, eventually" is not good enough
   /// for the PvP path, where nothing should survive the boundary at all.
   /// </summary>
-  public void ClearPending() => _pending.Clear();
+  public void ClearPending()
+  {
+    _pending.Clear();
+
+    // The journal goes with them, and this is a PvP requirement rather than tidiness. The config window draws
+    // in PvP — it has its own "PvP — hidden" banner — so a journal holding entries raised before the boundary
+    // would be readable there, which is precisely what "nothing raised before a PvP boundary may survive it"
+    // forbids. The cost is losing the trace across a zone; that is the price of the promise.
+    Plugin.Journal.Clear();
+  }
 
   /// <summary>Marks rungs as said-or-refused, so the episode never offers them again. See
   /// <see cref="RaiseStareEscalations"/> for which outcomes spend and which do not.</summary>

@@ -73,6 +73,10 @@ public sealed class Plugin : IDalamudPlugin
   /// <see cref="NameplateService.Sync"/>.</summary>
   [PluginService] public static INamePlateGui NamePlateGui { get; private set; } = null!;
 
+  /// <summary>Duty starts, wipes and clears. Gate #7 of the PvP defence is on this one; see
+  /// DutyService.RecordClear.</summary>
+  [PluginService] public static IDutyState DutyState { get; private set; } = null!;
+
   public static Configuration Configuration { get; private set; } = null!;
   public static ScentScanner Scanner { get; private set; } = null!;
   public static WatcherLog WatcherLog { get; private set; } = null!;
@@ -84,6 +88,12 @@ public sealed class Plugin : IDalamudPlugin
 
   /// <summary>The eye over their head. Off unless the user asks.</summary>
   public static NameplateService Nameplates { get; private set; } = null!;
+
+  /// <summary>Why the alerts did or did not fire. In memory, dies at logout; see <see cref="SignalJournal"/>.</summary>
+  public static SignalJournal Journal { get; private set; } = null!;
+
+  /// <summary>Notes a cleared duty on the marks who were there. Never creates one.</summary>
+  private readonly DutyService _duties;
 
   public readonly WindowSystem WindowSystem = new("HrothgarScent");
   private ScentWindow ScentWindow { get; init; }
@@ -138,9 +148,16 @@ public sealed class Plugin : IDalamudPlugin
     Configuration.Migrate();
 
     WatcherLog = new WatcherLog();
+
+    // Before AlertService, which records into it from its very first decision.
+    Journal = new SignalJournal();
     Alerts = new AlertService();
     Nameplates = new NameplateService();
     Scanner = new ScentScanner(WatcherLog, Alerts);
+
+    // After the scanner: the clear handler reads its published snapshot for the roster.
+    _duties = new DutyService();
+    _duties.Subscribe();
 
     ScentWindow = new ScentWindow();
     ConfigWindow = new ConfigWindow();
@@ -228,6 +245,8 @@ public sealed class Plugin : IDalamudPlugin
     _configWindow = null;
 
     Scanner.Dispose();
+
+    _duties.Dispose();
 
     // Detaches the handler and scrubs what it painted. Before the scanner's data goes, so the redraw it asks
     // for has something coherent to redraw against.

@@ -80,6 +80,8 @@ Everything shares the one cooldown you set. When two things happen at once, the 
 
 The rest wait their turn rather than being dropped, and anything still waiting is re-checked first — if they stopped watching or walked off, Hrothgar stays quiet. Set the cooldown to `0` to hear everything.
 
+Wondering why Hrothgar said nothing? **Alerts → What Hrothgar decided** lists the last 50 decisions and the rule behind each one. Usually it's a switch you forgot you set. It's kept for the session only, and never names anyone you've ignored.
+
 ## 📝 Marks — what Hrothgar writes down
 
 > **Hrothgar writes down exactly the players you pointed at. Everyone else is forgotten when you log out.**
@@ -107,6 +109,8 @@ So instead of guessing, Hrothgar **dims** any mark it hasn't seen in a while and
 - Has its own switch in **Filters → Marks**.
 
 Hover a name in the Marks table to see it.
+
+**Duties you clear together** work the same way: clear something with someone you've already marked and Hrothgar adds a line to their note. Only them — clearing a duty alongside a stranger is not a reason to remember them. It goes in the note, so you can edit or delete it like anything else you wrote.
 
 ### What Hrothgar refuses to smell
 
@@ -166,6 +170,7 @@ The config window (`/hscent config`) has a left icon rail: **General**, **Filter
 | Marks | Empty | Everyone you've focused, ignored, coloured or written a note about. Ignored players are hidden and never alert; ignore beats focus if a player carries both. Keyed by name + home world. See [Marks](#-marks--what-hrothgar-writes-down). |
 | Note when and where you last saw them | On | One overwritten line per marked player — never a history, never for anyone unmarked. The only thing stored that you didn't type; see [above](#the-one-thing-hrothgar-writes-down-that-you-didnt-type). |
 | Dim a mark unseen for | 30 days | Dims marks Hrothgar hasn't matched in this long, so an orphaned one can be found and fixed with **Renamed?**. Nothing is deleted by time. `0` never dims. |
+| Note duties you clear together | On | Adds a line to a marked player's note when you clear a duty with them. Never creates a record for anyone. |
 
 ### Colours
 

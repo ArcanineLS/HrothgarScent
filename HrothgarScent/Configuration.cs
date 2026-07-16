@@ -574,6 +574,19 @@ public sealed class Configuration : IPluginConfiguration
   /// </summary>
   public int MarkStaleDays { get; set; } = 30;
 
+  /// <summary>
+  /// Add a line to a marked player's note when you clear a duty together.
+  ///
+  /// ONLY players already marked, and it never creates a record: a duty completing is not a deliberate user
+  /// act, so it cannot be the reason someone is remembered. Everyone else in the party stays a stranger.
+  ///
+  /// On by default, on the same argument as LastSeen: you already told Hrothgar to remember this person, and
+  /// "we cleared this together" is the kind of thing remembering someone is FOR. It writes into the note — a
+  /// string the user owns and can edit or delete — rather than a field of its own, so nothing here grows a
+  /// history the user cannot reach.
+  /// </summary>
+  public bool RememberDutyClears { get; set; } = true;
+
   // ---- History ----
 
   public bool KeepHistory { get; set; } = true;
