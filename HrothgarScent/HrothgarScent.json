@@ -1,0 +1,22 @@
+{
+  "Author": "Bancho",
+  "Name": "Hrothgar Scent",
+  "Punchline": "Hrothgar smell you. Hrothgar know who watching.",
+  "Description": "A nearby-player list where every row shows whether that player is targeting you, with a watcher history and alerts.",
+  "ApplicableVersion": "any",
+  "Tags": [
+    "Utility",
+    "players",
+    "nearby",
+    "radar",
+    "target",
+    "social"
+  ],
+  "RepoUrl": "https://github.com/ArcanineLS/HrothgarScent",
+  "InternalName": "HrothgarScent",
+  "IconUrl": "https://github.com/ArcanineLS/DalamudPluginRepo/raw/master/images/hrothgarscent.png",
+  "ImageUrls": [
+    ""
+  ],
+  "Changelog": ""
+}

@@ -1,0 +1,11 @@
+.vs/
+obj/
+bin/
+*.user
+
+# Build output (covers bin/Release, bin/Debug, etc.)
+[Bb]in/
+[Oo]bj/
+
+# Local tooling / editor settings
+.claude/

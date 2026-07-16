@@ -1,0 +1,25 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.11.35208.52
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "HrothgarScent", "HrothgarScent\HrothgarScent.csproj", "{2F1A6D3C-5B84-4E17-9C0E-7A3D51E4B8F2}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|x64 = Debug|x64
+		Release|x64 = Release|x64
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{2F1A6D3C-5B84-4E17-9C0E-7A3D51E4B8F2}.Debug|x64.ActiveCfg = Debug|x64
+		{2F1A6D3C-5B84-4E17-9C0E-7A3D51E4B8F2}.Debug|x64.Build.0 = Debug|x64
+		{2F1A6D3C-5B84-4E17-9C0E-7A3D51E4B8F2}.Release|x64.ActiveCfg = Release|x64
+		{2F1A6D3C-5B84-4E17-9C0E-7A3D51E4B8F2}.Release|x64.Build.0 = Release|x64
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+		SolutionGuid = {6C4E9A17-3D82-4B05-8E71-9F2A4C6D0B33}
+	EndGlobalSection
+EndGlobal
