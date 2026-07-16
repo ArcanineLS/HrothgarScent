@@ -10,8 +10,18 @@ public enum SignalOutcome : byte
   /// <summary>It was said.</summary>
   Said,
 
-  /// <summary>The user's cooldown was still running. It waits and tries again.</summary>
+  /// <summary>The user's cooldown was still running, or something more urgent went first. It waits.</summary>
   Waiting,
+
+  /// <summary>
+  /// It got its turn and nothing came out — the chat line is off and the sound call failed.
+  ///
+  /// Its own outcome rather than folded into <see cref="Waiting"/>, because it is the one silence no setting
+  /// explains. Without it the signal sits until the TTL and is then reported as <see cref="Expired"/> —
+  /// "waited too long" — which is exactly false: it never waited, it got a window on every scan and the output
+  /// failed each time. An instrument that blames the wrong rule is worse than no instrument.
+  /// </summary>
+  OutputFailed,
 
   /// <summary>A switch is off — the half, the alert, chat and sound both, or the window shut with
   /// RecordWhileClosed off. The user said no.</summary>
@@ -84,13 +94,16 @@ public sealed class SignalJournal
   /// <summary>
   /// Records one decision. Framework thread only.
   ///
-  /// ONE ENTRY PER PUMP PER CLASS, never per raise, and that is the difference between a journal and a
-  /// firehose. A standing stare re-raises on every scan by design, so at the default interval one waiting
-  /// signal would write four entries a second — against a ten-second cooldown, forty identical rows, most of
-  /// the window. Per-subject would be worse still: a filtered 24-man alliance is 24 rows per scan. The bus
-  /// already coalesces a crowd into one line and dedups by identity; the journal has to match it or the cap is
-  /// a lie, and the ring turns over twice a second in exactly the crowded zone where alerts go missing and the
-  /// user comes looking.
+  /// UNCONDITIONAL: this writes what it is given. The rate limiting lives at the caller, in
+  /// AlertService.Journal, which drops a decision identical to the one already standing for that class — and it
+  /// has to live there, because the repetition is the CALLER's property. Pump runs on every scan, so a class
+  /// held by the cooldown offers the same row four times a second; the journal cannot tell that from a caller
+  /// that genuinely means it, and a filter here would silently eat the second row of any future one.
+  ///
+  /// ONE ENTRY PER CLASS PER DECISION, never per subject: a filtered 24-man alliance is one row with a count of
+  /// 24, not 24 rows. The bus already coalesces a crowd into one line; the journal has to match it or the cap is
+  /// a lie, and the ring turns over in exactly the crowded zone where alerts go missing and the user comes
+  /// looking — throwing away the answer they came for at the moment they came for it.
   /// </summary>
   /// <param name="subjects">How many players this decision covered. The count is the payload; see
   /// <paramref name="detail"/>.</param>

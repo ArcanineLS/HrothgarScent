@@ -1323,10 +1323,21 @@ public sealed class ConfigWindow : Window
     _ => "Marked arrived",
   };
 
+  /// <summary>
+  /// Muted for everything a rule decided, and red for the one case that is a fault.
+  ///
+  /// The colours carry the distinction the labels cannot fit: "not said" and "dropped" describe the plugin
+  /// obeying the user — settled, unalarming, grey. OutputFailed is the plugin trying to obey and failing, which
+  /// is the only row here the user can act on, so it must not be able to fall into the grey with the rest.
+  /// It gets its own arm rather than the catch-all for exactly that reason: the default would have quietly
+  /// labelled it "dropped" — reporting a fault as a rule, which is the misattribution the outcome was added to
+  /// end, reintroduced one layer up.
+  /// </summary>
   private static (string Label, Vector4 Color) OutcomeLabel(SignalOutcome outcome) => outcome switch
   {
     SignalOutcome.Said => ("said", UiTheme.Good),
     SignalOutcome.Waiting => ("waiting", UiTheme.Warn),
+    SignalOutcome.OutputFailed => ("failed", UiTheme.Bad),
     SignalOutcome.SwitchedOff => ("not said", UiTheme.Muted),
     SignalOutcome.Filtered => ("not said", UiTheme.Muted),
     SignalOutcome.NoLongerTrue => ("dropped", UiTheme.Muted),

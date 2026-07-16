@@ -79,8 +79,6 @@ public sealed class DutyService : IDisposable
       if (territory == _lastClearedTerritory)
         return;
 
-      _lastClearedTerritory = territory;
-
       var name = DutyName(contentId);
       if (name.Length == 0)
         return;
@@ -109,8 +107,17 @@ public sealed class DutyService : IDisposable
         cleared++;
       }
 
-      if (cleared > 0)
-        Plugin.Log.Debug("Noted {Name} on {Count} marked players", name, cleared);
+      if (cleared == 0)
+        return;
+
+      // Burned only by a clear that actually wrote something, and only here at the end — never up front beside
+      // the check it feeds. This guard exists to stop ONE completion double-writing, so a run that wrote nothing
+      // has nothing to protect and must not spend the territory: the user who clears a dungeon with an unmarked
+      // friend, marks them on the spot and immediately requeues would otherwise get silence the second time, for
+      // a reason no window explains, and the plugin would look like it had simply stopped remembering.
+      _lastClearedTerritory = territory;
+
+      Plugin.Log.Debug("Noted {Name} on {Count} marked players", name, cleared);
     }
     catch (Exception ex)
     {

@@ -91,6 +91,16 @@ public sealed class AlertService
   private const long PromoteAfterMs = 3_000;
 
   /// <summary>
+  /// Why a signal that got its window still said nothing.
+  ///
+  /// Names both outputs because Emit only fails when BOTH are unavailable — the chat line switched off and the
+  /// sound call throwing — and a reason naming one would send the user to check a setting that is not the
+  /// problem. This is the rarest row in the journal and the only one describing a fault rather than a rule, so
+  /// it has to point somewhere useful the first time.
+  /// </summary>
+  private const string OutputFailedDetail = "chat line off and the sound would not play";
+
+  /// <summary>
   /// How long a subject may wait, given the cooldown it is waiting on.
   ///
   /// NEVER SHORTER THAN THE COOLDOWN, and that is the whole reason this is a function rather than the constant
@@ -123,6 +133,22 @@ public sealed class AlertService
   /// inside one window is one piece of news ("5 eyes on you"), not five.
   /// </summary>
   private readonly Dictionary<SignalClass, PendingSignal> _pending = [];
+
+  /// <summary>
+  /// The last outcome journalled for each pending class, so an unchanged decision is recorded once instead of
+  /// once per scan.
+  ///
+  /// THE JOURNAL WOULD OTHERWISE BE THE FIREHOSE IT WAS BUILT TO REPLACE. Pump runs on every scan, so a class
+  /// held by the cooldown writes four identical rows a second; two classes pending against a ten-second
+  /// cooldown is eighty rows through a fifty-entry cap, and the ring turns over inside the window — evicting
+  /// the answer in exactly the crowded zone where the user came looking for it. Equality would not save it
+  /// either: every row carries a fresh timestamp, which is why the countdown is no longer in the detail.
+  ///
+  /// Cleared per class the moment that class leaves <see cref="_pending"/>, and that is what keeps this a
+  /// filter on repetition rather than on truth: Waiting → Said → Waiting is three genuine transitions and
+  /// records three times, but Waiting → Waiting → Waiting is one decision and records once.
+  /// </summary>
+  private readonly Dictionary<SignalClass, SignalOutcome> _lastJournalled = [];
 
   /// <summary>One class's waiting signal.</summary>
   private sealed class PendingSignal
@@ -380,6 +406,8 @@ public sealed class AlertService
       {
         if (Emit(signalClass, signal, config))
           (said ??= []).Add(signalClass);
+        else
+          Journal(signalClass, SignalOutcome.OutputFailed, signal.Subjects.Count, OutputFailedDetail);
       }
 
       // ONLY what actually reached the user, never the whole dictionary. Clearing unconditionally looks
@@ -397,9 +425,8 @@ public sealed class AlertService
 
       foreach (var signalClass in said)
       {
-        Plugin.Journal.Record(signalClass, SignalOutcome.Said, _pending[signalClass].Subjects.Count,
-          string.Empty);
-        _pending.Remove(signalClass);
+        Journal(signalClass, SignalOutcome.Said, _pending[signalClass].Subjects.Count, string.Empty);
+        Forget(signalClass);
       }
 
       return;
@@ -407,34 +434,48 @@ public sealed class AlertService
 
     if (_lastAlertTicks is { } last && now - last < cooldownMs)
     {
-      // Journalled once per class per scan, not once per subject, and only for the classes actually held up —
-      // this is the entry that answers "why did nothing happen just now", which is the question the whole
-      // feature exists for.
+      // Once per class per DECISION, not per subject and — via Journal — not per scan: this is the entry that
+      // answers "why did nothing happen just now", and a row written four times a second is the question
+      // burying its own answer. No countdown in the detail: the remaining time is a live value in a record that
+      // is frozen the moment it is written, so by the time it is read it is always wrong, and it would make
+      // every scan's row textually distinct and defeat the very suppression above.
       foreach (var (signalClass, signal) in _pending)
-        Plugin.Journal.Record(signalClass, SignalOutcome.Waiting, signal.Subjects.Count,
-          $"cooldown, {(cooldownMs - (now - last)) / 1000f:0.0}s left");
+        Journal(signalClass, SignalOutcome.Waiting, signal.Subjects.Count, "cooldown still running");
 
       return;
     }
 
-    var winner = Pick(now);
+    var winner = Pick(now, out var promoted);
     if (!_pending.TryGetValue(winner, out var winning))
       return;
 
     // Removed and charged only if it actually reached the user; otherwise it stays pending, keeps its age, and
     // tries again next scan — until it wins, or Prune decides it is no longer worth saying.
     if (!Emit(winner, winning, config))
+    {
+      // The signal that got its turn and produced nothing. Without this row the class sits, silent and blameless,
+      // until the TTL reports it as Expired — "waited too long to still be news" — about a signal that never
+      // waited for anything. The journal's whole product is an accurate reason, and a confidently wrong one is
+      // worse than the silence it replaced.
+      Journal(winner, SignalOutcome.OutputFailed, winning.Subjects.Count, OutputFailedDetail);
       return;
+    }
 
     _lastAlertTicks = now;
-    Plugin.Journal.Record(winner, SignalOutcome.Said, winning.Subjects.Count, string.Empty);
-    _pending.Remove(winner);
+    Journal(winner, SignalOutcome.Said, winning.Subjects.Count, string.Empty);
+    Forget(winner);
 
     // The classes that lost this window. Without this the journal would show what WAS said and stay silent
     // about what was not — which is the half the user came for.
+    //
+    // The reason has to follow Pick's actual branch. Pick is not strict priority: it promotes a class that has
+    // waited past PromoteAfterMs ahead of the ladder precisely so the bottom cannot starve, and the winner is
+    // then by construction the LESS urgent one. Reporting "something more urgent went first" there would tell a
+    // more urgent loser the exact inverse of what happened, in the one window whose only product is the truth
+    // about which rule fired.
     foreach (var (signalClass, signal) in _pending)
-      Plugin.Journal.Record(signalClass, SignalOutcome.Waiting, signal.Subjects.Count,
-        "something more urgent went first");
+      Journal(signalClass, SignalOutcome.Waiting, signal.Subjects.Count,
+        promoted ? "another signal had waited longer" : "something more urgent went first");
   }
 
   /// <summary>
@@ -526,8 +567,10 @@ public sealed class AlertService
     if (doomed is null)
       return;
 
+    // Forget, not Remove: the class is leaving, so the outcome standing against it must leave with it or it
+    // will swallow the first row of whatever episode comes next.
     foreach (var signalClass in doomed)
-      _pending.Remove(signalClass);
+      Forget(signalClass);
   }
 
   /// <summary>
@@ -610,7 +653,15 @@ public sealed class AlertService
   ///
   /// Callers must have checked <see cref="_pending"/> is non-empty.
   /// </summary>
-  private SignalClass Pick(long now)
+  /// <param name="promoted">
+  /// True when the winner jumped the ladder on age rather than earning the window on urgency.
+  ///
+  /// Reported rather than re-derived, because only this method knows which branch fired. The caller cannot
+  /// recover it: comparing the winner's ordinal against the losers' says nothing — the most urgent class is
+  /// ALSO the one that wins on strict priority — so a caller guessing from the outside gets the anti-starvation
+  /// case exactly backwards, which is precisely the case the journal exists to explain.
+  /// </param>
+  private SignalClass Pick(long now, out bool promoted)
   {
     SignalClass? overdue = null;
     var oldest = long.MaxValue;
@@ -634,9 +685,13 @@ public sealed class AlertService
       overdue = signalClass;
     }
 
-    if (overdue is { } promoted)
-      return promoted;
+    if (overdue is { } jumped)
+    {
+      promoted = true;
+      return jumped;
+    }
 
+    promoted = false;
     var best = SignalClass.FocusArrival;
     var found = false;
     foreach (var signalClass in _pending.Keys)
@@ -739,6 +794,38 @@ public sealed class AlertService
   }
 
   /// <summary>
+  /// Records a decision, but only when it is a different decision than the one already standing for this class.
+  ///
+  /// Every journalling call in the alert path goes through here rather than at
+  /// <see cref="SignalJournal.Record"/> directly, because the repetition is a property of the CALLER — Pump runs
+  /// per scan — and pushing the filter down into the journal would make it lie to any future caller that
+  /// legitimately wants two identical rows. See <see cref="_lastJournalled"/>.
+  /// </summary>
+  private void Journal(SignalClass signalClass, SignalOutcome outcome, int subjects, string detail)
+  {
+    if (_lastJournalled.TryGetValue(signalClass, out var previous) && previous == outcome)
+      return;
+
+    _lastJournalled[signalClass] = outcome;
+    Plugin.Journal.Record(signalClass, outcome, subjects, detail);
+  }
+
+  /// <summary>
+  /// Drops a class from the pending set and forgets what was last said about it, so its next appearance
+  /// journals from a clean slate rather than being mistaken for the tail of the last episode.
+  ///
+  /// The two dictionaries are only ever wrong together, so they are only ever written together. Removing from
+  /// <see cref="_pending"/> alone would leave a stale outcome that silently swallows the first entry of the
+  /// next episode — the failure would be a MISSING row in the diagnostic, which is the one bug this feature
+  /// cannot have and the one no test notices.
+  /// </summary>
+  private void Forget(SignalClass signalClass)
+  {
+    _pending.Remove(signalClass);
+    _lastJournalled.Remove(signalClass);
+  }
+
+  /// <summary>
   /// Forgets everything waiting, for the states where the world it described is gone: logged out, mid-zone, in
   /// PvP, or a scan that threw.
   ///
@@ -749,6 +836,7 @@ public sealed class AlertService
   public void ClearPending()
   {
     _pending.Clear();
+    _lastJournalled.Clear();
 
     // The journal goes with them, and this is a PvP requirement rather than tidiness. The config window draws
     // in PvP — it has its own "PvP — hidden" banner — so a journal holding entries raised before the boundary

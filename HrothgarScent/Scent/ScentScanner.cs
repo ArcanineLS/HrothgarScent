@@ -572,21 +572,27 @@ public sealed class ScentScanner : IDisposable
   /// </summary>
   private void Reset()
   {
+    // ABOVE the guard, and that placement is the whole point. A signal waiting on the bus describes people in a
+    // world that has just ended, and the journal describes decisions about them; nothing raised before a PvP
+    // boundary may survive it, and the config window — which draws in PvP, banner and all — is where those
+    // entries would be read.
+    //
+    // Behind the guard that promise had a hole exactly the shape of a scan that throws. Scan journals near its
+    // end but publishes its snapshot LAST, so a throw in between leaves entries written and _snapshot untouched
+    // — and if _snapshot was already Empty by reference, every Reset from then on short-circuits before
+    // reaching this line and the entries live forever. The guard's real subjects are the log Sync, the snapshot
+    // write and the Redraw; the journal has no business behind an identity check on an unrelated object.
+    //
+    // Free to hoist, which is why there is no reason not to: both dictionaries clear trivially when empty and
+    // SignalJournal.Clear self-guards on a count, so the repeated logged-out ticks the guard exists to protect
+    // pay nothing for this.
+    _alerts.ClearPending();
+
     if (ReferenceEquals(Volatile.Read(ref _snapshot), ScentSnapshot.Empty))
       return;
 
     _previousWatchers.Clear();
     _previousNearby.Clear();
-
-    // Inside the guard, deliberately: a signal waiting on the bus describes people in a world that has just
-    // ended, and Pump would never speak it anyway once its subjects fail the re-check. Dropping it here is what
-    // makes that certain rather than incidental — nothing raised before a PvP boundary may survive it, and
-    // nothing raised before a zone may arrive four seconds into the next one.
-    //
-    // The catch in OnFrameworkUpdate also lands here, so a scan that throws between a Raise and its Pump
-    // discards that scan's signals. Correct rather than merely tolerable: the snapshot behind them is being
-    // thrown away too, and a stare escalation re-raises on the next good scan regardless.
-    _alerts.ClearPending();
 
     _log.Sync([], NoWatchers);
     Volatile.Write(ref _snapshot, ScentSnapshot.Empty);
