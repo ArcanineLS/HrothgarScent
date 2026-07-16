@@ -276,6 +276,16 @@ public sealed class Configuration : IPluginConfiguration
   public bool UseJobAbbreviations { get; set; } = true;
 
   /// <summary>
+  /// The game's own icon beside each job name.
+  ///
+  /// Deliberately NOT in <see cref="FilterSignature"/>, for exactly the reason <see cref="HiddenColumnMask"/>
+  /// is not: it changes which cells are drawn, never which rows survive or what order they are in, so rebuilding
+  /// the view on it would be pure waste. It does not touch the sort either — ScentColumn.Job keys on the
+  /// rendered STRING, and an icon has no string.
+  /// </summary>
+  public bool ShowJobIcons { get; set; } = true;
+
+  /// <summary>
   /// Focus-target whoever's name the cursor is resting on, so the list can be read against the world.
   ///
   /// Off by default because it clobbers the focus target — the previous one is not restored on the way out,

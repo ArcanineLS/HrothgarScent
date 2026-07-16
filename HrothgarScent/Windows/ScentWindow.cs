@@ -6,6 +6,7 @@ using System.Threading;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.ClientState.Conditions;
 using Dalamud.Interface;
+using Dalamud.Interface.Textures;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
@@ -91,6 +92,10 @@ public sealed class ScentWindow : Window
 
   /// <summary>Ceiling for the "hide low level" filter — the throwaway alts and bots milling around aetherytes.</summary>
   private const byte LowLevelThreshold = 3;
+
+  /// <summary>First row of the game's job-icon block; the icon for job N is this plus N. Undocumented, and safe
+  /// only because <see cref="DrawJobIcon"/> asks for it with the non-throwing lookup.</summary>
+  private const uint JobIconBase = 62100;
 
   private const float HistoryTableHeight = 120f;
 
@@ -1206,7 +1211,7 @@ public sealed class ScentWindow : Window
     ImGui.TableSetupScrollFreeze(0, hud ? 0 : 1);
 
     foreach (var column in columns)
-      SetupColumn(column, config, scale);
+      SetupColumn(column, config, scale, rowHeight);
 
     if (!hud)
       ImGui.TableHeadersRow();
@@ -1263,7 +1268,7 @@ public sealed class ScentWindow : Window
   /// cover, because DefaultSort on a disabled column is inert. ApplyColumnVisibility keeps the mask and the
   /// ticks in step, so only a hand-edited config arrives here with them disagreeing.
   /// </summary>
-  private void SetupColumn(ScentColumn column, Configuration config, float scale)
+  private void SetupColumn(ScentColumn column, Configuration config, float scale, float rowHeight)
   {
     var flags = SortFlagsFor(column);
 
@@ -1300,8 +1305,12 @@ public sealed class ScentWindow : Window
         ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch | flags, 0f, (uint)column);
         break;
 
+      // Widened by exactly what the icon takes when it is on, measured rather than guessed. A fixed column
+      // does not grow to fit its content — it clips it, with no ellipsis to admit it — so an icon added to a
+      // width chosen for "WAR" would silently eat the text it sits beside.
       case ScentColumn.Job:
-        ImGui.TableSetupColumn("Job", ImGuiTableColumnFlags.WidthFixed | flags, 46f * scale, (uint)column);
+        ImGui.TableSetupColumn("Job", ImGuiTableColumnFlags.WidthFixed | flags,
+          46f * scale + (config.ShowJobIcons ? JobIconSize(scale, rowHeight) + 4f * scale : 0f), (uint)column);
         break;
 
       case ScentColumn.Race:
@@ -1596,6 +1605,7 @@ public sealed class ScentWindow : Window
 
         case ScentColumn.Job:
           ImGui.TableNextColumn();
+          DrawJobIcon(row, config, scale, rowHeight);
           ImGui.TextColored(JobPalette.JobColor(row.JobId),
             config.UseJobAbbreviations ? row.JobAbbreviation : row.JobName);
           break;
@@ -1650,6 +1660,49 @@ public sealed class ScentWindow : Window
 
     ImGui.PopID();
   }
+
+  /// <summary>
+  /// The game's own icon for a job, drawn before its name. Draws nothing at all if the texture is not ready.
+  ///
+  /// NO CACHE, NO DISPOSE, NO LIFETIME. ISharedImmediateTexture is owned by Dalamud, and TryGetWrap hands back
+  /// a wrap valid for the rest of the frame — so the correct amount of bookkeeping here is none. The prior art
+  /// ships no textures at all and instead has a settings SCREEN whose only job is to populate a dropdown on a
+  /// different settings screen: you tick FontAwesome glyphs into a pool, then pick from that pool per player.
+  /// None of that has to exist, because the icon is DERIVED from a field the row already carries.
+  ///
+  /// TryGetFromGameIcon, never GetFromGameIcon: the latter resolves the path eagerly and THROWS on an icon that
+  /// does not exist, which would put an exception in a table cell for a decoration. The Try form is documented
+  /// not to throw, and that is what makes the undocumented 62100 base safe to ship — a wrong id draws nothing
+  /// and the job's name is still right there.
+  ///
+  /// 62100 is the job-icon block; job 0 is "not loaded yet", which has no icon and no business claiming one.
+  /// </summary>
+  private static void DrawJobIcon(ScentRow row, Configuration config, float scale, float rowHeight)
+  {
+    if (!config.ShowJobIcons || row.JobId == 0)
+      return;
+
+    if (!Plugin.Textures.TryGetFromGameIcon(new GameIconLookup(JobIconBase + row.JobId), out var shared)
+        || !shared.TryGetWrap(out var wrap, out _))
+      return;
+
+    var size = JobIconSize(scale, rowHeight);
+    ImGui.Image(wrap.Handle, new Vector2(size, size));
+    ImGui.SameLine(0, 4f * scale);
+  }
+
+  /// <summary>
+  /// The job icon's edge.
+  ///
+  /// Sized to the CONTENT, not to rowHeight: the row's height already includes its padding, so drawing at
+  /// rowHeight would make each row exactly two paddings taller than the height the window was measured and
+  /// pinned against — and rows would re-flow as textures streamed in. If it reads too small, raise it inside
+  /// <see cref="RowHeight"/>, the one place where the pin, the reserve and the icon all move together.
+  ///
+  /// Shared by the drawing and by the column's width so the two cannot drift; a column narrower than its own
+  /// icon clips the text beside it, silently.
+  /// </summary>
+  private static float JobIconSize(float scale, float rowHeight) => rowHeight - CellPadding(scale).Y * 2f;
 
   /// <summary>
   /// Which single glyph stands for a mark, and what it says. Null when the record has nothing to show for

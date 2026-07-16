@@ -12,13 +12,20 @@ public sealed record ScentSnapshot(
   IReadOnlyList<ScentRow> Rows,
   int NearbyCount,
   int WatcherCount,
-  bool Valid)
+  bool Valid,
+  StareLevel MaxStareLevel,
+  bool MarkedNearby)
 {
   /// <summary>
   /// Published whenever there is nothing legitimate to show: logged out, zoning, or PvP. Valid=false lets
   /// the UI tell "no players nearby" apart from "not scanning" — the two look identical otherwise, and
   /// telling someone the coast is clear when we simply stopped looking is the one lie this plugin can't
   /// afford. Also the identity the scanner compares against to keep its reset idempotent.
+  ///
+  /// Every member spelled out rather than left to a default, and that is not style: this value is the PvP
+  /// defence's second layer — the gates hide the surfaces, and this is what guarantees there is nothing behind
+  /// them to hide. A member that silently defaulted would be one the next reader has to go and check.
   /// </summary>
-  public static readonly ScentSnapshot Empty = new(0, [], 0, 0, false);
+  public static readonly ScentSnapshot Empty =
+    new(0, [], 0, 0, false, StareLevel.Glance, false);
 }

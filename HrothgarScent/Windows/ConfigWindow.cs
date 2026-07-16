@@ -344,6 +344,11 @@ public sealed class ConfigWindow : Window
       "Show the search box on the Scent window's toolbar. Hiding it also stops whatever is typed in it from " +
       "filtering, so the list can never be filtered by a box you cannot see.");
 
+    ConfigCheckbox("Show job icons",
+      () => Plugin.Configuration.ShowJobIcons,
+      v => Plugin.Configuration.ShowJobIcons = v,
+      "The game's own job icon beside each job name in the list.");
+
     ConfigCheckbox("Add 'Hrothgar remember' to the game's right-click menu",
       () => Plugin.Configuration.ShowContextMenuMark,
       v => Plugin.Configuration.ShowContextMenuMark = v,

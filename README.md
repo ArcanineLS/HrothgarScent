@@ -144,7 +144,8 @@ The config window (`/hscent config`) has a left icon rail: **General**, **Filter
 | Add 'Hrothgar remember' to the game's right-click menu | On | Adds an entry wherever the game shows a player's name — friend list, Party Finder, chat log, FC roster. The only way to mark someone the Scent window can't see. Nothing is written down until you click it. Never appears in PvP. |
 | Show watcher history | On | Shows the **Hrothgar remember** section under the player list. |
 | Use job abbreviations | On | `WAR` instead of `Warrior`. |
-| Show server info bar entry | On | Adds the nearby/watcher count to the server info bar. |
+| Show job icons | On | The game's own job icon beside each job name. |
+| Show server info bar entry | On | Adds the nearby/watcher count to the server info bar. The count turns red when someone is actually fixated on you, rather than just glancing, and a marker appears when someone you've marked is nearby. Hover it for the details. |
 | Rescan interval | 250 ms | How often Hrothgar sniffs. Lower is snappier and costs more CPU; below ~100 ms buys nothing. Floored at 50 ms. Double-click the slider to type an exact value. |
 
 ### Filters

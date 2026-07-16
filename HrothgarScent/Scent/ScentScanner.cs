@@ -274,6 +274,10 @@ public sealed class ScentScanner : IDisposable
     var seenAt = wantLastSeen ? DateTimeOffset.Now : default;
     var zoneName = wantLastSeen ? ZoneName() : string.Empty;
 
+    // The two facts the info bar needs but cannot afford to work out for itself. See the loop below.
+    var markedNearby = false;
+    var maxStare = StareLevel.Glance;
+
     foreach (var row in rows)
     {
       if (row.IsSelf)
@@ -286,6 +290,16 @@ public sealed class ScentScanner : IDisposable
       // cannot create a record for anyone. See MarkStore.RecordSeen.
       if (wantLastSeen)
         Plugin.Marks.RecordSeen(row.Key, zoneName, seenAt);
+
+      // Resolved HERE, in the loop that already walks every row, and published on the snapshot — never worked
+      // out by the info bar. UpdateDtr runs on EVERY frame, unthrottled, and ahead of its own change guard, so
+      // an O(rows x marks) probe there would be paid sixty times a second and the guard could not amortise a
+      // penny of it. This loop is already paying for the walk.
+      //
+      // NOT ignored, and this is the ignore promise rather than a nicety: an ignored player IS a marked one, so
+      // a plain "is there a mark" test would put "one you marked is here" on the info bar about the very person
+      // the user said to never show or announce again. Ignore beats focus here as everywhere.
+      markedNearby |= marks.Find(row.Key) is { IsIgnored: false };
 
       if (row.IsWatching)
       {
@@ -316,6 +330,14 @@ public sealed class ScentScanner : IDisposable
           state = new StareState { FirstTicks = now, LastTicks = now };
           (fresh ??= []).Add(row);
         }
+
+        // The worst rung anyone has reached RIGHT NOW, for the info bar. Off the live threshold rather than
+        // state.Level: Level is a record of what has been ANNOUNCED, so a rung waiting on the cooldown would
+        // leave the bar reporting a calm it cannot see. The bar is a readout, not an alert — it owes the truth
+        // now, not the truth that was spoken.
+        var reached = config.StareLevelOf(state.AccumulatedMs);
+        if (reached > maxStare)
+          maxStare = reached;
 
         current[row.Key] = state;
       }
@@ -368,7 +390,9 @@ public sealed class ScentScanner : IDisposable
       Rows: rows.ToArray(),
       NearbyCount: nearby,
       WatcherCount: current.Count,
-      Valid: true));
+      Valid: true,
+      MaxStareLevel: maxStare,
+      MarkedNearby: markedNearby));
   }
 
   /// <summary>

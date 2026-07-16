@@ -15,6 +15,7 @@ using System.Linq;
 using Dalamud.Game.Command;
 using Dalamud.Game.Gui.ContextMenu;
 using Dalamud.Game.Gui.Dtr;
+using Dalamud.Game.Text.SeStringHandling;
 using Dalamud.Interface.GameFonts;
 using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Utility;
@@ -37,6 +38,14 @@ public sealed class Plugin : IDalamudPlugin
   internal const string ChatTag = "HrothgarScent";
   internal const ushort ChatTagColor = 45;
 
+  /// <summary>
+  /// UIColor row id the info bar's count turns when someone is actually fixated on you — a red, matching the
+  /// chat alert's. Cosmetic only, and unverified against the live sheet from the shipped assemblies, on exactly
+  /// the terms AlertService already accepts for its own: a wrong row id costs the wrong colour and nothing else.
+  /// The tooltip says the same thing in words, so nothing depends on this landing.
+  /// </summary>
+  private const ushort DtrStareColor = 17;
+
   [PluginService] internal static IDalamudPluginInterface PluginInterface { get; private set; } = null!;
   [PluginService] internal static ICommandManager CommandManager { get; private set; } = null!;
   [PluginService] public static IObjectTable Objects { get; private set; } = null!;
@@ -56,6 +65,9 @@ public sealed class Plugin : IDalamudPlugin
   /// <summary>The game's own right-click menu. Gate #5 of the PvP defence lives on this one — see
   /// <see cref="OnMenuOpened"/>.</summary>
   [PluginService] public static IContextMenu ContextMenu { get; private set; } = null!;
+
+  /// <summary>The game's own icons. Needs no caching and no disposal of ours — see ScentWindow's job cell.</summary>
+  [PluginService] public static ITextureProvider Textures { get; private set; } = null!;
 
   public static Configuration Configuration { get; private set; } = null!;
   public static ScentScanner Scanner { get; private set; } = null!;
@@ -101,7 +113,8 @@ public sealed class Plugin : IDalamudPlugin
   /// happened to move, which in a housing ward or an inn is never. Same discipline, and the same reason, as
   /// <see cref="Configuration.FilterSignature"/>: key on what the output is made of, not on the output.
   /// </summary>
-  private (bool Nearby, bool Watchers, int NearbyCount, int WatcherCount)? _dtrLast;
+  private (bool Nearby, bool Watchers, int NearbyCount, int WatcherCount, StareLevel Stare, bool Marked)?
+    _dtrLast;
 
   public Plugin()
   {
@@ -286,8 +299,11 @@ public sealed class Plugin : IDalamudPlugin
     // Assign only on change: each setter rebuilds the payload, and this runs every single frame. ADD EVERY NEW
     // INPUT OF THE TWO STRINGS BELOW HERE. Leaving one out does not break the build and does not look like a
     // bug — the info bar simply keeps the previous answer, with nothing on screen to explain why.
+    var stare = Configuration.EnableWatchers ? snapshot.MaxStareLevel : StareLevel.Glance;
+    var marked = Configuration.EnableNearbyList && snapshot.MarkedNearby;
+
     var inputs = (Configuration.EnableNearbyList, Configuration.EnableWatchers,
-      snapshot.NearbyCount, snapshot.WatcherCount);
+      snapshot.NearbyCount, snapshot.WatcherCount, stare, marked);
     if (_dtrLast == inputs)
       return;
 
@@ -295,18 +311,46 @@ public sealed class Plugin : IDalamudPlugin
 
     // Each half prints only its own count. The scanner keeps both up to date either way — the halves are UI
     // only — so this is the one place the toggles reach the info bar.
-    _dtrEntry.Text = Configuration.EnableNearbyList
+    //
+    // The watcher count carries the INTENSITY as well as the volume: "42 (1)" reads the same whether that one
+    // glanced for a frame or has held you for a minute, and intensity is the interesting half. This is the only
+    // surface that is on screen with the window shut, so it is the cheapest place in the plugin to say so.
+    var counts = Configuration.EnableNearbyList
       ? Configuration.EnableWatchers && snapshot.WatcherCount > 0
         ? $"Scent: {snapshot.NearbyCount} ({snapshot.WatcherCount})"
         : $"Scent: {snapshot.NearbyCount}"
       : $"Scent: ({snapshot.WatcherCount})";
 
+    var text = new SeStringBuilder();
+
+    // One glyph and one colour is the whole budget. The info bar is real estate shared with every other
+    // plugin, and a third decoration would be antisocial.
+    if (marked)
+      text.AddIcon(BitmapFontIcon.Returner);
+
+    if (stare > StareLevel.Glance)
+      text.AddUiForeground(DtrStareColor).AddText(counts).AddUiForegroundOff();
+    else
+      text.AddText(counts);
+
+    _dtrEntry.Text = text.Build();
+
+    // The tier in WORDS as well as in colour. A colour-only escalation is invisible to a colourblind user, and
+    // this is the one readout with no room to say it any other way.
+    var stareLine = stare switch
+    {
+      StareLevel.Fixation => "\nOne of them fixed on you.",
+      StareLevel.Stare => "\nOne of them not looking away.",
+      _ => string.Empty,
+    };
+
     _dtrEntry.Tooltip = (Configuration.EnableNearbyList, Configuration.EnableWatchers) switch
     {
-      (true, true) => $"Hrothgar smell {snapshot.NearbyCount} nearby, {snapshot.WatcherCount} watching you.\n",
-      (true, false) => $"Hrothgar smell {snapshot.NearbyCount} nearby.\n",
-      _ => $"Hrothgar smell {snapshot.WatcherCount} watching you.\n",
-    } + "Left-click: open Scent. Right-click: settings.";
+      (true, true) => $"Hrothgar smell {snapshot.NearbyCount} nearby, {snapshot.WatcherCount} watching you.",
+      (true, false) => $"Hrothgar smell {snapshot.NearbyCount} nearby.",
+      _ => $"Hrothgar smell {snapshot.WatcherCount} watching you.",
+    } + stareLine + (marked ? "\nOne you marked is here." : string.Empty)
+      + "\nLeft-click: open Scent. Right-click: settings.";
   }
 
   private void OnDtrClick(DtrInteractionEvent ev)
