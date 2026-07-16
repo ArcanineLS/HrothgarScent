@@ -54,6 +54,8 @@ Alerts fire **once per person**, not once per glance.
 
 The watcher history lives in memory only. It is never written to disk, and it is cleared on logout.
 
+Turn on **Show the eye over their head** in General and a watcher's *nameplate* is coloured too, so you can see who's looking without the window open. It's off by default, it only ever changes a colour — nothing added, nothing hidden — and it never runs in PvP.
+
 ### 👁 A glance is not a stare
 
 Someone cycling targets holds you for a second. Someone *fixed on you* holds you for a minute. Hrothgar tells them apart:
@@ -145,6 +147,7 @@ The config window (`/hscent config`) has a left icon rail: **General**, **Filter
 | Show watcher history | On | Shows the **Hrothgar remember** section under the player list. |
 | Use job abbreviations | On | `WAR` instead of `Warrior`. |
 | Show job icons | On | The game's own job icon beside each job name. |
+| Show the eye over their head | **Off** | Colours the nameplate of anyone targeting you. Cosmetic only, and never in PvP. |
 | Show server info bar entry | On | Adds the nearby/watcher count to the server info bar. The count turns red when someone is actually fixated on you, rather than just glancing, and a marker appears when someone you've marked is nearby. Hover it for the details. |
 | Rescan interval | 250 ms | How often Hrothgar sniffs. Lower is snappier and costs more CPU; below ~100 ms buys nothing. Floored at 50 ms. Double-click the slider to type an exact value. |
 

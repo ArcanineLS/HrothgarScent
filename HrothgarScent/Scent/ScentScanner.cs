@@ -377,6 +377,16 @@ public sealed class ScentScanner : IDisposable
     // against who is still watching and who is still here before it is allowed to speak.
     _alerts.Pump(current, nearbyKeys);
 
+    // BEFORE _previousWatchers is replaced, while both sides of the edge are still in hand, and keyed on the
+    // whole SET rather than on `fresh`: fresh only ever holds arrivals, and a DEPARTURE is the case that
+    // matters — nothing else would ever tell the plates to drop the colour off someone who looked away. The
+    // game never dirties a plate because its owner changed target, so without this the eye never moves.
+    //
+    // Gated on the feature, because RequestRedraw is a game call and asking the game to rebuild every plate
+    // four times a second, to paint nothing, is rude to everyone else drawing on them.
+    if (config.NameplateMode != NameplateMode.Off && !SameWatchers(current, _previousWatchers))
+      Plugin.Nameplates.Redraw();
+
     // Updated unconditionally, including when we chose not to record: otherwise every watcher already
     // present would re-fire the moment the window opened.
     _previousWatchers = current;
@@ -385,9 +395,22 @@ public sealed class ScentScanner : IDisposable
     // ToArray freezes the projection — the List must not escape, or a later scan could grow it under a
     // reader mid-draw. One reference write publishes the whole thing; reference assignment is atomic, so no
     // lock is needed and no reader can observe a partial snapshot.
+    // INDEXER ASSIGNMENT, never ToDictionary or ToFrozenDictionary — both THROW on a duplicate key, and a throw
+    // here is caught by OnFrameworkUpdate, which answers it with Reset(). One duplicated object id would
+    // therefore empty the list on every scan, forever: the whole plugin switched off, silently, by a decoration.
+    // Today a duplicate costs one redundant table row. Last-wins is the same answer the table already gives.
+    // MaxPlayerObjectIndex is the same belt-and-braces instinct, one layer up.
+    //
+    // A plain Dictionary rather than a frozen one: this is rebuilt four times a second, and FrozenDictionary
+    // trades expensive construction for fast reads — the wrong side of that trade at this lifetime.
+    var byId = new Dictionary<ulong, ScentRow>(rows.Count);
+    foreach (var row in rows)
+      byId[row.GameObjectId] = row;
+
     Volatile.Write(ref _snapshot, new ScentSnapshot(
       Version: ++_version,
       Rows: rows.ToArray(),
+      ById: byId,
       NearbyCount: nearby,
       WatcherCount: current.Count,
       Valid: true,
@@ -434,6 +457,27 @@ public sealed class ScentScanner : IDisposable
   /// </summary>
   private static bool IsWatching(ulong targetId, ulong myGameObjectId)
     => targetId != 0 && targetId != NoTargetSentinel && targetId == myGameObjectId;
+
+  /// <summary>
+  /// Whether the same people are watching, ignoring how long each has been at it.
+  ///
+  /// Equal counts plus one-way containment IS set equality, which is why one loop suffices. Written out rather
+  /// than reached for via SetEquals so that nothing allocates: this runs on every scan for as long as anyone is
+  /// looking at you, and the answer is almost always "yes, nothing changed".
+  /// </summary>
+  private static bool SameWatchers(Dictionary<WatcherKey, StareState> a, Dictionary<WatcherKey, StareState> b)
+  {
+    if (a.Count != b.Count)
+      return false;
+
+    foreach (var key in a.Keys)
+    {
+      if (!b.ContainsKey(key))
+        return false;
+    }
+
+    return true;
+  }
 
   /// <summary>
   /// The current zone's name, resolved once per zone rather than once per scan.
@@ -529,5 +573,12 @@ public sealed class ScentScanner : IDisposable
 
     _log.Sync([], NoWatchers);
     Volatile.Write(ref _snapshot, ScentSnapshot.Empty);
+
+    // INSIDE the idempotence guard above, which is the whole reason this is safe to put here: Reset runs on
+    // every throttle tick for as long as the player stays logged out, and an unguarded redraw would ask the
+    // game to rebuild every nameplate four times a second, forever, for nothing. Past the guard it fires once,
+    // on the transition — which is exactly when the plates are still wearing the last zone's colours.
+    if (Plugin.Configuration.NameplateMode != NameplateMode.Off)
+      Plugin.Nameplates.Redraw();
   }
 }

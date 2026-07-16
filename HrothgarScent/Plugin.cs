@@ -69,6 +69,10 @@ public sealed class Plugin : IDalamudPlugin
   /// <summary>The game's own icons. Needs no caching and no disposal of ours — see ScentWindow's job cell.</summary>
   [PluginService] public static ITextureProvider Textures { get; private set; } = null!;
 
+  /// <summary>The nameplates over players' heads. Gate #6 of the PvP defence lives on this one; see
+  /// <see cref="NameplateService.Sync"/>.</summary>
+  [PluginService] public static INamePlateGui NamePlateGui { get; private set; } = null!;
+
   public static Configuration Configuration { get; private set; } = null!;
   public static ScentScanner Scanner { get; private set; } = null!;
   public static WatcherLog WatcherLog { get; private set; } = null!;
@@ -77,6 +81,9 @@ public sealed class Plugin : IDalamudPlugin
   /// <summary>The durable record of players the user pointed at. The counterpart to <see cref="WatcherLog"/>,
   /// which is the record of players who pointed at them, and which is never written down.</summary>
   public static MarkStore Marks { get; private set; } = null!;
+
+  /// <summary>The eye over their head. Off unless the user asks.</summary>
+  public static NameplateService Nameplates { get; private set; } = null!;
 
   public readonly WindowSystem WindowSystem = new("HrothgarScent");
   private ScentWindow ScentWindow { get; init; }
@@ -132,6 +139,7 @@ public sealed class Plugin : IDalamudPlugin
 
     WatcherLog = new WatcherLog();
     Alerts = new AlertService();
+    Nameplates = new NameplateService();
     Scanner = new ScentScanner(WatcherLog, Alerts);
 
     ScentWindow = new ScentWindow();
@@ -221,6 +229,10 @@ public sealed class Plugin : IDalamudPlugin
 
     Scanner.Dispose();
 
+    // Detaches the handler and scrubs what it painted. Before the scanner's data goes, so the redraw it asks
+    // for has something coherent to redraw against.
+    Nameplates.Dispose();
+
     // After the scanner stops, so nothing can queue another write behind this one. Bounded internally: a hung
     // disk must not wedge a synchronous unload.
     Marks.Flush();
@@ -272,6 +284,11 @@ public sealed class Plugin : IDalamudPlugin
     // First, and outside anything that could return early: once Dalamud stops raising the Draw event this is
     // the hover focus's only way back to the game. See ScentWindow.ReleaseStrandedHoverFocus.
     ScentWindow.ReleaseStrandedHoverFocus();
+
+    // Every frame, unthrottled, and deliberately not driven by an event: the one event that looks right —
+    // TerritoryChanged — reads IsPvP before the game has assigned it, and so fails open on the way IN. See
+    // NameplateService.Sync. Two field reads and a comparison; it costs nothing to be sure.
+    Nameplates.Sync();
 
     UpdateDtr();
   }

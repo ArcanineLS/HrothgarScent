@@ -10,6 +10,7 @@ namespace HrothgarScent.Scent;
 public sealed record ScentSnapshot(
   long Version,
   IReadOnlyList<ScentRow> Rows,
+  IReadOnlyDictionary<ulong, ScentRow> ById,
   int NearbyCount,
   int WatcherCount,
   bool Valid,
@@ -27,5 +28,5 @@ public sealed record ScentSnapshot(
   /// them to hide. A member that silently defaulted would be one the next reader has to go and check.
   /// </summary>
   public static readonly ScentSnapshot Empty =
-    new(0, [], 0, 0, false, StareLevel.Glance, false);
+    new(0, [], new Dictionary<ulong, ScentRow>(), 0, 0, false, StareLevel.Glance, false);
 }

@@ -15,6 +15,17 @@ public enum JobColorMode
   Job,
 }
 
+/// <summary>How much of the plugin reaches the nameplates over players' heads.</summary>
+public enum NameplateMode
+{
+  /// <summary>Nothing. The default, and deliberately: writing on the game's own world UI is somebody else's
+  /// screen, and a plugin that starts doing it uninvited is a bad guest.</summary>
+  Off,
+
+  /// <summary>Colour the name of whoever is targeting you, and nothing else.</summary>
+  Watchers,
+}
+
 public enum LodestoneRegion
 {
   Europe,
@@ -286,6 +297,17 @@ public sealed class Configuration : IPluginConfiguration
   public bool ShowJobIcons { get; set; } = true;
 
   /// <summary>
+  /// Whether the watcher eye reaches the nameplate over a player's head.
+  ///
+  /// OFF by default and staying that way. Nameplate modification is the most visible thing a plugin can do and
+  /// is scrutinised at Dalamud review; it is also the one surface where being wrong is wrong in front of other
+  /// people. The user asks for this or it does not happen.
+  ///
+  /// Cosmetic only — a colour on a name, nothing added, nothing hidden. See NameplateService.
+  /// </summary>
+  public NameplateMode NameplateMode { get; set; } = NameplateMode.Off;
+
+  /// <summary>
   /// Focus-target whoever's name the cursor is resting on, so the list can be read against the world.
   ///
   /// Off by default because it clobbers the focus target — the previous one is not restored on the way out,
@@ -307,9 +329,10 @@ public sealed class Configuration : IPluginConfiguration
   /// <summary>
   /// Whether the watcher half is shown. UI only; see <see cref="EnableNearbyList"/>.
   ///
-  /// Hides the eye column, the history section and the info bar's watcher count, and suppresses watcher alerts
-  /// — an alert is user-facing output of a feature the user switched off, and a chat line from a half that is
-  /// not on screen has nothing to explain it.
+  /// Hides the eye column, the history section, the info bar's watcher count and the nameplate colour, and
+  /// suppresses watcher alerts — an alert is user-facing output of a feature the user switched off, and a chat
+  /// line from a half that is not on screen has nothing to explain it. ADD EVERY NEW WATCHER SURFACE HERE:
+  /// this doc is the list, and a surface missing from it is one that keeps talking after the half goes quiet.
   /// </summary>
   public bool EnableWatchers { get; set; } = true;
 

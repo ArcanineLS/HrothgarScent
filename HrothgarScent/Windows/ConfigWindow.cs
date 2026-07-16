@@ -349,6 +349,18 @@ public sealed class ConfigWindow : Window
       v => Plugin.Configuration.ShowJobIcons = v,
       "The game's own job icon beside each job name in the list.");
 
+    // Off by default and asked for explicitly: this is the game's own world UI, in front of other people.
+    // Toggling it only writes config — NameplateService.Sync notices on the next framework tick and attaches or
+    // detaches itself. Calling the game from a checkbox in Draw is the thing this plugin does not do.
+    var nameplates = Plugin.Configuration.NameplateMode != NameplateMode.Off;
+    if (ImGui.Checkbox("Show the eye over their head", ref nameplates))
+    {
+      Plugin.Configuration.NameplateMode = nameplates ? NameplateMode.Watchers : NameplateMode.Off;
+      Plugin.Configuration.Save();
+    }
+    UiTheme.Tooltip("Colours the nameplate of anyone targeting you, so you can see it without the window open. " +
+                    "Nothing is added or hidden — just the colour, and only in the open world. Never in PvP.");
+
     ConfigCheckbox("Add 'Hrothgar remember' to the game's right-click menu",
       () => Plugin.Configuration.ShowContextMenuMark,
       v => Plugin.Configuration.ShowContextMenuMark = v,
