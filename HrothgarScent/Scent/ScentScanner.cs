@@ -52,6 +52,15 @@ public sealed class ScentScanner : IDisposable
   /// the value simply rides along, carried forward in place by the edge pass instead of a set being rebuilt
   /// every tick. Framework-thread-owned, like everything else the scan mutates.
   /// </summary>
+  /// <summary>
+  /// The mark revision this scanner last told the nameplates about, so an edit fires exactly one redraw.
+  /// </summary>
+  /// <remarks>
+  /// -1 rather than 0: MarksIndex.Empty starts at revision 0, so a 0 here would make the first scan of a session
+  /// with no marks at all look like a change and ask the game to rebuild every plate for nothing.
+  /// </remarks>
+  private int _previousMarkRevision = -1;
+
   private Dictionary<WatcherKey, StareState> _previousWatchers = [];
 
   /// <summary>The territory <see cref="_zoneName"/> was resolved for. Framework-thread-owned; see
@@ -403,6 +412,27 @@ public sealed class ScentScanner : IDisposable
     if (config.NameplateMode != NameplateMode.Off && config.EnableWatchers
         && !SameWatchers(current, _previousWatchers))
       Plugin.Nameplates.Redraw();
+
+    // The mark half's own trigger, on the same terms and for the same reason: the game will not dirty a plate
+    // because the user picked a colour, so without this the feature is inert — you choose cyan in the profile
+    // and the plate keeps whatever it had until something unrelated forces a rebuild.
+    //
+    // The REVISION, not the set. The watcher test above compares who is watching, because that is what changes
+    // it; here the set can be identical while the answer is completely different — recolouring or unfocusing
+    // someone already standing there changes no membership at all. MarksIndex is published whole on every edit
+    // and carries its own revision, so this notices any of them without the scanner learning what a mark is.
+    //
+    // Its own statement rather than a clause on the one above, because the two are independently switchable and
+    // an && between them would let either half silently disable the other's redraw.
+    var markRevision = Plugin.Marks.Index.Revision;
+    if (config.NameplateMode != NameplateMode.Off && config.NameplateMarkColors && config.EnableNearbyList
+        && markRevision != _previousMarkRevision)
+      Plugin.Nameplates.Redraw();
+
+    // Updated unconditionally, like _previousWatchers below and for the same reason: tracking it only while the
+    // feature is on would make the first scan after switching it back on compare against a revision from
+    // whenever it was switched off, and fire a redraw that Sync's own Subscribe has already fired.
+    _previousMarkRevision = markRevision;
 
     // Updated unconditionally, including when we chose not to record: otherwise every watcher already
     // present would re-fire the moment the window opened.

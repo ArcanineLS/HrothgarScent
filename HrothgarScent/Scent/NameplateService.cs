@@ -55,8 +55,14 @@ public sealed class NameplateService : IDisposable
     // last frame's red name sits over a watcher's head for as long as they keep staring, while the eye column,
     // the history and the info bar have all correctly gone silent. Subscribe and Unsubscribe own the redraw,
     // and this is the only thing that reaches them.
-    var wanted = Plugin.Configuration.NameplateMode != NameplateMode.Off
-              && Plugin.Configuration.EnableWatchers
+    // EITHER half is reason enough to attach, and that OR is load-bearing now that marks paint here too. A bare
+    // EnableWatchers would leave the handler detached for a user running the list with the watcher half off —
+    // so their mark colours would never appear at all, and the switch that killed them is the one switch that
+    // has nothing to do with marks. The handler decides WHAT to paint; this decides only whether there is
+    // anything to paint at all.
+    var config = Plugin.Configuration;
+    var wanted = config.NameplateMode != NameplateMode.Off
+              && (config.EnableWatchers || (config.NameplateMarkColors && config.EnableNearbyList))
               && !Plugin.ClientState.IsPvP
               && Plugin.ClientState.IsLoggedIn;
 
@@ -124,16 +130,34 @@ public sealed class NameplateService : IDisposable
       return;
 
     var config = Plugin.Configuration;
-    if (config.NameplateMode == NameplateMode.Off || !config.EnableWatchers)
+
+    // The two halves are gated SEPARATELY, on the same switches that gate them everywhere else: watchers belong
+    // to the Watchers half, marks belong to the nearby list. One combined test was correct while watchers were
+    // the only thing painted here — it is not now. A user running the list with the Watchers half off would
+    // otherwise lose their mark colours to a switch that has nothing to do with marks.
+    var paintWatchers = config.NameplateMode != NameplateMode.Off && config.EnableWatchers;
+    var paintMarks = config.NameplateMode != NameplateMode.Off && config.NameplateMarkColors
+                  && config.EnableNearbyList;
+
+    if (!paintWatchers && !paintMarks)
       return;
 
     // One volatile read of an immutable value for the whole frame, exactly as Draw does. No object table, no
     // pointer, nothing kept past this method.
     var snapshot = Plugin.Scanner.Snapshot;
-    if (!snapshot.Valid || snapshot.WatcherCount == 0)
+    if (!snapshot.Valid)
       return;
 
-    var color = PackRgba(config.ColorWatcher);
+    // Each half's own "nothing to do" test, ANDed. WatcherCount == 0 alone used to be a sound early-out because
+    // a watcher was all this painted; with marks it would drop every mark colour on screen the moment nobody
+    // happened to be staring — the colours would flicker in and out with a stranger's attention, which is the
+    // one thing they have nothing to do with.
+    var anyWatchers = paintWatchers && snapshot.WatcherCount > 0;
+    var anyMarks = paintMarks && snapshot.MarkedNearby;
+    if (!anyWatchers && !anyMarks)
+      return;
+
+    var watcherColor = PackAbgr(config.ColorWatcher);
 
     // One published read for the frame, exactly as the scan does. Immutable and volatile-read, so it is safe
     // from here and cannot tear.
@@ -151,17 +175,39 @@ public sealed class NameplateService : IDisposable
 
       // IsSelf: rows includes you, and IsWatching is TRUE for your own row whenever you target yourself, which
       // is ordinary play and would paint your own name red for it. Every other consumer of rows guards this.
-      //
-      // IsIgnored: "never shown or announced" is the oldest promise this plugin makes, and THIS is the surface
-      // where breaking it is loudest — a red name over a harasser's head, in the world, in front of everyone,
-      // while the table has dropped them and every other readout is silent. The snapshot deliberately carries
-      // ignored players: rows is unfiltered, so ById is too, and they count toward WatcherCount. Every
-      // consumer filters at its OWN edge, and this is that edge. Do not "simplify" this back into the scanner —
-      // WatcherCount feeds the eye column and the info bar, and filtering there would change both.
-      if (row.IsSelf || !row.IsWatching || marks.IsIgnored(row.Key))
+      if (row.IsSelf)
         continue;
 
-      handler.TextColor = color;
+      // IsIgnored: "never shown or announced" is the oldest promise this plugin makes, and THIS is the surface
+      // where breaking it is loudest — a coloured name over a harasser's head, in the world, in front of
+      // everyone, while the table has dropped them and every other readout is silent. The snapshot deliberately
+      // carries ignored players: rows is unfiltered, so ById is too, and they count toward WatcherCount. Every
+      // consumer filters at its OWN edge, and this is that edge. Do not "simplify" this back into the scanner —
+      // WatcherCount feeds the eye column and the info bar, and filtering there would change both.
+      //
+      // ABOVE the whole chain, so it cannot be outranked. An ignored player who is also focused, or who is
+      // staring right now, must still be painted nothing: ignore beats everything, everywhere.
+      var mark = marks.Find(row.Key);
+      if (mark is { IsIgnored: true })
+        continue;
+
+      // THE PRIORITY, top down. Targeting you is the most urgent fact this plugin ever has and outranks any
+      // colour chosen at leisure; a colour you gave them outranks the game's default; the default is what is
+      // left when neither applies, and is expressed by painting NOTHING rather than by painting a default.
+      if (paintWatchers && row.IsWatching)
+      {
+        handler.TextColor = watcherColor;
+        continue;
+      }
+
+      // FOCUSED ONLY, matching the list's own rule at ScentWindow's name-colour chain: "a colour on an unfocused
+      // player therefore shows nothing here, deliberately". A nameplate that painted an unfocused player's
+      // colour would assert, in the world and in front of everyone, a mark the list itself denies.
+      //
+      // Color ?? ColorFocused, again matching the list: an unset colour is not "no colour", it is the default
+      // focus colour, and the profile's own swatch shows it as such.
+      if (paintMarks && mark is { IsFocused: true })
+        handler.TextColor = PackAbgr(mark.Color ?? config.ColorFocused);
     }
   }
 
@@ -172,17 +218,19 @@ public sealed class NameplateService : IDisposable
   /// alpha, and this runs outside any ImGui frame — on the one path whose entire pitch is thread discipline.
   /// This is context-free arithmetic and nothing else.
   ///
-  /// UNVERIFIED: THE BYTE ORDER. TextColor is a raw uint off the game's number array with no typed colour
-  /// behind it — it is not a ByteColor, so the layout cannot be read out of the assemblies, and settling it
-  /// needs the game. RGBA is assumed because that is the convention for the game's own number-array colours;
-  /// ImGui packs the other way (ABGR). The default ColorWatcher is red, which packs to the same bytes under
-  /// BOTH readings, so a mistake here is invisible until someone picks green or blue — test with a deliberately
-  /// asymmetric colour, pure blue at half alpha, and if the channels are swapped this method is the whole fix.
+  /// ABGR — 0xAABBGGRR — VERIFIED IN GAME, and it is the opposite of what this originally assumed. TextColor is
+  /// a raw uint off the game's number array with no typed colour behind it, so the layout cannot be read out of
+  /// the assemblies at all; it took a screenshot to settle. Packing RGBA and picking #EF8A0B (a deliberately
+  /// asymmetric orange: R239 G138 B11) rendered the plate HOT PINK — R255 G11 B138 — which is that same uint
+  /// read back low-byte-first, and is the only one of the four candidate orders that produces it.
+  ///
+  /// The failure hid for as long as it did because the default ColorWatcher is red, and red packs to the same
+  /// bytes under both readings. Nothing was wrong until someone chose a colour with two channels in it.
   /// </summary>
-  private static uint PackRgba(Vector4 color)
+  private static uint PackAbgr(Vector4 color)
   {
     static uint Channel(float v) => (uint)Math.Clamp((int)MathF.Round(v * 255f), 0, 255);
 
-    return (Channel(color.X) << 24) | (Channel(color.Y) << 16) | (Channel(color.Z) << 8) | Channel(color.W);
+    return (Channel(color.W) << 24) | (Channel(color.Z) << 16) | (Channel(color.Y) << 8) | Channel(color.X);
   }
 }

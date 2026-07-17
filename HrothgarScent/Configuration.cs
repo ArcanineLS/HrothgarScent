@@ -308,6 +308,21 @@ public sealed class Configuration : IPluginConfiguration
   public NameplateMode NameplateMode { get; set; } = NameplateMode.Off;
 
   /// <summary>
+  /// Whether a focused player's own colour reaches their nameplate too.
+  ///
+  /// A SEPARATE FLAG rather than a third <see cref="NameplateMode"/>, and the reason is the master switch above
+  /// it. That one is a checkbox that writes its enum on every tick, so a mode carrying this choice would be
+  /// silently reset to plain Watchers the first time anyone unticked "show the eye" and ticked it back. A
+  /// preference the UI destroys by accident is worse than one that is merely off.
+  ///
+  /// SUBORDINATE to it in effect, though: NameplateMode is the answer to "may this plugin write on the game's
+  /// world UI at all", and nothing here is painted while that is Off.
+  ///
+  /// Off by default, on the same reasoning as its master — this is other people's screens.
+  /// </summary>
+  public bool NameplateMarkColors { get; set; } = false;
+
+  /// <summary>
   /// Focus-target whoever's name the cursor is resting on, so the list can be read against the world.
   ///
   /// Off by default because it clobbers the focus target — the previous one is not restored on the way out,

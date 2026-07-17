@@ -361,6 +361,23 @@ public sealed class ConfigWindow : Window
     UiTheme.Tooltip("Colours the nameplate of anyone targeting you, so you can see it without the window open. " +
                     "Nothing is added or hidden — just the colour, and only in the open world. Never in PvP.");
 
+    // Indented and disabled rather than hidden: it is subordinate to the switch above — that one answers "may
+    // this plugin write on the game's world UI at all" — and an option that vanished would leave no trace of
+    // why the colours stopped. Its own setting either way, so unticking the master and reticking it does not
+    // quietly throw this choice away.
+    using (ImRaii.Disabled(!nameplates))
+    {
+      ImGui.Indent();
+      ConfigCheckbox("Also colour players you focused",
+        () => Plugin.Configuration.NameplateMarkColors,
+        v => Plugin.Configuration.NameplateMarkColors = v,
+        "Paints a focused player's nameplate in the colour you gave them in their profile.\r\n\r\n" +
+        "Someone targeting you always wins: they stay the watcher colour no matter what you picked. Ignored " +
+        "players are never painted at all, and an unfocused player's colour shows nothing here — the same rule " +
+        "the list follows.");
+      ImGui.Unindent();
+    }
+
     ConfigCheckbox("Add 'Remember this Player' to the game's right-click menu",
       () => Plugin.Configuration.ShowContextMenuMark,
       v => Plugin.Configuration.ShowContextMenuMark = v,
@@ -1248,104 +1265,7 @@ public sealed class ConfigWindow : Window
       "Alerts fire once per person, not per glance — someone who keeps re-targeting you inside the cooldown " +
       "stays quiet. Whoever you have chosen not to hear about is filtered out BEFORE the cooldown, so a " +
       "party member can never burn the alert that a stranger in the same moment deserved.");
-
-    DrawJournalSection();
   }
-
-  /// <summary>
-  /// The last few things the alert path decided, and why.
-  ///
-  /// HERE, at the bottom of the Alerts tab, directly under the dead-rung warning — which is a static
-  /// PREDICTION of silence that admits its own limits ("a prediction, not a proof... hence 'may never'"). This
-  /// is the observation that closes that loop, so it belongs beside it rather than on a rail entry of its own:
-  /// a diagnostic is not a peer of Filters and Colours.
-  ///
-  /// Not the Watchers tab, though it is tempting — the journal carries focus arrivals, which belong to the
-  /// NEARBY half, and that tab is the watcher half's territory.
-  /// </summary>
-  private static void DrawJournalSection()
-  {
-    ImGui.Dummy(new Vector2(0, 6f * ImGuiHelpers.GlobalScale));
-    UiTheme.SectionHeader("What I decided", FontAwesomeIcon.ListUl);
-
-    var entries = Plugin.Journal.Snapshot();
-    if (entries.Count == 0)
-    {
-      UiTheme.TextWrappedColored(UiTheme.Muted,
-        "Nothing yet. When I say something — or stay quiet when you expected otherwise — the reason " +
-        "shows up here. Kept in memory for this session only.");
-      return;
-    }
-
-    UiTheme.TextWrappedColored(UiTheme.Muted,
-      "Newest first. A missing alert usually means a rule you forgot you set, and this is the rule saying so. " +
-      "Kept in memory for this session only, and never the name of anyone you ignored.");
-    ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
-
-    var scale = ImGuiHelpers.GlobalScale;
-    var tableFlags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.NoSavedSettings
-                   | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.ScrollY;
-
-    if (ImGui.BeginTable("##journal", 4, tableFlags, new Vector2(0f, 160f * scale)))
-    {
-      ImGui.TableSetupColumn("When", ImGuiTableColumnFlags.WidthFixed, 62f * scale);
-      ImGui.TableSetupColumn("What", ImGuiTableColumnFlags.WidthFixed, 96f * scale);
-      ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 30f * scale);
-      ImGui.TableSetupColumn("Why", ImGuiTableColumnFlags.WidthStretch);
-      ImGui.TableHeadersRow();
-
-      foreach (var entry in entries)
-      {
-        ImGui.TableNextRow();
-
-        ImGui.TableNextColumn();
-        ImGui.AlignTextToFramePadding();
-        ImGui.TextColored(UiTheme.Muted, entry.When.ToString("HH:mm:ss"));
-
-        ImGui.TableNextColumn();
-        ImGui.TextUnformatted(ClassLabel(entry.Class));
-
-        // The count IS the payload, and deliberately so: it is the whole of what a suppressed entry may say.
-        // A name here would put an ignored player back on screen, one tab from where the user erased them.
-        ImGui.TableNextColumn();
-        ImGui.TextColored(UiTheme.Muted, entry.Subjects.ToString());
-
-        ImGui.TableNextColumn();
-        var (label, color) = OutcomeLabel(entry.Outcome);
-        ImGui.TextColored(color, entry.Detail.Length > 0 ? $"{label} — {entry.Detail}" : label);
-      }
-
-      ImGui.EndTable();
-    }
-  }
-
-  private static string ClassLabel(SignalClass signalClass) => signalClass switch
-  {
-    SignalClass.StareEscalation => "Still watching",
-    SignalClass.NewWatcher => "New watcher",
-    _ => "Marked arrived",
-  };
-
-  /// <summary>
-  /// Muted for everything a rule decided, and red for the one case that is a fault.
-  ///
-  /// The colours carry the distinction the labels cannot fit: "not said" and "dropped" describe the plugin
-  /// obeying the user — settled, unalarming, grey. OutputFailed is the plugin trying to obey and failing, which
-  /// is the only row here the user can act on, so it must not be able to fall into the grey with the rest.
-  /// It gets its own arm rather than the catch-all for exactly that reason: the default would have quietly
-  /// labelled it "dropped" — reporting a fault as a rule, which is the misattribution the outcome was added to
-  /// end, reintroduced one layer up.
-  /// </summary>
-  private static (string Label, Vector4 Color) OutcomeLabel(SignalOutcome outcome) => outcome switch
-  {
-    SignalOutcome.Said => ("said", UiTheme.Good),
-    SignalOutcome.Waiting => ("waiting", UiTheme.Warn),
-    SignalOutcome.OutputFailed => ("failed", UiTheme.Bad),
-    SignalOutcome.SwitchedOff => ("not said", UiTheme.Muted),
-    SignalOutcome.Filtered => ("not said", UiTheme.Muted),
-    SignalOutcome.NoLongerTrue => ("dropped", UiTheme.Muted),
-    _ => ("dropped", UiTheme.Muted),
-  };
 
   // ---- Watchers ----
 
