@@ -42,11 +42,21 @@ public sealed class ProfileWindow : Window
   /// </summary>
   private const int NoteMaxLength = 512;
 
-  /// <summary>Height of the banner strip behind the name. Scaled at use; this is the 100% figure.</summary>
-  private const float BannerHeight = 96f;
-
   /// <summary>Side of the square avatar. The Lodestone's face thumbnail is square, and a job icon is too.</summary>
   private const float AvatarSize = 84f;
+
+  /// <summary>Breathing room between the avatar and the banner's edges. Also sets the banner's height.</summary>
+  private const float AvatarInset = 10f;
+
+  /// <summary>
+  /// Height of the coloured header. DERIVED from the avatar rather than a constant beside it, because the banner
+  /// exists to CONTAIN the avatar and the name — and two independent numbers is exactly how it stopped.
+  ///
+  /// It used to be its own 96, with the avatar hung 55% below the banner's edge. That put the colour and the
+  /// content in different places: a coloured strip with nothing in it, and then the name in the dark underneath
+  /// it. Every fix to one of them moved the other.
+  /// </summary>
+  private const float BannerHeight = AvatarSize + AvatarInset * 2f;
 
   /// <summary>Who this profile is about, or null when nothing has opened it yet.</summary>
   private WatcherKey? _key;
@@ -164,23 +174,27 @@ public sealed class ProfileWindow : Window
     // recognisable from the header alone rather than from a swatch further down. Focus only: the colour folds
     // into the focus slot everywhere else in the plugin, and a banner claiming a colour the list ignores would
     // be the DTR's old lie in a different window.
+    // Fades ACROSS, not down, and only to 0.30. Down-and-out was what made the colour look stunted: the bottom
+    // of the strip was 8% alpha, i.e. the window background, so the eye read the banner as ending halfway and
+    // the rest as dead space. Left-to-right keeps every row of the header on colour — the avatar sits in the
+    // strong end, the text in the calm end where it stays legible.
     var tint = mark is { IsFocused: true, Color: not null } ? mark.Color.Value : UiTheme.AccentPurple;
-    var top = ImGui.ColorConvertFloat4ToU32(tint with { W = 0.55f });
-    var bottom = ImGui.ColorConvertFloat4ToU32(tint with { W = 0.08f });
+    var left = ImGui.ColorConvertFloat4ToU32(tint with { W = 0.55f });
+    var right = ImGui.ColorConvertFloat4ToU32(tint with { W = 0.30f });
 
-    draw.AddRectFilledMultiColor(origin, origin + new Vector2(width, banner), top, top, bottom, bottom);
+    draw.AddRectFilledMultiColor(origin, origin + new Vector2(width, banner), left, right, right, left);
 
     // Reserve the banner in the layout so everything below flows under it.
     ImGui.Dummy(new Vector2(width, banner));
 
-    var avatarPos = origin + new Vector2(12f * scale, banner - avatar * 0.55f);
+    // INSIDE the banner now, not hung off its edge. The overhang is what created the empty area: it forced the
+    // name into the dark below while the colour sat above with nothing in it. The banner's height is derived
+    // from this inset (see BannerHeight), so the avatar cannot drift out of the block that exists to hold it.
+    var avatarPos = origin + new Vector2(AvatarInset * scale, AvatarInset * scale);
     DrawAvatar(key, mark, avatarPos, avatar, scale);
 
-    // CENTRED ON THE AVATAR, not parked under the banner. Pinning the text to the banner's baseline made its
-    // position a fact about the banner while its neighbour's was a fact about the overhang — so the block sat
-    // low and ran past the avatar's bottom edge, and the two only lined up at one particular line count.
-    // Measured from the lines actually about to be drawn, so adding or dropping the watching line keeps it
-    // centred instead of nudging everything down.
+    // Centred on the avatar, measured from the lines actually about to be drawn — so adding or dropping the
+    // watching line keeps it centred instead of nudging everything down.
     var lines = 3 + (row?.IsWatching == true ? 1 : 0);
     var textHeight = lines * ImGui.GetTextLineHeightWithSpacing();
 
@@ -218,8 +232,10 @@ public sealed class ProfileWindow : Window
         UiTheme.TextWrappedColored(Plugin.Configuration.ColorWatcher, "Looking at you right now.");
     }
 
-    // Past the taller of the two columns, whichever it was.
-    var below = Math.Max(ImGui.GetCursorScreenPos().Y, avatarPos.Y + avatar + 6f * scale);
+    // Past the banner OR past the text, whichever ran longer. The banner contains the avatar by construction now,
+    // so it is only the text that can overrun — a wrapped world+race line, or a long name — and clearing the
+    // banner alone would let that text collide with the action row.
+    var below = Math.Max(ImGui.GetCursorScreenPos().Y + 4f * scale, origin.Y + banner + 6f * scale);
     ImGui.SetCursorScreenPos(new Vector2(origin.X, below));
 
     DrawActions(key, mark, row, scale);
