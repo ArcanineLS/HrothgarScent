@@ -385,10 +385,11 @@ public sealed class ConfigWindow : Window
       "It is the only way to mark someone the Scent window cannot see. Nothing is ever written down until you " +
       "click it.");
 
-    ConfigCheckbox("Show watcher history",
+    ConfigCheckbox("Show the Targeted tab",
       () => Plugin.Configuration.ShowWatcherHistory,
       v => Plugin.Configuration.ShowWatcherHistory = v,
-      "Show the 'Remembered' section under the player list. The history is still recorded either way.");
+      "Show the 'Targeted' tab beside the player list. The history is still recorded either way — and with " +
+      "this off the Scent window drops its tab bar entirely.");
 
     ConfigCheckbox("Use job abbreviations",
       () => Plugin.Configuration.UseJobAbbreviations,
@@ -497,7 +498,7 @@ public sealed class ConfigWindow : Window
     ConfigCheckbox("Watchers",
       () => Plugin.Configuration.EnableWatchers,
       v => Plugin.Configuration.EnableWatchers = v,
-      "The eye column, the 'Remembered' history, the watching count in the server info bar, and watcher " +
+      "The eye column, the 'Targeted' tab, the watching count in the server info bar, and watcher " +
       "alerts. The history keeps recording while it is off.");
   }
 

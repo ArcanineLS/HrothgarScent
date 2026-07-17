@@ -45,7 +45,7 @@ Open it with `/hscent`.
 
 Each row's eye column lights up while that player is targeting you. Turn on **Watchers first** and they float to the top of whatever sort you're using — you keep your column sort.
 
-**Hrothgar remember** logs who targeted you, how many times, and when. Entries stay after the player leaves.
+The **Targeted** tab logs who targeted you, how many times, and when. Entries stay after the player leaves.
 
 Alerts fire **once per person**, not once per glance.
 
@@ -68,7 +68,7 @@ Someone cycling targets holds you for a second. Someone *fixed on you* holds you
 
 Said once each, never repeated. Look away and back and it starts over. Both thresholds are sliders in **Alerts**, and `0` turns either off.
 
-Hover the count in **Hrothgar remember** for how long someone has watched you in total this session.
+Hover the count in the **Targeted** tab for how long someone has watched you in total this session.
 
 ### 🔔 One cooldown, no starving
 
@@ -86,7 +86,7 @@ Wondering why Hrothgar said nothing? **Alerts → What Hrothgar decided** lists 
 
 > **Hrothgar writes down exactly the players you pointed at. Everyone else is forgotten when you log out.**
 
-Right-click a player → **Remember this player** for a note, a colour, and the focus/ignore ticks. Or right-click their name **anywhere the game shows it** — friend list, Party Finder, chat log, FC roster — and pick **Hrothgar remember**. That reaches people the Scent window can't see at all.
+Right-click a player → **Profile** for their face, a note, a colour, and the focus/ignore ticks. Or right-click their name **anywhere the game shows it** — friend list, Party Finder, chat log, FC roster — and pick **Scent → Profile**. That reaches people the Scent window can't see at all.
 
 Untick everything and clear the note, and the record is deleted. **Nothing is ever added just by walking past someone.**
 
@@ -122,7 +122,7 @@ The game exposes two identifiers that would survive renames. Hrothgar reads **ne
 
 ## 🛡️ PvP
 
-The window, the info bar entry, the commands and the game-menu **Hrothgar remember** entry all **hide and refuse in PvP**, and the scanner stops collecting entirely. This is not configurable — it's a competitive-integrity requirement and a condition of Dalamud plugin acceptance.
+The window, the info bar entry, the commands and the game-menu **Scent** entry all **hide and refuse in PvP**, and the scanner stops collecting entirely. This is not configurable — it's a competitive-integrity requirement and a condition of Dalamud plugin acceptance.
 
 ## ⚙️ Configuration
 
@@ -147,8 +147,8 @@ The config window (`/hscent config`) has a left icon rail: **General**, **Filter
 | Hide in duty | Off | Hides the window while you're bound by duty. |
 | Hide in cutscenes | On | Hides the window during cutscenes. |
 | Show search bar | On | Shows the search box in the toolbar. See [Searching](#-searching). |
-| Add 'Hrothgar remember' to the game's right-click menu | On | Adds an entry wherever the game shows a player's name — friend list, Party Finder, chat log, FC roster. The only way to mark someone the Scent window can't see. Nothing is written down until you click it. Never appears in PvP. |
-| Show watcher history | On | Shows the **Hrothgar remember** section under the player list. |
+| Add 'Remember this Player' to the game's right-click menu | On | Adds an entry wherever the game shows a player's name — friend list, Party Finder, chat log, FC roster. The only way to mark someone the Scent window can't see. Nothing is written down until you click it. Never appears in PvP. |
+| Show the Targeted tab | On | Shows the **Targeted** tab beside **Nearby**. The history is recorded either way. |
 | Use job abbreviations | On | `WAR` instead of `Warrior`. |
 | Show job icons | On | The game's own job icon beside each job name. |
 | Show the eye over their head | **Off** | Colours the nameplate of anyone targeting you. Cosmetic only, and never in PvP. |

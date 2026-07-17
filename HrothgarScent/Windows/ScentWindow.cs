@@ -143,6 +143,28 @@ public sealed class ScentWindow : Window
   private bool _sortAscending;
 
   /// <summary>
+  /// Columns the gear menu asked to show or hide, waiting for a live table to apply them to.
+  ///
+  /// The header's right-click menu used to own column visibility, and dropping the header row took it with it —
+  /// so the gear menu has to drive it instead, and it draws from the toolbar, outside any table.
+  /// TableSetColumnEnabled is the only way in (DefaultHide is read once, when the table initialises, and says
+  /// nothing on any later frame) and it asserts on a live table, so the click cannot act where it happens.
+  ///
+  /// A DICTIONARY, not one slot. One slot would be enough only if it were drained every frame, and it is not:
+  /// the drain lives at the bottom of the player table, which does not draw while the Targeted tab is up, on
+  /// the empty state, or with the nearby list off — and the gear menu is reachable in all three. A second click
+  /// would then overwrite the first, silently, and the tick of the column you just hid would pop back on
+  /// because it had gone back to reading an unchanged mask. Keyed by column, so re-clicking one replaces its
+  /// own entry rather than queueing a fight between two answers about the same column.
+  ///
+  /// Applied AFTER <see cref="ApplyColumnVisibility"/>, which is what makes the round-trip settle rather than
+  /// fight. ImGui defers the change to the next frame (IsUserEnabledNextFrame), so this frame's save still sees
+  /// the OLD state — it is next frame's ApplyColumnVisibility that reads the new one and writes the mask. That
+  /// costs exactly one save per click, because both halves only save on change.
+  /// </summary>
+  private readonly Dictionary<ScentColumn, bool> _pendingColumnToggles = [];
+
+  /// <summary>
   /// The row the hover-focus feature last handed to the game, or 0 if it holds nothing.
   ///
   /// The one piece of this window's state two threads write: <see cref="HoverFocus"/> on the render thread and
@@ -350,12 +372,6 @@ public sealed class ScentWindow : Window
 
     RebuildViewIfStale(snapshot);
 
-    // Read once, up here, and hand the same list to both the reserve and the section below. Calling
-    // Snapshot() twice would let the two disagree about whether there is a table to leave room for.
-    var history = !hud && config.EnableWatchers && config.ShowWatcherHistory
-      ? Plugin.WatcherLog.Snapshot()
-      : null;
-
     // Everything below the player table's BOTTOM EDGE, which is what bodyMax has to keep free — it subtracts
     // this figure from a content region measured at the table's TOP.
     //
@@ -364,54 +380,54 @@ public sealed class ScentWindow : Window
     // PLUS ItemSpacing.Y, and that gap is space under the table's bottom edge exactly as the footer is. It used
     // to be spelled GetTextLineHeightWithSpacing() against the footer — the same number, read as the footer's
     // own trailing spacing, which the footer does not have: ItemSize keeps the LAST item's trailing spacing out
-    // of the content extent, so the footer costs its height alone and has no spare to lend anyone. Believing in
-    // that spare is what let HistoryReserve budget its Dummy bare against it.
+    // of the content extent, so the footer costs its height alone and has no spare to lend anyone.
     //
-    // Every term is now one block's real cost and no two of them cancel. Do not reintroduce an argument that
-    // they do: the arithmetic is only ever exercised when the clamp binds, so a term that cancels on paper is a
-    // term nothing on screen will contradict until a user with a tall list and a short viewport finds it.
-    var reserve = 0f;
-    if (!hud)
-    {
-      reserve += ImGui.GetStyle().ItemSpacing.Y + IconLineHeight();
-      if (history is not null)
-        reserve += HistoryReserve(scale, history.Count > 0);
-    }
+    // The footer is now the ONLY thing under that edge, and the history's term is gone rather than mislaid: it
+    // draws in its own tab, where no player table exists to reserve against it. That is the whole of what the
+    // tabs bought the height machinery, and it is why HistoryReserve — which existed only to budget a block
+    // stacked under the list — could be deleted outright instead of corrected.
+    //
+    // Every term is one block's real cost and no two of them cancel. Do not reintroduce an argument that they
+    // do: the arithmetic is only ever exercised when the clamp binds, so a term that cancels on paper is a term
+    // nothing on screen will contradict until a user with a tall list and a short viewport finds it.
+    var reserve = hud ? 0f : ImGui.GetStyle().ItemSpacing.Y + IconLineHeight();
 
-    // Both stay 0 unless a table actually draws. MeasureDesiredHeight subtracts one from the other, so every
-    // branch that draws no table must contribute no correction.
+    // The Targeted tab earns the tab bar; without it a one-tab bar is chrome wrapped around the only thing it
+    // could ever show. Both of its conditions are the ones that used to decide whether the section drew at all,
+    // unchanged: the watcher half being off must take the log with it, and ShowWatcherHistory is the user
+    // saying they do not want it. HUD is excluded for the reason it excludes the toolbar and the footer — a tab
+    // bar is chrome, and HUD's whole argument is that it has none.
+    var tabbed = !hud && config.EnableWatchers && config.ShowWatcherHistory;
+
+    // Both stay 0 unless a player table actually draws — MeasureDesiredHeight subtracts one from the other, so
+    // a branch that draws no table must contribute no correction. This is exactly why they are assigned from
+    // INSIDE the Nearby tab and nowhere else: measuring what the table WOULD want while the Targeted tab is up
+    // would pin the window a whole list taller than the thing on screen, every frame, until the tab changed.
     var wanted = 0f;
     var drawn = 0f;
 
-    if (config.EnableNearbyList)
+    if (tabbed)
     {
-      if (_view.Count > 0)
+      if (ImGui.BeginTabBar("##scentTabs"))
       {
-        // The cap applied to the COUNT, through one call, so "exactly at the cap" cannot become two figures that
-        // have to be argued into agreeing: the height is monotonic in the row count, so the smaller of the two
-        // heights is just the height of the smaller count. Cap+1 is the first row the table scrolls.
-        wanted = PlayerTableHeight(Math.Min(_view.Count, VisibleRowCap(config)), !hud, scale, rowHeight);
+        if (ImGui.BeginTabItem("Nearby"))
+        {
+          (wanted, drawn) = DrawNearby(snapshot, config, scale, hud, rowHeight, reserve);
+          ImGui.EndTabItem();
+        }
 
-        // Binds on the frame a crowd arrives, before PreDraw has pinned the taller window — and then binds
-        // PERMANENTLY once that pin hits the viewport clamp, which is a state PreDraw deliberately produces
-        // rather than an edge case. Either way the table must not overflow the window it is in.
-        // MeasureDesiredHeight adds back exactly what this took, or the window could never grow.
-        var bodyMax = ImGui.GetContentRegionAvail().Y - reserve;
-        drawn = MathF.Min(wanted, MathF.Max(rowHeight, bodyMax));
+        if (ImGui.BeginTabItem("Targeted"))
+        {
+          DrawTargeted(config, scale);
+          ImGui.EndTabItem();
+        }
+
+        ImGui.EndTabBar();
       }
-
-      // Both zero on the empty state, which draws one line of text and ignores the height entirely.
-      DrawPlayerTable(snapshot, config, scale, drawn, hud, rowHeight);
     }
     else
     {
-      DrawNearbyListOff(snapshot, config, hud, scale);
-    }
-
-    if (history is not null)
-    {
-      ImGui.Dummy(new Vector2(0, 6f * scale));
-      DrawWatcherHistory(history, config, scale);
+      (wanted, drawn) = DrawNearby(snapshot, config, scale, hud, rowHeight, reserve);
     }
 
     if (!hud)
@@ -424,6 +440,53 @@ public sealed class ScentWindow : Window
     ClearHoverFocusIfIdle();
   }
 
+  /// <summary>
+  /// The Nearby half's body: the player list, or the one line that stands in for it.
+  ///
+  /// Returns the two figures <see cref="MeasureDesiredHeight"/> needs and nothing else reads — what the table
+  /// asked for, and what the clamp let it have. Both 0 unless a table drew, which is the contract that lets the
+  /// caller hand them straight through from either the tabbed or the bare path.
+  ///
+  /// <paramref name="reserve"/> is measured by the caller rather than in here, because it is a fact about what
+  /// the CALLER draws below this block, not about the list.
+  /// </summary>
+  /// <remarks>
+  /// Safe to call from inside a TabItem, which is the only place the tabbed path calls it from: a tab item is
+  /// not a child window, so GetContentRegionAvail still measures to the WINDOW's content bottom and bodyMax
+  /// keeps meaning what it meant when this was stacked bare. Verified against cimgui rather than assumed.
+  /// </remarks>
+  private (float Wanted, float Drawn) DrawNearby(ScentSnapshot snapshot, Configuration config, float scale,
+    bool hud, float rowHeight, float reserve)
+  {
+    if (!config.EnableNearbyList)
+    {
+      DrawNearbyListOff(snapshot, config, hud, scale);
+      return (0f, 0f);
+    }
+
+    var wanted = 0f;
+    var drawn = 0f;
+
+    if (_view.Count > 0)
+    {
+      // The cap applied to the COUNT, through one call, so "exactly at the cap" cannot become two figures that
+      // have to be argued into agreeing: the height is monotonic in the row count, so the smaller of the two
+      // heights is just the height of the smaller count. Cap+1 is the first row the table scrolls.
+      wanted = PlayerTableHeight(Math.Min(_view.Count, VisibleRowCap(config)), rowHeight);
+
+      // Binds on the frame a crowd arrives, before PreDraw has pinned the taller window — and then binds
+      // PERMANENTLY once that pin hits the viewport clamp, which is a state PreDraw deliberately produces
+      // rather than an edge case. Either way the table must not overflow the window it is in.
+      // MeasureDesiredHeight adds back exactly what this took, or the window could never grow.
+      var bodyMax = ImGui.GetContentRegionAvail().Y - reserve;
+      drawn = MathF.Min(wanted, MathF.Max(rowHeight, bodyMax));
+    }
+
+    // Both zero on the empty state, which draws one line of text and ignores the height entirely.
+    DrawPlayerTable(snapshot, config, scale, drawn, hud, rowHeight);
+    return (wanted, drawn);
+  }
+
   /// <summary>The configured row cap, clamped where it is read. The value round-trips through a JSON file the
   /// user can hand-edit — the same reason the constructor guards SortColumn rather than casting it blindly.</summary>
   private static int VisibleRowCap(Configuration config)
@@ -433,11 +496,16 @@ public sealed class ScentWindow : Window
   /// Records the height this window wants, for <see cref="PreDraw"/> to pin one frame later.
   ///
   /// Measured at the cursor rather than re-derived from the blocks above, so the title bar, the toolbar, the
-  /// wrapped empty-state line and the history section cannot drift out of step with a second copy of their own
-  /// arithmetic — the trap <see cref="HistoryReserve"/> documents at length. GetCursorPosY is window-space and
-  /// so already carries the title bar; WindowPadding.Y closes the bottom. ItemSpacing.Y comes off because
-  /// ItemSize leaves the last item's trailing spacing out of the content extent, which is the rule ImGui's own
-  /// auto-fit measures by.
+  /// tab bar, the wrapped empty-state line and whichever tab is up cannot drift out of step with a second copy
+  /// of their own arithmetic. That is also why the tab bar costs this nothing to know about: it is an item like
+  /// any other and the cursor has already walked past it. GetCursorPosY is window-space and so already carries
+  /// the title bar; WindowPadding.Y closes the bottom. ItemSpacing.Y comes off because ItemSize leaves the last
+  /// item's trailing spacing out of the content extent, which is the rule ImGui's own auto-fit measures by.
+  ///
+  /// EndTabBar leaves the cursor under the SELECTED tab's content rather than under the taller of the two, so
+  /// the window follows the tab actually on screen. Verified against cimgui rather than assumed: a max there
+  /// would have held this window at the Nearby list's height for as long as the Targeted tab was up, with
+  /// nothing on screen to say why.
   ///
   /// The table is the ONE block this cannot measure. It was handed a height clamped by the very window this
   /// figure pins, so measuring what it drew would latch the window at whatever size a crowd found it and never
@@ -561,27 +629,29 @@ public sealed class ScentWindow : Window
   private void DrawToolbar(Configuration config, float scale)
   {
     var cogWidth = SettingsButtonWidth();
-    var style = ImGui.GetStyle();
 
-    // Gone with the list rather than disabled, unlike the checkbox below: the term is not persisted config with
-    // a home in the config window — see the remarks on _search — so there is no setting here to silently vanish
-    // and be reported as lost. EffectiveSearch has to blank a term whose box is off screen anyway, so hiding the
-    // box is the only option that keeps the two in step. It comes back with its text when the list does.
-    if (config.ShowSearchBar && config.EnableNearbyList)
+    // Gone with the list rather than disabled: the term is not persisted config with a home in the config
+    // window — see the remarks on _search — so there is no setting here to silently vanish and be reported as
+    // lost. EffectiveSearch has to blank a term whose box is off screen anyway, so hiding the box is the only
+    // option that keeps the two in step. It comes back with its text when the list does.
+    var searchShown = config.ShowSearchBar && config.EnableNearbyList;
+    if (searchShown)
     {
-      // The flexible element takes the punishment, which is the whole point of measuring here. With the Races
-      // button gone the only fixed items left on this line are the checkbox and the cog, so the box can have
+      // The flexible element takes the punishment, which is the whole point of measuring here. The cog is the
+      // only fixed item left on this line now that the checkbox has gone to the gear menu, so the box takes
       // whatever is left — and the cog can never be the thing that overruns.
       //
-      // Measured, never assumed: GlobalScale and the Dalamud font size are INDEPENDENT user settings, so
-      // "Watchers first" can be arbitrarily wide relative to any `N * scale` figure.
+      // Measured, never assumed: GlobalScale and the Dalamud font size are INDEPENDENT user settings, so no
+      // `N * scale` figure can stand in for a glyph's width.
       // The marker comes out of the box's budget, measured rather than guessed, and its leading gap with it:
       // HelpMarker opens with its own SameLine(0, 4 * scale), so forgetting that term pushes the cog off the
       // end of the line, where ImGui culls it silently — and a culled cog is the way back to the settings.
+      //
+      // The line is now exactly box + marker + 12 + cog, and every term of that is subtracted here. The
+      // ItemSpacing.X pair this used to carry went with the checkbox: the default-spaced SameLine that stood
+      // between the two is gone, and a term for a gap that is not there is slack the box pays for.
       var marker = ImGui.CalcTextSize(SearchHelpGlyph).X + 4f * scale;
-      var checkbox = ImGui.CalcTextSize("Watchers first").X + ImGui.GetFrameHeight() + style.ItemInnerSpacing.X;
-      var boxWidth = ImGui.GetContentRegionAvail().X - checkbox - cogWidth - marker
-        - style.ItemSpacing.X * 2f - 12f * scale;
+      var boxWidth = ImGui.GetContentRegionAvail().X - cogWidth - marker - 12f * scale;
       ImGui.SetNextItemWidth(MathF.Max(90f * scale, boxWidth));
       ImGui.InputTextWithHint("##search", "Search... (try world:)", ref _search, SearchMaxLength);
 
@@ -596,15 +666,154 @@ public sealed class ScentWindow : Window
       else
         UiTheme.HelpMarker(SearchHelp);
 
-      ImGui.SameLine();
+      // The gap goes in before DrawSettingsButton measures, not after it: GetContentRegionAvail measures from
+      // the cursor, and until SameLine puts the cursor back on this line it is already at the start of the next
+      // one, where it reports a full window's width of room and nothing would ever wrap.
+      //
+      // GUARDED, and the guard is new with the checkbox's departure. SameLine with nothing before it on the
+      // line snaps the cursor to the PREVIOUS line's — and this toolbar is the first block in the window, where
+      // there is no previous line to snap to. The checkbox used to be unconditional and stood in the way of
+      // ever finding that out.
+      ImGui.SameLine(0, 12f * scale);
     }
+
+    DrawSettingsButton(cogWidth, config);
+
+    ImGui.Dummy(new Vector2(0, 2f * scale));
+  }
+
+  /// <summary>The cog's width. Measured under the icon font it is drawn with, because a glyph the text font
+  /// does not have measures as a fallback box or as nothing.</summary>
+  private static float SettingsButtonWidth()
+  {
+    Vector2 glyphSize;
+    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+      glyphSize = ImGui.CalcTextSize(FontAwesomeIcon.Cog.ToIconString());
+
+    return glyphSize.X + ImGui.GetStyle().FramePadding.X * 2f;
+  }
+
+  /// <summary>
+  /// The cog, right-aligned on the current toolbar line. Drawn with the icon font so it reads as the same
+  /// control as Dalamud's own plugin cog.
+  ///
+  /// It opens a menu now rather than the config window, because dropping the header row took the sort and the
+  /// column ticks with it and they had to land somewhere reachable. The config window is still one item away —
+  /// the cog remains the way back, which is why <see cref="DrawToolbar"/> draws it unconditionally.
+  ///
+  /// No leading SameLine: the caller owns that, because whether there is a line to join is the caller's fact
+  /// and it is no longer always true. The Max clamp is a floor against the cursor walking backwards over the
+  /// widget to its left, NOT a fit guard: it turns an overrun into a cog placed past the content region,
+  /// outside the clip rect, which ImGui culls entirely — silently, since a culled button cannot draw the
+  /// tooltip that would have explained it. Whether the line has room is the caller's question to answer, and
+  /// <see cref="DrawToolbar"/> answers it with <see cref="SettingsButtonWidth"/>, whose result is passed back
+  /// in here as <paramref name="width"/>.
+  /// </summary>
+  private void DrawSettingsButton(float width, Configuration config)
+  {
+    ImGui.SetCursorPosX(ImGui.GetCursorPosX() + MathF.Max(0f, ImGui.GetContentRegionAvail().X - width));
+
+    bool clicked;
+    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+      clicked = ImGui.Button(FontAwesomeIcon.Cog.ToIconString());
+    if (clicked)
+      ImGui.OpenPopup("##scentMenu");
+    UiTheme.Tooltip("Sort, columns, settings");
+
+    // OpenPopup and BeginPopup must share an ID scope, and here they do by sitting adjacent with nothing
+    // pushed between them. This is the rule that forced the old mark editor to defer through a request field;
+    // see DrawRowContextMenu.
+    if (!ImGui.BeginPopup("##scentMenu"))
+      return;
+
+    DrawSettingsMenu(config);
+    ImGui.EndPopup();
+  }
+
+  /// <summary>
+  /// The gear menu: everything the header row used to carry, plus the checkbox the toolbar gave up.
+  ///
+  /// The sort and the column ticks lived in the table's header — the sort on its arrows, the ticks in its
+  /// right-click menu — and dropping the header row would have deleted both outright rather than moved them.
+  /// This is where they went. "Watchers first" joins them because it is the same kind of thing: a knob about
+  /// how the list is ordered, which is not worth a permanent line of toolbar.
+  ///
+  /// Both submenus go dead with the nearby list, exactly as the checkbox does and for the same reason: they
+  /// drive a table <see cref="DrawNearby"/> is not called to draw. Deliberately with no tooltip saying so —
+  /// <see cref="DrawNearbyListOff"/> is already on screen saying it, and per <see cref="UiTheme.TooltipEvenIfDisabled"/>
+  /// a tooltip explaining what the window already says is noise.
+  /// </summary>
+  private void DrawSettingsMenu(Configuration config)
+  {
+    if (ImGui.BeginMenu("Sort by", config.EnableNearbyList))
+    {
+      foreach (var column in ColumnLayout)
+      {
+        // The eye with the watcher half off — the one column that can be switched off wholesale. Skipped
+        // rather than greyed, which is what the header's own right-click menu did with a Disabled column.
+        if (IsColumnDisabled(column, config))
+          continue;
+
+        if (ImGui.MenuItem(ColumnLabel(column), column == _sortColumn))
+          SortBy(column, _sortAscending);
+      }
+
+      // Spelled out rather than folded into "click the sorted column again to flip it", which is the header's
+      // gesture and dies with the header. A direction the user cannot see is a direction they cannot undo, and
+      // there is no arrow left on screen to show them which way it points.
+      ImGui.Separator();
+
+      if (ImGui.MenuItem("Ascending", _sortAscending))
+        SortBy(_sortColumn, true);
+      if (ImGui.MenuItem("Descending", !_sortAscending))
+        SortBy(_sortColumn, false);
+
+      ImGui.EndMenu();
+    }
+
+    if (ImGui.BeginMenu("Columns", config.EnableNearbyList))
+    {
+      foreach (var column in ColumnLayout)
+      {
+        if (IsColumnDisabled(column, config))
+          continue;
+
+        // Read off the mask rather than the table, because there is no table in scope here — but the PENDING
+        // click beats the mask, and that is not a nicety. The mask does not move until a live table has applied
+        // the toggle and ApplyColumnVisibility has read the result back off it, which is next frame at the
+        // earliest and NEVER while the empty state or the Targeted tab is what is on screen. Without this the
+        // tick would answer the table instead of the user, and unticking a column with nobody nearby would look
+        // like a control that does nothing.
+        var pinned = IsColumnFixed(column);
+        var holdsSort = column == _sortColumn;
+        var shown = pinned || (_pendingColumnToggles.TryGetValue(column, out var pending)
+          ? pending
+          : !config.IsColumnHidden((uint)column));
+
+        if (ImGui.MenuItem(ColumnLabel(column), shown, !pinned && !holdsSort))
+          _pendingColumnToggles[column] = !shown;
+
+        // TooltipEvenIfDisabled, because both arms below are only ever reached on an item that refused the
+        // click — the plain helper answers false forever on one of those and would kill the tooltip in exactly
+        // the state whose whole job is explaining the refusal.
+        if (pinned)
+          UiTheme.TooltipEvenIfDisabled("Always on. The list with no names in it is not a list.");
+        else if (holdsSort)
+          UiTheme.TooltipEvenIfDisabled("It holds the sort. Sort by something else first, then hide it.");
+      }
+
+      ImGui.EndMenu();
+    }
+
+    ImGui.Separator();
 
     var watchersFirst = config.WatchersFirst;
 
     // Dead unless BOTH halves are on, for two separate reasons and either one sufficient. With the watcher half
     // off it sorts by a fact the list is not allowed to show. With the nearby half off there is no list at all:
     // it reorders _view, which nothing renders in that state, under a tooltip promising to float people to the
-    // top of something. Disabled rather than hidden, unlike the box above, because this one IS persisted config.
+    // top of something. Disabled rather than hidden, unlike the search box, because this one IS persisted
+    // config — a setting that silently vanishes is a setting reported as lost.
     var sortDead = !config.EnableWatchers || !config.EnableNearbyList;
     if (sortDead)
       ImGui.BeginDisabled();
@@ -632,47 +841,42 @@ public sealed class ScentWindow : Window
           : "Float everyone looking at you to the top, on top of whatever column you sorted by.\n" +
             "It is an extra key, not a sort mode — you keep your column sort.");
 
-    // The gap goes in before the measurement below, not after it: GetContentRegionAvail measures from the
-    // cursor, and until SameLine puts the cursor back on this line it is already at the start of the next one,
-    // where it reports a full window's width of room and nothing would ever wrap.
-    ImGui.SameLine(0, 12f * scale);
-    DrawSettingsButton(cogWidth);
+    ImGui.Separator();
 
-    ImGui.Dummy(new Vector2(0, 2f * scale));
-  }
-
-  /// <summary>The cog's width. Measured under the icon font it is drawn with, because a glyph the text font
-  /// does not have measures as a fallback box or as nothing.</summary>
-  private static float SettingsButtonWidth()
-  {
-    Vector2 glyphSize;
-    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-      glyphSize = ImGui.CalcTextSize(FontAwesomeIcon.Cog.ToIconString());
-
-    return glyphSize.X + ImGui.GetStyle().FramePadding.X * 2f;
+    if (ImGui.MenuItem("Settings..."))
+      Plugin.ToggleConfigWindow();
   }
 
   /// <summary>
-  /// The cog, right-aligned on the current toolbar line. Drawn with the icon font so it reads as the same
-  /// control as Dalamud's own plugin cog.
+  /// Moves the sort from the gear menu, and shows the column if it was hidden.
   ///
-  /// The Max clamp is a floor against the cursor walking backwards over the widget to its left, NOT a fit
-  /// guard: it turns an overrun into a cog placed past the content region, outside the clip rect, which ImGui
-  /// culls entirely — silently, since a culled button cannot draw the tooltip that would have explained it.
-  /// Whether the line has room is the caller's question to answer, and <see cref="DrawToolbar"/> answers it
-  /// with <see cref="SettingsButtonWidth"/>, whose result is passed back in here as <paramref name="width"/>.
+  /// The show is what keeps this honest. <see cref="SetupColumn"/> already refuses DefaultHide to whichever
+  /// column owns the sort, so a config restored with the two disagreeing comes up with the column visible — but
+  /// that flag is read ONCE, when the table initialises, and says nothing on any later frame. Without the
+  /// queued show, a sort moved mid-session would order the list by a column that is not on screen, which is the
+  /// thing the remarks at <see cref="ScentColumn.Job"/> forbid. Queued rather than applied here because
+  /// TableSetColumnEnabled asserts on a live table and this runs from a popup, outside one.
+  ///
+  /// Persisted on the spot, and only on a real change: re-picking the column already sorted by would otherwise
+  /// rewrite the config file on every click. This is the guard the old header-driven path needed for the same
+  /// reason and kept in the same shape.
+  ///
+  /// The view re-sorts THIS frame with no help: the signature <see cref="RebuildViewIfStale"/> hashes carries
+  /// _sortColumn and _sortAscending, and <see cref="Draw"/> calls it after the toolbar.
   /// </summary>
-  private static void DrawSettingsButton(float width)
+  private void SortBy(ScentColumn column, bool ascending)
   {
-    ImGui.SameLine(0, 0);
-    ImGui.SetCursorPosX(ImGui.GetCursorPosX() + MathF.Max(0f, ImGui.GetContentRegionAvail().X - width));
+    if (column == _sortColumn && ascending == _sortAscending)
+      return;
 
-    bool clicked;
-    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-      clicked = ImGui.Button(FontAwesomeIcon.Cog.ToIconString());
-    if (clicked)
-      Plugin.ToggleConfigWindow();
-    UiTheme.Tooltip("Settings");
+    _sortColumn = column;
+    _sortAscending = ascending;
+    Plugin.Configuration.SortColumn = (uint)column;
+    Plugin.Configuration.SortAscending = ascending;
+    Plugin.Configuration.Save();
+
+    if (!IsColumnFixed(column) && Plugin.Configuration.IsColumnHidden((uint)column))
+      _pendingColumnToggles[column] = true;
   }
 
   /// <summary>
@@ -915,32 +1119,34 @@ public sealed class ScentWindow : Window
   }
 
   /// <summary>
-  /// What the table would take if it drew <paramref name="rows"/> rows and no more. The header measures the way
-  /// TableGetHeaderRowHeight does — one text line plus CellPadding.Y twice, evaluated inside the same push, which
-  /// is why it takes the figure from <see cref="CellPadding"/> and not from the style. The trailing pixels are the
+  /// What the table would take if it drew <paramref name="rows"/> rows and no more. The trailing pixels are the
   /// outer border line, which is drawn outside the rows' own extents and stays a hairline at any scale.
   ///
-  /// Strictly increasing in <paramref name="rows"/>, which is what lets <see cref="Draw"/> apply the row cap to
-  /// the count rather than to two heights. <paramref name="rowHeight"/> is <see cref="RowHeight"/>'s answer for
-  /// this frame, passed in rather than re-measured for the reasons on it.
+  /// The header's term is gone rather than passed 0: no mode draws a header row any more, so there is no arm
+  /// left to choose between. That is what makes this rows and nothing else.
+  ///
+  /// Strictly increasing in <paramref name="rows"/>, which is what lets <see cref="DrawNearby"/> apply the row
+  /// cap to the count rather than to two heights. <paramref name="rowHeight"/> is <see cref="RowHeight"/>'s
+  /// answer for this frame, passed in rather than re-measured for the reasons on it.
   /// </summary>
-  private static float PlayerTableHeight(int rows, bool header, float scale, float rowHeight)
-    => (header ? ImGui.GetTextLineHeight() + CellPadding(scale).Y * 2f : 0f)
-     + rows * rowHeight + 2f;
+  private static float PlayerTableHeight(int rows, float rowHeight)
+    => rows * rowHeight + 2f;
 
   /// <summary>
   /// One line's height with an icon on it: the taller of the icon font's line and the text font's — the same
-  /// Max, and the same reason, as <see cref="RowHeight"/>. Both blocks <see cref="Draw"/> reserves room for are
-  /// this shape, every arm of them: <see cref="DrawFooter"/>, and the line the history section stands in for its
-  /// table with.
+  /// Max, and the same reason, as <see cref="RowHeight"/>. The one block <see cref="Draw"/> still reserves room
+  /// for is this shape in every arm of it: <see cref="DrawFooter"/>.
   ///
   /// Measured rather than assumed to be one text line, because the reserve is exact and the two fonts do not
   /// share a line height — the whole reason RowHeight exists. CalcTextSize answers with the font's line height
   /// and not the glyph's ink, so which FontAwesome glyph is measured here does not matter and no caller has to
   /// pass one.
   ///
-  /// ONE line. A message that wraps to two is 2 * GetTextLineHeight and this is short by one — see the remarks
-  /// in <see cref="DrawWatcherHistory"/> on why those strings stay short.
+  /// ONE line, and the footer cannot be anything else: it is built from TextColored, which does not wrap unless
+  /// a wrap position is pushed, and none is. A block that DOES wrap is 2 * GetTextLineHeight and this is short
+  /// by one — which is what made the history's empty-state message, drawn through TextWrappedColored, dangerous
+  /// enough to need its strings held short by force. It is measured through here no longer; it sizes itself, in
+  /// its own tab. See <see cref="DrawTargeted"/>.
   /// </summary>
   private static float IconLineHeight()
   {
@@ -969,12 +1175,13 @@ public sealed class ScentWindow : Window
     var flags = ImGuiTableFlags.RowBg | ImGuiTableFlags.NoSavedSettings | ImGuiTableFlags.SizingStretchProp
               | ImGuiTableFlags.Sortable | ImGuiTableFlags.Hideable | ImGuiTableFlags.Reorderable;
 
-    // Hideable and Reorderable stay in HUD mode even with no header to right-click, and this is not laziness.
+    // Hideable and Reorderable stay with no header anywhere to right-click or drag, and this is not laziness.
     // TableUpdateLayout force-enables every column of a table that is not Hideable — so dropping the flag would
-    // un-hide the user's hidden columns the moment HUD came on, and ApplyColumnVisibility would then persist
-    // that as their choice. Resizable is the one that is safe to drop, and the one worth dropping: it is the
-    // only one with a live hit-test, and invisible column-resize handles in a chrome-less overlay steal the
-    // window drag. Borders and ScrollY go for the reasons at their own lines below.
+    // un-hide the user's hidden columns, and ApplyColumnVisibility would then persist that as their choice. The
+    // gear menu's Columns submenu is what drives them now; see _pendingColumnToggle. Resizable is the one that
+    // is safe to drop, and the one worth dropping: it is the only one with a live hit-test, and invisible
+    // column-resize handles in a chrome-less overlay steal the window drag. Borders and ScrollY go for the
+    // reasons at their own lines below.
     //
     // BordersOuter | BordersInnerV is Borders minus BordersInnerH, and dropping that one flag is the whole of
     // the density work. The rule between every row is drawn in TableBorderLight, which is far louder than the
@@ -988,10 +1195,10 @@ public sealed class ScentWindow : Window
 
     var columns = ColumnLayout;
 
-    // Before BeginTable sees the sort flags: a column this frame switches off cannot hold the sort, and ImGui
-    // answers one that does by stripping it during sanitize and substituting its own pick — which ApplySortSpecs
-    // would dutifully save over the user's choice. Reached only by turning the watcher half off while sorted by
-    // the eye, which is a two-click sequence, not a hand-edited config.
+    // Before SetupColumn, which is the live reason for the ordering: its DefaultHide guard asks whether each
+    // column owns the sort, so it has to be asked after the sort has finished moving. A column this frame
+    // switches off cannot hold the sort — reached only by turning the watcher half off while sorted by the eye,
+    // which is a two-click sequence, not a hand-edited config.
     ReconcileSortColumn(config, snapshot);
 
     // Pushed before BeginTable and popped after EndTable — CellPadding is read at BeginTable and again per row.
@@ -1013,31 +1220,54 @@ public sealed class ScentWindow : Window
     if (!ImGui.BeginTable("##scentTable", columns.Length, flags, new Vector2(0f, hud ? 0f : height)))
       return;
 
-    // 0 in HUD: this freezes the first ROW, which is the header only because there is one. With the header
-    // gone it would pin whoever sorts first and scroll everyone else under them.
-    ImGui.TableSetupScrollFreeze(0, hud ? 0 : 1);
-
+    // No TableSetupScrollFreeze: it freezes the first ROW, which was only ever the header. With the header gone
+    // it would pin whoever sorts first and scroll everyone else under them. 0 is the default, so the call is
+    // simply absent rather than passed a 0.
     foreach (var column in columns)
       SetupColumn(column, config, scale, rowHeight);
 
-    if (!hud)
-      ImGui.TableHeadersRow();
-
-    // ORDER IS LOAD-BEARING, and only one of the two reasons is obvious.
+    // NO TableHeadersRow, in either mode. The header row cost a line of chrome to show nine labels the columns
+    // do not need — but it was also the ONLY way in to the sort (its arrows) and to column visibility (its
+    // right-click menu), so both had to be rehoused before it could go. They are in the gear menu; see
+    // DrawSettingsMenu. This is the layout HUD mode has always drawn, and it works for the reason the ordering
+    // note below has always given.
     //
-    // ApplySortSpecs first because a sort change must land this frame rather than showing one frame of the old
-    // order under a header arrow that already claims the new one. And ApplyColumnVisibility second because it
-    // requires a locked layout — TableSetupColumn overwrites every column's flags each frame and it is
+    // ORDER IS LOAD-BEARING.
+    //
+    // ConsumeSortSpecs first because it is what LOCKS THE LAYOUT, and ApplyColumnVisibility cannot be asked
+    // anything until it is: TableSetupColumn overwrites every column's flags each frame and it is
     // TableUpdateLayout that puts the status bits back, so asked any earlier every column answers that it is
     // disabled, and this would write that away as the user's choice on the first frame, every frame.
     //
-    // In HUD mode TableHeadersRow is gone and ImGui.TableGetSortSpecs is the ONLY thing left that locks the
-    // layout (it calls TableUpdateLayout when the layout is not locked). That is why Sortable stays in both
-    // modes and why these two cannot be swapped: TableGetSortSpecs returns NULL before the lock if Sortable is
-    // absent, ApplySortSpecs would short-circuit on specs.IsNull, the layout would never lock, and
-    // ApplyColumnVisibility would silently persist every column as hidden.
-    ApplySortSpecs(snapshot);
+    // With no header row anywhere, ImGui.TableGetSortSpecs is the ONLY thing left that reaches
+    // TableUpdateLayout (it calls it when the layout is not locked). That is why Sortable stays even though
+    // nothing on screen can click a sort any more, and why these two cannot be swapped: TableGetSortSpecs
+    // returns NULL before the lock if Sortable is absent, ConsumeSortSpecs would short-circuit on specs.IsNull,
+    // the layout would never lock, and ApplyColumnVisibility would silently persist every column as hidden.
+    ConsumeSortSpecs();
     ApplyColumnVisibility(config, columns);
+
+    // Last, because it must not be what ApplyColumnVisibility reads: ImGui defers this to the next frame, so
+    // the mask written above is still this frame's honest answer and next frame's is the new one. See
+    // _pendingColumnToggles.
+    //
+    // ALL of them, and cleared unconditionally. Several can be outstanding at once — this is the first table to
+    // draw since the user was last in the gear menu, and that may have been several clicks ago on a tab where
+    // nothing drained them. ImGui defers each one identically, so applying five in a frame settles exactly as
+    // one does.
+    if (_pendingColumnToggles.Count > 0)
+    {
+      foreach (var (column, show) in _pendingColumnToggles)
+      {
+        var index = Array.IndexOf(columns, column);
+        if (index >= 0)
+          ImGui.TableSetColumnEnabled(index, show);
+      }
+
+      // Outside the loop and unconditional: a column that is no longer in `columns` has no index to set, and
+      // keeping it would mean retrying it against every table for the rest of the session.
+      _pendingColumnToggles.Clear();
+    }
 
     // HUD has no ScrollY, so the table draws exactly its rows and anything past the window's edge is simply
     // gone. Show what fits and admit the rest: under HudClickThrough (NoInputs) a scrollbar cannot be dragged
@@ -1068,21 +1298,27 @@ public sealed class ScentWindow : Window
   /// <summary>
   /// Registers one column, honouring the persisted tick.
   ///
-  /// Never hidden while it owns the sort, whatever the mask says, and this guarantee now covers EVERY column
-  /// rather than Race alone. ImGui strips a disabled column's sort order during sanitize and falls back to its
-  /// own pick — the first sortable column, ascending — which ApplySortSpecs would then dutifully save over the
-  /// user's choice: exactly what SortFlagsFor exists to prevent, reached by the one route its flags cannot
-  /// cover, because DefaultSort on a disabled column is inert. ApplyColumnVisibility keeps the mask and the
-  /// ticks in step, so only a hand-edited config arrives here with them disagreeing.
+  /// Never hidden while it owns the sort, whatever the mask says, and this guarantee covers EVERY column. The
+  /// reason is no longer ImGui's sanitize pass — <see cref="ConsumeSortSpecs"/> stopped believing that — it is
+  /// simply that a list ordered by a column which is not on screen is ordered by nothing the user can see, the
+  /// rule the remarks at <see cref="ScentColumn.Job"/> set out. This is the init half of that promise and
+  /// <see cref="SortBy"/> is the mid-session half, because DefaultHide is read once and says nothing on any
+  /// later frame. ApplyColumnVisibility then persists the force-show, so the mask and the ticks end up agreeing
+  /// either way.
+  ///
+  /// No DefaultSort. It was here so that ImGui's own initial pick could not be reported back and saved over the
+  /// user's choice, and with nothing on screen left to sort by, the report is not read at all — see
+  /// <see cref="ConsumeSortSpecs"/>. A flag that steers a value nobody reads is a flag that only has to be kept
+  /// true in future.
   /// </summary>
   private void SetupColumn(ScentColumn column, Configuration config, float scale, float rowHeight)
   {
-    var flags = SortFlagsFor(column);
+    var flags = ImGuiTableColumnFlags.None;
 
     // Disabled, never absent — see ColumnLayout for what dropping a column costs. It beats the NoHide below
     // rather than fighting it: ImGui computes IsEnabled as "IsUserEnabled AND not Disabled", and NoHide only
-    // forces the first of those. So the eye leaves the table and the header's right-click menu, which skips
-    // Disabled columns, while the column count stays put.
+    // forces the first of those. So the eye leaves the table, and the gear menu's two submenus skip it for the
+    // same reason the header's right-click menu used to, while the column count stays put.
     if (IsColumnDisabled(column, config))
       flags |= ImGuiTableColumnFlags.Disabled;
 
@@ -1093,23 +1329,17 @@ public sealed class ScentWindow : Window
 
     switch (column)
     {
-      // "Watching", not "##eye". TableSetupColumn stores a label starting with '#' verbatim — its only guard is
-      // label[0] == 0 — and TableDrawContextMenu hands that string straight to MenuItem, which renders
-      // everything before the "##" and uses the rest as an ID. Everything before it is nothing, so the header's
-      // right-click menu grew a ticked, greyed-out entry with no text at all: the "invisible tab".
-      // NoHeaderLabel suppresses the label on the path into TableHeader ONLY; TableDrawContextMenu calls
-      // TableGetColumnName independently and is unaffected. So the header cell stays blank exactly as it looks
-      // today, and the menu reads "Watching" — greyed and ticked, which is honest, because NoHide means it is.
-      // The column's ImGui ID changes from "eye"; inert, because the table sets NoSavedSettings and
-      // TableHeadersRow scopes each header with PushID(column_n) anyway.
+      // NoHeaderLabel is vestigial now that no header row draws, and stays because it costs nothing and states
+      // the intent: the eye needs no title over it. The label itself is NOT vestigial — it is what the gear
+      // menu reads; see ColumnLabel.
       case ScentColumn.Watching:
-        ImGui.TableSetupColumn("Watching",
+        ImGui.TableSetupColumn(ColumnLabel(column),
           ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoHeaderLabel | flags,
           WatchingColumnWidth(scale), (uint)column);
         break;
 
       case ScentColumn.Name:
-        ImGui.TableSetupColumn("Name", ImGuiTableColumnFlags.WidthStretch | flags, 0f, (uint)column);
+        ImGui.TableSetupColumn(ColumnLabel(column), ImGuiTableColumnFlags.WidthStretch | flags, 0f, (uint)column);
         break;
 
       // Widened by exactly what the icon takes when it is on, measured rather than guessed. A fixed column
@@ -1123,44 +1353,69 @@ public sealed class ScentWindow : Window
       // opts this one column out of that latch, at the cost of a drag handle on a 46px column that has nothing
       // to drag. The other eight stay resizable.
       case ScentColumn.Job:
-        ImGui.TableSetupColumn("Job",
+        ImGui.TableSetupColumn(ColumnLabel(column),
           ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoResize | flags,
           46f * scale + (config.ShowJobIcons ? JobIconSize(scale, rowHeight) + 4f * scale : 0f), (uint)column);
         break;
 
       case ScentColumn.Race:
-        ImGui.TableSetupColumn("Race", ImGuiTableColumnFlags.WidthFixed | flags, 70f * scale, (uint)column);
+        ImGui.TableSetupColumn(ColumnLabel(column), ImGuiTableColumnFlags.WidthFixed | flags, 70f * scale, (uint)column);
         break;
 
       case ScentColumn.Level:
-        ImGui.TableSetupColumn("Lv", ImGuiTableColumnFlags.WidthFixed | flags, 30f * scale, (uint)column);
+        ImGui.TableSetupColumn(ColumnLabel(column), ImGuiTableColumnFlags.WidthFixed | flags, 30f * scale, (uint)column);
         break;
 
       case ScentColumn.World:
-        ImGui.TableSetupColumn("World", ImGuiTableColumnFlags.WidthFixed | flags, 90f * scale, (uint)column);
+        ImGui.TableSetupColumn(ColumnLabel(column), ImGuiTableColumnFlags.WidthFixed | flags, 90f * scale, (uint)column);
         break;
 
       case ScentColumn.Company:
-        ImGui.TableSetupColumn("FC", ImGuiTableColumnFlags.WidthFixed | flags, 60f * scale, (uint)column);
+        ImGui.TableSetupColumn(ColumnLabel(column), ImGuiTableColumnFlags.WidthFixed | flags, 60f * scale, (uint)column);
         break;
 
       // 62, not 52: "128.6y" at a large Dalamud font clipped silently at the old width, and there is no
       // ellipsis on a table cell to say so.
       case ScentColumn.Distance:
-        ImGui.TableSetupColumn("Dist", ImGuiTableColumnFlags.WidthFixed | flags, 62f * scale, (uint)column);
+        ImGui.TableSetupColumn(ColumnLabel(column), ImGuiTableColumnFlags.WidthFixed | flags, 62f * scale, (uint)column);
         break;
 
       // Measured under the icon font like the eye, and for the same reason: GlobalScale and the Dalamud font
       // size are independent settings, so any literal here is a width that shrinks relative to its own glyph.
-      // NoHeaderLabel for the eye's reason too — the glyph needs no title over it, and the header's right-click
-      // menu still reads "Mark" via TableGetColumnName.
       case ScentColumn.Mark:
-        ImGui.TableSetupColumn("Mark",
+        ImGui.TableSetupColumn(ColumnLabel(column),
           ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoHeaderLabel | flags,
           MarkColumnWidth(scale), (uint)column);
         break;
     }
   }
+
+  /// <summary>
+  /// What a column is called, in one place.
+  ///
+  /// Two readers that must agree exactly, and no longer for the reason they used to. The table registers these
+  /// with TableSetupColumn, and the gear menu prints them — and with the header row gone the menu is the ONLY
+  /// place a user ever reads a column's name, so a label that drifted from the column it names would be a tick
+  /// against the wrong word with nothing on screen to contradict it.
+  ///
+  /// "Watching", never "##eye". TableSetupColumn stores a label starting with '#' verbatim — its only guard is
+  /// label[0] == 0 — and a menu item would render everything before the "##" and use the rest as an ID.
+  /// Everything before it is nothing, which is how the header's right-click menu once grew a ticked, greyed-out
+  /// entry with no text at all: the "invisible tab". The same trap is live in the Columns submenu.
+  /// </summary>
+  private static string ColumnLabel(ScentColumn column) => column switch
+  {
+    ScentColumn.Watching => "Watching",
+    ScentColumn.Name => "Name",
+    ScentColumn.Job => "Job",
+    ScentColumn.Race => "Race",
+    ScentColumn.Level => "Lv",
+    ScentColumn.World => "World",
+    ScentColumn.Company => "FC",
+    ScentColumn.Distance => "Dist",
+    ScentColumn.Mark => "Mark",
+    _ => "?",
+  };
 
   /// <summary>The mark column's width; measured under the icon font, exactly like
   /// <see cref="WatchingColumnWidth"/> and for the reason stated there.</summary>
@@ -1192,35 +1447,22 @@ public sealed class ScentWindow : Window
   }
 
   /// <summary>
-  /// Marks the persisted sort column as the table's default.
-  ///
-  /// ImGui picks a Sortable table's initial sort from these flags on the frame it first builds the table, and
-  /// then reports that choice back as a dirty spec. Without this it would hand us its own pick — the first
-  /// sortable column, ascending — and <see cref="ApplySortSpecs"/> would dutifully save it over whatever the
-  /// user had chosen.
-  /// </summary>
-  private ImGuiTableColumnFlags SortFlagsFor(ScentColumn column)
-  {
-    if (column != _sortColumn)
-      return ImGuiTableColumnFlags.None;
-
-    return ImGuiTableColumnFlags.DefaultSort
-      | (_sortAscending ? ImGuiTableColumnFlags.PreferSortAscending : ImGuiTableColumnFlags.PreferSortDescending);
-  }
-
-  /// <summary>
   /// Moves the sort off a column this frame switches off.
   ///
-  /// Only the eye can be switched off, and only by the user turning the watcher half off while sorted by it.
-  /// Left alone, ImGui's sanitize pass strips a disabled column's sort order and falls back to its own pick,
-  /// which ApplySortSpecs would then save — so the sort would silently become "whatever was leftmost" and STAY
-  /// there after the half came back on. Falling back to Name, and persisting it, leaves the user somewhere they
-  /// can see, and lands this frame rather than one frame after ImGui notices.
+  /// Only the eye can be switched off, and only by the user turning the watcher half off while sorted by it —
+  /// the gear menu's Columns submenu refuses to hide whichever column holds the sort, and its Sort submenu
+  /// refuses to offer a column that is switched off, so this is the one route left in.
+  ///
+  /// Left alone the list would go on sorting by a fact the window is no longer allowed to show, and would keep
+  /// doing it after the half came back on, because nothing else would ever move it. Falling back to Name, and
+  /// persisting it, leaves the user somewhere they can see. ImGui's own sanitize pass would also strip the
+  /// disabled column's sort order and substitute its own pick, but that is no longer this method's problem:
+  /// <see cref="ConsumeSortSpecs"/> does not read the answer.
   ///
   /// Asks <see cref="IsColumnDisabled"/> rather than testing membership of <see cref="ColumnLayout"/>: the
   /// layout is constant, so every column is always in it and a membership test answers true forever.
   ///
-  /// Runs before BeginTable because DefaultSort is read when the table is built.
+  /// Runs before BeginTable so the rebuilt view is the one this frame's rows are drawn from.
   /// </summary>
   private void ReconcileSortColumn(Configuration config, ScentSnapshot snapshot)
   {
@@ -1280,34 +1522,37 @@ public sealed class ScentWindow : Window
     config.Save();
   }
 
-  private void ApplySortSpecs(ScentSnapshot snapshot)
+  /// <summary>
+  /// Locks the table's layout, and puts ImGui's sort report back down unread.
+  ///
+  /// This used to ADOPT that report, and had to: the header's arrows were how the user sorted, and the report
+  /// was the only way to hear about it. With the header row gone nothing on screen can move ImGui's sort — the
+  /// gear menu writes <see cref="_sortColumn"/> directly and never tells the table; see <see cref="SortBy"/> —
+  /// so the report has stopped being user input. It can now only be one of two things, and NEITHER may be
+  /// believed:
+  ///
+  /// The init pick from DefaultSort, which is <see cref="_sortColumn"/> already, so adopting it achieves
+  /// nothing.
+  ///
+  /// Or ImGui's SANITIZE FALLBACK, which is the dangerous one. Disable a column holding ImGui's sort order and
+  /// it strips that order and substitutes its own pick — the first sortable column, ascending. The table's idea
+  /// of the sort and <see cref="_sortColumn"/> drift apart the moment the gear menu moves one without the other,
+  /// so the column ImGui falls back FROM need not be the one the user is sorted BY: sorting by Dist while the
+  /// table still thinks Race, then hiding Race from the Columns submenu, would have handed this "Watching,
+  /// ascending" and it would have saved that over their choice. <see cref="SetupColumn"/> and
+  /// <see cref="ReconcileSortColumn"/> each guard one end of that trap; this is the route neither can see, and
+  /// it only opened when the sort left the header.
+  ///
+  /// So the sort has exactly one owner now. The call itself stays and must: TableGetSortSpecs is the only thing
+  /// left that locks the layout — see the ordering note in <see cref="DrawPlayerTable"/> — and SpecsDirty must
+  /// be cleared or ImGui re-raises it every frame forever.
+  /// </summary>
+  private static void ConsumeSortSpecs()
   {
     var specs = ImGui.TableGetSortSpecs();
     if (specs.IsNull || !specs.SpecsDirty)
       return;
 
-    if (specs.SpecsCount > 0)
-    {
-      var column = (ScentColumn)specs.Specs[0].ColumnUserID;
-      var ascending = specs.Specs[0].SortDirection != ImGuiSortDirection.Descending;
-
-      // Only on an actual change. The table hands us its dirty specs on the first frame it exists, so an
-      // unconditional save would rewrite the config file every single time the window opened.
-      if (Enum.IsDefined(column) && (column != _sortColumn || ascending != _sortAscending))
-      {
-        _sortColumn = column;
-        _sortAscending = ascending;
-        Plugin.Configuration.SortColumn = (uint)column;
-        Plugin.Configuration.SortAscending = ascending;
-        Plugin.Configuration.Save();
-
-        // The signature moved, so re-sort now rather than render one frame of the old order under a header
-        // arrow that already claims the new one.
-        RebuildViewIfStale(snapshot);
-      }
-    }
-
-    // Must be cleared, or ImGui re-raises it and this runs every frame forever.
     specs.SpecsDirty = false;
   }
 
@@ -1780,10 +2025,14 @@ public sealed class ScentWindow : Window
   ///
   /// The count is deliberately NOT what is on screen: it is other players in range, excluding self, whatever the
   /// filters are doing — so it and the list are free to disagree, and that disagreement is the one signal that
-  /// filters are hiding people. "Others near" is what stops that reading as a contradiction. "Nearby: 0" beside
-  /// a visible self row looked like an off-by-one; "Others near: 0" is an answer to the question the label now
-  /// actually asks, and self is excluded from BOTH sides of the hiding arm, so it is accurate there too. The
-  /// wording is the only thing that changed here — do not "fix" the count to match the list.
+  /// filters are hiding people. DO NOT "fix" the count to match the list.
+  ///
+  /// The labels are gone and the tooltips are now the only thing carrying what they said. That is a real trade
+  /// and it is worth naming: "Others near: 0" answered the question it asked, where a bare "0 nearby" beside a
+  /// visible self row can be read as the off-by-one this line once actually had. Three things pay for it —
+  /// HideSelf defaults ON so that row is usually not there, self is excluded from BOTH sides of the hiding arm
+  /// so the ratio stays true regardless, and the tooltip says "you are not counted" outright. If the self row
+  /// ever becomes the common case, the label comes back before the count moves.
   ///
   /// <see cref="ScentSnapshot.Valid"/> gates both halves, and that is not a change to the count: a snapshot from
   /// ScentScanner.Reset carries 0 and 0 because nothing was scanned, not because the room was empty, and this
@@ -1807,10 +2056,10 @@ public sealed class ScentWindow : Window
 
       ImGui.TextColored(hiding ? UiTheme.Warn : UiTheme.Muted,
         !snapshot.Valid
-          ? "Others near: —"
+          ? "— nearby"
           : hiding
-            ? $"Others near: {_shownOthers} of {snapshot.NearbyCount} shown"
-            : $"Others near: {snapshot.NearbyCount}");
+            ? $"{_shownOthers} of {snapshot.NearbyCount} nearby"
+            : $"{snapshot.NearbyCount} nearby");
       UiTheme.Tooltip(snapshot.Valid
         ? "Other people in range — you are not counted. I see everyone; filters only " +
           "change what the list shows."
@@ -1820,20 +2069,28 @@ public sealed class ScentWindow : Window
     if (!config.EnableWatchers)
       return;
 
+    // The separator is drawn, not spaced, because the labels that used to hold these two counts apart have
+    // gone. Its own item, so the two halves keep their own colours: the left turns amber when filters hide
+    // people and the right takes the watcher colour, and one TextColored spanning both could be neither.
     if (config.EnableNearbyList)
-      ImGui.SameLine(0, 10f * scale);
+    {
+      ImGui.SameLine(0, 6f * scale);
+      ImGui.TextColored(UiTheme.Muted, "·");
+      ImGui.SameLine(0, 6f * scale);
+    }
 
     DrawWatcherCount(snapshot, config, scale);
 
-    // The caller's job, because DrawWatcherCount owns no tooltip; see its remarks. Nothing else on screen
-    // explains this dash: DrawEmptyState would, but it only draws with the nearby half ON and the view empty,
-    // and this line is reached with neither guaranteed.
-    if (!snapshot.Valid)
-      UiTheme.Tooltip(NoseClosed);
+    // The caller's job, because DrawWatcherCount owns no tooltip; see its remarks. It carries what the dropped
+    // "Watching you:" label used to say outright — that the subject is YOU — which is why the valid arm now has
+    // a tooltip where it never needed one before. Nothing else on screen explains the dash either:
+    // DrawEmptyState would, but it only draws with the nearby half ON and the view empty, and this line is
+    // reached with neither guaranteed.
+    UiTheme.Tooltip(snapshot.Valid ? "People targeting you right now." : NoseClosed);
   }
 
   /// <summary>
-  /// The eye + "Watching you: N" pair, in the watcher colour once there is one. Shared by <see cref="DrawFooter"/>
+  /// The eye + "N watching" pair, in the watcher colour once there is one. Shared by <see cref="DrawFooter"/>
   /// and <see cref="DrawNearbyListOff"/> rather than written twice, because the second is the watcher half's only
   /// HUD surface and two copies of one readout is how the two end up disagreeing about what the half is called.
   ///
@@ -1850,54 +2107,35 @@ public sealed class ScentWindow : Window
     {
       UiTheme.Icon(FontAwesomeIcon.EyeSlash, UiTheme.Muted);
       ImGui.SameLine(0, 4f * scale);
-      ImGui.TextColored(UiTheme.Muted, "Watching you: —");
+      ImGui.TextColored(UiTheme.Muted, "— watching");
       return;
     }
 
     var color = snapshot.WatcherCount > 0 ? config.ColorWatcher : UiTheme.Muted;
     UiTheme.Icon(FontAwesomeIcon.Eye, color);
     ImGui.SameLine(0, 4f * scale);
-    ImGui.TextColored(color, $"Watching you: {snapshot.WatcherCount}");
+    ImGui.TextColored(color, $"{snapshot.WatcherCount} watching");
   }
 
   /// <summary>
-  /// Vertical space <see cref="DrawWatcherHistory"/> needs: the gap above it, its section header, and then
-  /// either the fixed-height table or the one line that stands in for it. Sized from the same list the section
-  /// draws, because an empty log is the default state and reserving a table's worth of room for it would park
-  /// 120px of nothing under the player list until the first watcher ever showed up.
+  /// The Targeted tab: who has been staring at you, and when.
   ///
-  /// The header's height comes from <see cref="UiTheme.SectionHeaderHeight"/> rather than the literals this
-  /// used to carry: SectionHeader draws its label in HeaderFont and emits three items with ItemSpacing between
-  /// them, none of which is visible from here, so two sets of literals in two files could only ever agree by
-  /// luck — and disagreeing creeps the footer down the window or forces a scrollbar. It is handed the icon the
-  /// section below actually draws, because that icon shares the header's line and only the caller knows it is
-  /// there.
+  /// "Targeted", not "Remembered". These entries are episodes of being targeted — ProfileWindow has always said
+  /// "Targeted @ 21:39:15" of the same records — while "Remembered" was doing double duty for MARKS, which are
+  /// the durable record the user authors by hand in MarkStore and have nothing to do with this. Two things
+  /// called the same word is how a user goes looking for their notes in a log that drops itself on logout.
   ///
-  /// EVERY term is one block's height PLUS the ItemSpacing.Y that follows it, and no two of them are allowed to
-  /// cancel: the Dummy's is spelled out beside it, and the table's is added by hand because HistoryTableHeight is
-  /// outer_size.y and EndTable's inner EndChild spends ItemSpacing.Y on top of it. This block is never the last
-  /// thing on the window, so no arm here may drop its trailing term — the footer below it is the one that does,
-  /// and <see cref="Draw"/> budgets the footer bare for exactly that reason.
+  /// NO SECTION HEADER. The tab is the header: a header reading "Targeted" under a tab reading "Targeted" is
+  /// the same word twice for ~38px, and it used to be the largest single thing an empty log spent. What is left
+  /// on that state is one line saying so.
   ///
-  /// The message arm goes through <see cref="IconLineHeight"/> and not GetTextLineHeightWithSpacing, because the
-  /// line it stands for has an icon on it and the icon font is the taller of the two.
-  ///
-  /// The Dummy's term used to be argued away against a "spare" ItemSpacing.Y in the footer's reserve. There is
-  /// no spare: that ItemSpacing.Y is the player table's own trailing gap and was always spoken for, which is why
-  /// the sums looked right with this section switched off and were short by one gap with it on. The shortfall
-  /// only shows once the window meets the viewport clamp, and then it is permanent — an outer scrollbar wrapped
-  /// around the table's own, which is the very thing this reserve exists to prevent.
+  /// The snapshot is read here rather than passed in, now that nothing above needs to know whether there is a
+  /// table to leave room for — the reserve that used to ask has gone with the stacking. One volatile read of an
+  /// immutable list; see WatcherLog.Snapshot.
   /// </summary>
-  private static float HistoryReserve(float scale, bool hasEntries)
-    => 6f * scale + ImGui.GetStyle().ItemSpacing.Y
-     + UiTheme.SectionHeaderHeight(FontAwesomeIcon.History)
-     + (hasEntries
-       ? HistoryTableHeight * scale + ImGui.GetStyle().ItemSpacing.Y
-       : IconLineHeight() + ImGui.GetStyle().ItemSpacing.Y);
-
-  private static void DrawWatcherHistory(IReadOnlyList<WatcherEntry> entries, Configuration config, float scale)
+  private static void DrawTargeted(Configuration config, float scale)
   {
-    UiTheme.SectionHeader("Remembered", FontAwesomeIcon.History);
+    var entries = Plugin.WatcherLog.Snapshot();
 
     if (entries.Count == 0)
     {
@@ -1906,13 +2144,17 @@ public sealed class ScentWindow : Window
       // has to say that it is not remembering, or it is exactly the lie DrawEmptyState goes to such lengths to
       // avoid: the coast reported clear because we stopped remembering, not because nothing happened.
       //
-      // The subject is YOU, never the plugin: every other string here is about who is watching YOU ("Watching
-      // you: 0", "This one is targeting you.", "First watched you"), and this is the easiest place to flip it
-      // by accident.
+      // The subject is YOU, never the plugin: every other string here is about who is watching YOU ("This one
+      // is targeting you.", "First watched you", and the footer's "People targeting you right now."), and this
+      // is the easiest place to flip it by accident. The footer's own counts dropped their labels in the
+      // rework and lean on that tooltip for the "you" — which is the one place this rule is now held by a
+      // hover rather than by the line itself.
       //
-      // Both strings stay SHORT deliberately. HistoryReserve budgets exactly one IconLineHeight for this message
-      // and it is drawn wrapped — a longer string, or a large Dalamud font at the 420px minimum width, wraps to
-      // two lines and pushes the footer past the window's bottom edge.
+      // Both strings used to be held SHORT by force: HistoryReserve budgeted exactly one IconLineHeight for
+      // this message, so a second line pushed the footer off the window's bottom edge. That reserve is gone
+      // with the stacking — this line is now the whole of its own tab, and MeasureDesiredHeight measures the
+      // cursor after it wraps rather than predicting where it will. A two-line wrap costs a taller window and
+      // nothing else. They stay short anyway, because they read better short.
       UiTheme.Icon(FontAwesomeIcon.EyeSlash, UiTheme.Muted);
       ImGui.SameLine();
       UiTheme.TextWrappedColored(UiTheme.Muted, config.KeepHistory
