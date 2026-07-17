@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
@@ -134,10 +135,14 @@ public sealed class ProfileWindow : Window
     DrawHeader(key, mark, row, scale);
     ImGui.Dummy(new Vector2(0, 6f * scale));
 
-    DrawNote(key, mark, scale);
-    ImGui.Dummy(new Vector2(0, 4f * scale));
+    // BUILT BEFORE IT IS DRAWN, because the note stretches to meet it and therefore has to know how tall it will
+    // be. Its height is not a constant: a sighting is two short lines, but every "why there is no sighting"
+    // branch is a wrapped paragraph, and reserving two lines for four would push the answer below the fold in
+    // exactly the case the paragraph exists to explain.
+    var history = BuildHistory(key, mark);
 
-    DrawHistory(key, mark);
+    DrawNote(key, mark, scale, HeightOf(history, scale));
+    DrawHistory(history);
   }
 
   /// <summary>
@@ -454,7 +459,10 @@ public sealed class ProfileWindow : Window
   /// with no correct value, no absent state to explain, and nothing to say back. The separators are what stop it
   /// reading as another readout that happens to be empty.
   /// </summary>
-  private void DrawNote(WatcherKey key, MarkedPlayer? mark, float scale)
+  /// <param name="reserveBelow">
+  /// How much room the history underneath needs, so the note can take everything else.
+  /// </param>
+  private void DrawNote(WatcherKey key, MarkedPlayer? mark, float scale, float reserveBelow)
   {
     ImGui.Separator();
     ImGui.Dummy(new Vector2(0, 2f * scale));
@@ -466,9 +474,20 @@ public sealed class ProfileWindow : Window
     // rather than spending a line on the word "Note".
     var notePos = ImGui.GetCursorScreenPos();
 
+    // STRETCHES to meet the history below. Everything else on this window is sized by its content; the note has
+    // no natural height — it is an empty box the user may put one line or ten in — so it is the only thing here
+    // that can absorb a resize. A fixed four lines left a dead gap under it that grew with every drag, on the
+    // one field whose whole purpose is room to write.
+    //
+    // Floored at three lines rather than allowed to collapse: on a window dragged short the note would otherwise
+    // shrink to nothing while the history it is yielding to stays fully drawn, which inverts the priority — the
+    // history is two lines of recall, the note is the only thing here the user actually authors.
+    var reserve = reserveBelow + (mark is null ? 0f : ImGui.GetFrameHeight() + ImGui.GetStyle().ItemSpacing.Y)
+                + 8f * scale;
+    var noteHeight = Math.Max(ImGui.GetTextLineHeight() * 3f, ImGui.GetContentRegionAvail().Y - reserve);
+
     ImGui.SetNextItemWidth(-1);
-    if (ImGui.InputTextMultiline("##profilenote", ref _note, NoteMaxLength,
-          new Vector2(0, ImGui.GetTextLineHeight() * 4f)))
+    if (ImGui.InputTextMultiline("##profilenote", ref _note, NoteMaxLength, new Vector2(0, noteHeight)))
       Plugin.Marks.Update(key, _worldName, m => m with { Note = _note });
     UiTheme.Tooltip("Kept on disk until you delete it. Nobody else can see it, and it never leaves your machine.");
 
@@ -508,33 +527,65 @@ public sealed class ProfileWindow : Window
   /// about them, not something the user wrote — so it is shown here and forgotten at logout, exactly like the
   /// history pane it comes from. See <see cref="WatcherLog"/>.
   /// </summary>
-  private static void DrawHistory(WatcherKey key, MarkedPlayer? mark)
+  private static List<(string Text, Vector4 Color)> BuildHistory(WatcherKey key, MarkedPlayer? mark)
   {
-    ImGui.Separator();
+    var lines = new List<(string, Vector4)>(2);
 
     var stares = Plugin.WatcherLog.Snapshot().FirstOrDefault(entry => entry.Key == key);
     if (stares is null)
-      DrawNoSightings();
+      lines.Add(NoSightings());
     else
     {
-      UiTheme.TextWrappedColored(UiTheme.Muted, $"Looked at you {stares.Count}x this session.");
-
-      // One episode has no "first" and "most recently" — the two timestamps would be the same clock printed
-      // twice, which reads as a rendering fault rather than as a single sighting.
-      UiTheme.TextWrappedColored(UiTheme.Muted, stares.Count == 1
-        ? $"At {stares.FirstSeen:HH:mm:ss}."
-        : $"First at {stares.FirstSeen:HH:mm:ss}, most recently at {stares.LastSeen:HH:mm:ss}.");
-
       // Not "0s": the dwell is sampled per scan, so a glance shorter than one interval genuinely measures zero.
       // Printing 0s would report "they looked for no time at all" about someone who did look.
-      UiTheme.TextWrappedColored(UiTheme.Muted, stares.TotalStareMs <= 0
-        ? "Too briefly to time."
-        : $"Held you as their target for {FormatDwell(stares.TotalStareMs)} in total.");
+      var held = stares.TotalStareMs <= 0
+        ? "too briefly to time"
+        : $"targeted for {FormatDwell(stares.TotalStareMs)}";
+
+      // THE COUNT SURVIVES, in the only branch where it says anything. One episode has no "first" and no "most
+      // recently", so it takes the short form. More than one and the bare form would print ONE clock time for
+      // five separate episodes — reporting the last as if it were the whole story, and silently dropping four.
+      // Count is episodes, not scans; see WatcherEntry.Count.
+      lines.Add((stares.Count == 1
+        ? $"Targeted @ {stares.FirstSeen:HH:mm:ss}  ({held})"
+        : $"Targeted {stares.Count}x, last @ {stares.LastSeen:HH:mm:ss}  ({held} in total)", UiTheme.Muted));
     }
 
     // The one durable observation, shown where it is made rather than only in a file. See MarkedPlayer.LastSeen.
     if (mark?.LastSeen is { } lastSeen)
-      UiTheme.TextWrappedColored(UiTheme.Muted, ScentWindow.FormatLastSeen(lastSeen, mark.LastSeenZone));
+      lines.Add((string.IsNullOrEmpty(mark.LastSeenZone)
+        ? $"Last Seen: {ScentWindow.FormatAgo(lastSeen)}"
+        : $"Last Seen: {ScentWindow.FormatAgo(lastSeen)}, {mark.LastSeenZone}", UiTheme.Muted));
+
+    return lines;
+  }
+
+  /// <summary>
+  /// How tall <see cref="DrawHistory"/> will be, measured from the strings it is actually about to draw.
+  ///
+  /// Measured rather than assumed because the paragraphs wrap, and wrapping depends on a window width the user
+  /// can drag. A constant would be right at one width and wrong at every other — pushing the history off the
+  /// bottom on a narrow window, which is the one place it must not go.
+  /// </summary>
+  private static float HeightOf(List<(string Text, Vector4 Color)> lines, float scale)
+  {
+    var style = ImGui.GetStyle();
+    var wrap = ImGui.GetContentRegionAvail().X;
+
+    // The separator and the breathing room above it.
+    var height = style.ItemSpacing.Y * 2f + 4f * scale;
+
+    foreach (var (text, _) in lines)
+      height += ImGui.CalcTextSize(text, false, wrap).Y + style.ItemSpacing.Y;
+
+    return height;
+  }
+
+  private static void DrawHistory(List<(string Text, Vector4 Color)> lines)
+  {
+    ImGui.Separator();
+    foreach (var (text, color) in lines)
+      UiTheme.TextWrappedColored(color, text);
   }
 
   /// <summary>
@@ -552,40 +603,33 @@ public sealed class ProfileWindow : Window
   ///
   /// A precise explanation of the WRONG nothing is worse than a dash: a dash does not claim authority.
   /// </summary>
-  private static void DrawNoSightings()
+  private static (string Text, Vector4 Color) NoSightings()
   {
     var config = Plugin.Configuration;
 
     if (!config.KeepHistory)
     {
-      UiTheme.TextWrappedColored(UiTheme.Warn,
-        "Not remembering. History is switched off, so only people looking at you right now appear here — this "
-        + "cannot tell you whether they did earlier.");
-      return;
+      return ("Not remembering. History is switched off, so only people looking at you right now appear here — "
+        + "this cannot tell you whether they did earlier.", UiTheme.Warn);
     }
 
     if (Plugin.WatcherLog.Forgotten is > 0 and var forgotten)
     {
-      UiTheme.TextWrappedColored(UiTheme.Warn,
-        $"{forgotten} {(forgotten == 1 ? "watcher has" : "watchers have")} already been dropped from this "
+      return ($"{forgotten} {(forgotten == 1 ? "watcher has" : "watchers have")} already been dropped from this "
         + $"session's log — it keeps {Math.Max(1, config.HistoryLimit)}. If they were one of them, this says "
-        + "nothing about them.");
-      return;
+        + "nothing about them.", UiTheme.Warn);
     }
 
     if (!config.RecordWhileClosed && !Plugin.IsMainWindowOpen)
     {
-      UiTheme.TextWrappedColored(UiTheme.Muted,
-        "They have never targeted you while the Scent window was open — and staring is only recorded while it "
-        + "is open.");
-      return;
+      return ("They have never targeted you while the Scent window was open — and staring is only recorded "
+        + "while it is open.", UiTheme.Muted);
     }
 
     // The true never. The second sentence is mandatory: FirstSeen is the first time they TARGETED you, so a
     // null here must never be read as "never seen".
-    UiTheme.TextWrappedColored(UiTheme.Muted,
-      "They have never targeted you this session. That is not the same as never being near you — nothing here "
-      + "records who was merely around.");
+    return ("They have never targeted you this session. That is not the same as never being near you — nothing "
+      + "here records who was merely around.", UiTheme.Muted);
   }
 
   /// <summary>Cumulative dwell, in the coarsest unit that is still true. Its own formatter rather than

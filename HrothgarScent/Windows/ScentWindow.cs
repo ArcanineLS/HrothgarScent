@@ -2023,17 +2023,29 @@ public sealed class ScentWindow : Window
   /// </summary>
   internal static string FormatLastSeen(DateTimeOffset lastSeen, string zone)
   {
-    var ago = DateTimeOffset.Now - lastSeen;
-    var when = ago < TimeSpan.Zero ? "just now"                       // a clock that moved; do not print "in -3h"
+    var when = FormatAgo(lastSeen);
+    return string.IsNullOrEmpty(zone) ? $"Last seen {when}." : $"Last seen {when}, in {zone}.";
+  }
+
+  /// <summary>
+  /// Just the "how long ago", with no sentence around it.
+  /// </summary>
+  /// <remarks>
+  /// Split out of <see cref="FormatLastSeen"/> rather than copied, because the profile says the same thing in a
+  /// different shape ("Last Seen: 28 minutes ago, Empyreum") and two windows disagreeing about when "yesterday"
+  /// starts would be worse than either wording. The sentence is the caller's; the clock is not.
+  /// </remarks>
+  internal static string FormatAgo(DateTimeOffset when)
+  {
+    var ago = DateTimeOffset.Now - when;
+    return ago < TimeSpan.Zero ? "just now"                           // a clock that moved; do not print "in -3h"
       : ago.TotalMinutes < 2 ? "just now"
       : ago.TotalHours < 1 ? $"{(int)ago.TotalMinutes} minutes ago"
       : ago.TotalHours < 2 ? "an hour ago"
       : ago.TotalDays < 1 ? $"{(int)ago.TotalHours} hours ago"
       : ago.TotalDays < 2 ? "yesterday"
       : ago.TotalDays < 7 ? $"{(int)ago.TotalDays} days ago"
-      : lastSeen.ToString("dd MMM yyyy");
-
-    return string.IsNullOrEmpty(zone) ? $"Last seen {when}." : $"Last seen {when}, in {zone}.";
+      : when.ToString("dd MMM yyyy");
   }
 
   /// <summary>
