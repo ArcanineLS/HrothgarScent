@@ -653,7 +653,7 @@ public sealed class ScentWindow : Window
       var marker = ImGui.CalcTextSize(SearchHelpGlyph).X + 4f * scale;
       var boxWidth = ImGui.GetContentRegionAvail().X - cogWidth - marker - 12f * scale;
       ImGui.SetNextItemWidth(MathF.Max(90f * scale, boxWidth));
-      ImGui.InputTextWithHint("##search", "Search... (try world:)", ref _search, SearchMaxLength);
+      ImGui.InputTextWithHint("##search", "Search...", ref _search, SearchMaxLength);
 
       // Amber when the box names a field that does not exist, muted otherwise. An unknown field matches
       // everyone rather than nobody — the safe failure — but it is a SILENT one: the filter looks like it did
@@ -2164,19 +2164,25 @@ public sealed class ScentWindow : Window
     }
 
     var showWhen = config.ShowTimestamps;
-    const ImGuiTableFlags flags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg
-      | ImGuiTableFlags.NoSavedSettings | ImGuiTableFlags.SizingStretchProp | ImGuiTableFlags.ScrollY;
+
+    // The same shape the Nearby table now wears, and for the same reasons documented at DrawPlayerTable's flags.
+    // BordersOuter | BordersInnerV is Borders minus the horizontal rule between every row — that rule is far
+    // louder than the RowBg stripe underneath it, so the stripes read as absent and the rules as clutter;
+    // dropping the one flag reveals the striping that was always there. No header row and no scroll-freeze: the
+    // columns here are the eye+name, a count and a time, all self-evident or carried by a tooltip, exactly as
+    // Nearby's Name and Dist are — a "Who / Times / When" bar was labelling the obvious and costing a row.
+    const ImGuiTableFlags flags = ImGuiTableFlags.BordersOuter | ImGuiTableFlags.BordersInnerV
+      | ImGuiTableFlags.RowBg | ImGuiTableFlags.NoSavedSettings | ImGuiTableFlags.SizingStretchProp
+      | ImGuiTableFlags.ScrollY;
 
     WatcherKey? toRemove = null;
     if (ImGui.BeginTable("##watcherHistory", showWhen ? 4 : 3, flags, new Vector2(0f, HistoryTableHeight * scale)))
     {
-      ImGui.TableSetupScrollFreeze(0, 1);
       ImGui.TableSetupColumn("Who", ImGuiTableColumnFlags.WidthStretch);
       ImGui.TableSetupColumn("Times", ImGuiTableColumnFlags.WidthFixed, 46f * scale);
       if (showWhen)
         ImGui.TableSetupColumn("When", ImGuiTableColumnFlags.WidthFixed, 88f * scale);
       ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 60f * scale);
-      ImGui.TableHeadersRow();
 
       // Current watchers above history, then most recent first: the answer to "who is looking at me right
       // now" must never be buried under a log that happens to sort above it.
