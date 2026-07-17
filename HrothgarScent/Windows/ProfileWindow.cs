@@ -165,8 +165,17 @@ public sealed class ProfileWindow : Window
     var avatarPos = origin + new Vector2(12f * scale, banner - avatar * 0.55f);
     DrawAvatar(key, mark, avatarPos, avatar, scale);
 
-    // The text block sits to the right of the avatar and below the banner's baseline.
-    ImGui.SetCursorScreenPos(new Vector2(avatarPos.X + avatar + 12f * scale, origin.Y + banner + 4f * scale));
+    // CENTRED ON THE AVATAR, not parked under the banner. Pinning the text to the banner's baseline made its
+    // position a fact about the banner while its neighbour's was a fact about the overhang — so the block sat
+    // low and ran past the avatar's bottom edge, and the two only lined up at one particular line count.
+    // Measured from the lines actually about to be drawn, so adding or dropping the watching line keeps it
+    // centred instead of nudging everything down.
+    var lines = 3 + (row?.IsWatching == true ? 1 : 0);
+    var textHeight = lines * ImGui.GetTextLineHeightWithSpacing();
+
+    ImGui.SetCursorScreenPos(new Vector2(
+      avatarPos.X + avatar + 12f * scale,
+      avatarPos.Y + (avatar - textHeight) * 0.5f));
 
     using (ImRaii.Group())
     {
@@ -357,8 +366,14 @@ public sealed class ProfileWindow : Window
     {
       PortraitState.Ready => "Their Lodestone portrait.",
       PortraitState.Looking => "Looking them up on the Lodestone…",
-      PortraitState.Missing => "The Lodestone has nobody by this name on this world. They may have renamed or "
-                             + "transferred — use Renamed? in settings to point the mark at who they are now.",
+      // THREE causes, and the search cannot tell them apart — a private profile, a rename and a transfer all
+      // return the same zero results. Naming only the rename would send the user to repair a mark that is not
+      // broken, which is a precise explanation of the wrong nothing: worse than a vague one, because it carries
+      // authority. Showing their job instead is stated first so the fallback does not read as a failure.
+      PortraitState.Missing => "Showing their job — the Lodestone lists nobody by this name on this world.\r\n\r\n"
+                             + "Their profile may be private, or they may have renamed or transferred. If you "
+                             + "know they renamed, use Renamed? in settings to point the mark at who they are "
+                             + "now.",
       PortraitState.Failed => "Could not reach the Lodestone. Showing their job instead.",
       _ => Plugin.Configuration.ShowLodestonePortraits
         ? "Showing their job."
