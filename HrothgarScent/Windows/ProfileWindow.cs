@@ -64,11 +64,17 @@ public sealed class ProfileWindow : Window
 
   public ProfileWindow() : base("Profile##hrothgarscent-profile")
   {
-    Size = new Vector2(460, 520);
+    // Wider than MinimumSize below, deliberately: a first-use size UNDER the minimum is a window that opens
+    // already being clamped, i.e. a default the constraint immediately overrules.
+    Size = new Vector2(540, 520);
     SizeCondition = ImGuiCond.FirstUseEver;
+    // The minimum is set by the ACTION ROW, not by the text: three icon buttons, the Lodestone button, both
+    // ticks, the swatch and its reset all sit on one line, and ImGui does not wrap a SameLine chain — it runs
+    // off the edge. Everything scales together (Dalamud multiplies these by GlobalScale), so this holds at any
+    // UI scale; it is the row's content that pins it, and anything added to that row has to be paid for here.
     SizeConstraints = new WindowSizeConstraints
     {
-      MinimumSize = new Vector2(420, 360),
+      MinimumSize = new Vector2(500, 360),
       MaximumSize = new Vector2(900, 1200),
     };
   }
@@ -128,7 +134,7 @@ public sealed class ProfileWindow : Window
     DrawHeader(key, mark, row, scale);
     ImGui.Dummy(new Vector2(0, 6f * scale));
 
-    DrawMarkControls(key, mark, scale);
+    DrawNote(key, mark, scale);
     ImGui.Dummy(new Vector2(0, 4f * scale));
 
     DrawHistory(key, mark);
@@ -211,7 +217,7 @@ public sealed class ProfileWindow : Window
     var below = Math.Max(ImGui.GetCursorScreenPos().Y, avatarPos.Y + avatar + 6f * scale);
     ImGui.SetCursorScreenPos(new Vector2(origin.X, below));
 
-    DrawActions(key, row);
+    DrawActions(key, mark, row, scale);
   }
 
   /// <summary>
@@ -223,7 +229,7 @@ public sealed class ProfileWindow : Window
   /// hidden. Hiding them would make the row's contents jump as someone walks in and out of range, and a control
   /// that appears and disappears is harder to trust than one that greys out and says why.
   /// </summary>
-  private void DrawActions(WatcherKey key, ScentRow? row)
+  private void DrawActions(WatcherKey key, MarkedPlayer? mark, ScentRow? row, float scale)
   {
     // Icons for the three that act on a character, words for the one that opens a browser. Not a style choice:
     // the icon row is disabled as a block whenever they walk away, and a text button sitting inside that block
@@ -255,6 +261,64 @@ public sealed class ProfileWindow : Window
     if (ImGui.Button("Open on Lodestone"))
       PlayerActions.OpenLodestone(key.Name, WorldNameOf(key, row));
     UiTheme.Tooltip("Opens their public profile in your browser. Works whether or not they are nearby.");
+
+    // The mark's controls ride the same row, past a wider gap. The gap is the only thing separating two kinds of
+    // control that must not be confused: everything to the left DOES something once and is forgotten, while
+    // everything from here rightwards CHANGES WHAT IS ON DISK the instant it is clicked. Same line, because they
+    // are all "act on this person"; visibly spaced, because only half of them are permanent.
+    ImGui.SameLine(0, 20f * scale);
+
+    var config = Plugin.Configuration;
+
+    var focus = mark?.IsFocused ?? false;
+    if (ImGui.Checkbox("Focus", ref focus))
+      Plugin.Marks.Update(key, _worldName, m => m with
+      {
+        Marks = focus ? m.Marks | MarkKind.Focus : m.Marks & ~MarkKind.Focus,
+      });
+    UiTheme.Tooltip("Colour them and float them near the top of the list.");
+
+    ImGui.SameLine();
+
+    var ignore = mark?.IsIgnored ?? false;
+    if (ImGui.Checkbox("Ignore", ref ignore))
+      Plugin.Marks.Update(key, _worldName, m => m with
+      {
+        Marks = ignore ? m.Marks | MarkKind.Ignore : m.Marks & ~MarkKind.Ignore,
+      });
+    UiTheme.Tooltip("Never show or announce them again. Beats Focus if they carry both.");
+
+    // The colour rides beside Focus rather than owning a row. It FOLDS INTO the focus slot everywhere else in
+    // the plugin — see DrawRow's name-colour chain — so it is only meaningful on a focused player, and sitting
+    // here says that by placement instead of by a caveat under a lonely swatch.
+    ImGui.SameLine(0, 10f * scale);
+
+    var color = mark?.Color ?? config.ColorFocused;
+    if (ImGui.ColorEdit4("##markcolour", ref color,
+          ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.AlphaPreview | ImGuiColorEditFlags.NoLabel))
+      Plugin.Marks.Update(key, _worldName, m => m with { Color = color });
+    UiTheme.Tooltip(focus
+      ? "Their colour in the list, on the eye, and on the nameplate."
+      : "Their colour — shows on focused players only, so this does nothing until Focus is ticked.");
+
+    ImGui.SameLine(0, 4f * scale);
+
+    // Mandatory, not a nicety: ColorEdit4 takes a non-null Vector4, so there is no path back to "no colour"
+    // through the widget itself. Without this the default is unreachable the moment the user touches the swatch.
+    using (ImRaii.Disabled(mark?.Color is null))
+    {
+      if (IconButton(FontAwesomeIcon.Undo, "resetcolour"))
+        Plugin.Marks.Update(key, _worldName, m => m with { Color = null });
+    }
+    UiTheme.TooltipEvenIfDisabled(mark?.Color is null
+      ? "Already the default focus colour."
+      : "Back to the default focus colour.");
+
+    // Its own line, because it is a sentence about the row above rather than another control in it. Both at once
+    // is a contradiction the user is allowed to hold — the flags stay independent so that un-ignoring gives the
+    // focus back — but it must not be silent, or the row simply vanishes and the Focus tick looks broken.
+    if (focus && ignore)
+      UiTheme.TextWrappedColored(UiTheme.Muted, "Ignored, so Focus does nothing while both are ticked.");
   }
 
   /// <summary>
@@ -382,63 +446,18 @@ public sealed class ProfileWindow : Window
     UiTheme.Tooltip(tip);
   }
 
-  /// <summary>The ticks, the note and the colour. Carried over from the editor this window replaces, with its
-  /// reasoning intact — see each comment.</summary>
-  private void DrawMarkControls(WatcherKey key, MarkedPlayer? mark, float scale)
+  /// <summary>
+  /// The note, and the button that deletes the record it belongs to.
+  ///
+  /// Fenced off above and below. Everything else on this window is a fact ABOUT the player or a verb aimed AT
+  /// them; this is the only place the user writes prose, and the rules run the other way — it is the one field
+  /// with no correct value, no absent state to explain, and nothing to say back. The separators are what stop it
+  /// reading as another readout that happens to be empty.
+  /// </summary>
+  private void DrawNote(WatcherKey key, MarkedPlayer? mark, float scale)
   {
-    var config = Plugin.Configuration;
-
-    var focus = mark?.IsFocused ?? false;
-    if (ImGui.Checkbox("Focus", ref focus))
-      Plugin.Marks.Update(key, _worldName, m => m with
-      {
-        Marks = focus ? m.Marks | MarkKind.Focus : m.Marks & ~MarkKind.Focus,
-      });
-    UiTheme.Tooltip("Colour them and float them near the top of the list.");
-
-    ImGui.SameLine();
-
-    var ignore = mark?.IsIgnored ?? false;
-    if (ImGui.Checkbox("Ignore", ref ignore))
-      Plugin.Marks.Update(key, _worldName, m => m with
-      {
-        Marks = ignore ? m.Marks | MarkKind.Ignore : m.Marks & ~MarkKind.Ignore,
-      });
-    UiTheme.Tooltip("Never show or announce them again. Beats Focus if they carry both.");
-
-    // The colour rides the Focus row rather than owning one of its own. It FOLDS INTO the focus slot everywhere
-    // else in the plugin — see DrawRow's name-colour chain — so it is only meaningful on a focused player, and
-    // putting it here says that by placement instead of by a caveat under a lonely swatch.
-    ImGui.SameLine(0, 18f * scale);
-
-    var color = mark?.Color ?? config.ColorFocused;
-    if (ImGui.ColorEdit4("##markcolour", ref color,
-          ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.AlphaPreview | ImGuiColorEditFlags.NoLabel))
-      Plugin.Marks.Update(key, _worldName, m => m with { Color = color });
-    UiTheme.Tooltip(focus
-      ? "Their colour in the list, on the eye, and on the nameplate."
-      : "Their colour — shows on focused players only, so this does nothing until Focus is ticked.");
-
-    ImGui.SameLine(0, 4f * scale);
-
-    // Mandatory, not a nicety: ColorEdit4 takes a non-null Vector4, so there is no path back to "no colour"
-    // through the widget itself. Without this the default is unreachable the moment the user touches the swatch.
-    using (ImRaii.Disabled(mark?.Color is null))
-    {
-      if (IconButton(FontAwesomeIcon.Undo, "resetcolour"))
-        Plugin.Marks.Update(key, _worldName, m => m with { Color = null });
-    }
-    UiTheme.TooltipEvenIfDisabled(mark?.Color is null
-      ? "Already the default focus colour."
-      : "Back to the default focus colour.");
-
-    // Both at once is a contradiction the user is allowed to hold — the two flags stay independent so that
-    // un-ignoring gives the focus back — but it must not be silent, or the row simply vanishes and the Focus
-    // tick above looks broken.
-    if (focus && ignore)
-      UiTheme.TextWrappedColored(UiTheme.Muted, "Ignored, so Focus does nothing while both are ticked.");
-
-    ImGui.Dummy(new Vector2(0, 6f * scale));
+    ImGui.Separator();
+    ImGui.Dummy(new Vector2(0, 2f * scale));
 
     // MULTILINE, and the hint is painted by hand because of it. The note is the one thing on this window the
     // user authors and it holds sentences, so InputTextWithHint — which is single-line only — would have traded
