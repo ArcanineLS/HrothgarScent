@@ -24,6 +24,15 @@ namespace HrothgarScent.Scent;
 /// </summary>
 public sealed class NameplateService : IDisposable
 {
+  /// <summary>
+  /// How far the outline is darkened below the name it surrounds. See <see cref="Paint"/>.
+  ///
+  /// Multiplied, not subtracted: a fixed offset would clip a dark colour to black and leave a bright one barely
+  /// distinguishable from its own fill, so the outline would only work for colours near the middle. Scaling
+  /// keeps the gap proportional, so every colour gets the same relative separation.
+  /// </summary>
+  private const float EdgeShade = 0.25f;
+
   /// <summary>Whether the handler is currently attached. The PvP defence's second half; see
   /// <see cref="Sync"/>.</summary>
   private bool _subscribed;
@@ -157,8 +166,6 @@ public sealed class NameplateService : IDisposable
     if (!anyWatchers && !anyMarks)
       return;
 
-    var watcherColor = PackAbgr(config.ColorWatcher);
-
     // One published read for the frame, exactly as the scan does. Immutable and volatile-read, so it is safe
     // from here and cannot tear.
     var marks = Plugin.Marks.Index;
@@ -196,7 +203,7 @@ public sealed class NameplateService : IDisposable
       // left when neither applies, and is expressed by painting NOTHING rather than by painting a default.
       if (paintWatchers && row.IsWatching)
       {
-        handler.TextColor = watcherColor;
+        Paint(handler, config.ColorWatcher);
         continue;
       }
 
@@ -207,8 +214,32 @@ public sealed class NameplateService : IDisposable
       // Color ?? ColorFocused, again matching the list: an unset colour is not "no colour", it is the default
       // focus colour, and the profile's own swatch shows it as such.
       if (paintMarks && mark is { IsFocused: true })
-        handler.TextColor = PackAbgr(mark.Color ?? config.ColorFocused);
+        Paint(handler, mark.Color ?? config.ColorFocused);
     }
+  }
+
+  /// <summary>
+  /// Colours one plate — BOTH the fill and its outline.
+  ///
+  /// The outline is not decoration and not optional. A nameplate is drawn as coloured text inside a contrasting
+  /// edge, and the game's default edge is tuned for the white text it expects; leave it alone and a chosen
+  /// colour is rendered inside an outline picked for a different colour entirely. The result reads as washed
+  /// out or haloed rather than as the colour the user picked, on the surface whose entire job is showing them
+  /// that colour.
+  ///
+  /// The edge is the SAME hue, darkened — not black, and not a second choice for the user to make. Black would
+  /// fight a dark colour and vanish behind it; a second setting would be two knobs for one decision, and the
+  /// wrong pairing is a legibility bug the user gets to inflict on themselves. Deriving it means any colour they
+  /// pick arrives already legible.
+  ///
+  /// Alpha is forced opaque on the edge and taken from the colour on the fill. A translucent outline stops being
+  /// an outline — the world shows through the one part whose whole purpose is separating the text FROM the
+  /// world — and this plugin's colours are all alpha 1 in practice anyway.
+  /// </summary>
+  private static void Paint(INamePlateUpdateHandler handler, Vector4 color)
+  {
+    handler.TextColor = PackAbgr(color);
+    handler.EdgeColor = PackAbgr(new Vector4(color.X * EdgeShade, color.Y * EdgeShade, color.Z * EdgeShade, 1f));
   }
 
   /// <summary>
