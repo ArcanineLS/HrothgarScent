@@ -128,30 +128,10 @@ public sealed class ProfileWindow : Window
     DrawHeader(key, mark, row, scale);
     ImGui.Dummy(new Vector2(0, 6f * scale));
 
-    DrawLive(row, scale);
-    ImGui.Dummy(new Vector2(0, 4f * scale));
-
     DrawMarkControls(key, mark, scale);
     ImGui.Dummy(new Vector2(0, 4f * scale));
 
     DrawHistory(key, mark);
-
-    if (mark is null)
-      return;
-
-    ImGui.Dummy(new Vector2(0, 6f * scale));
-    ImGui.Separator();
-
-    if (ImGui.SmallButton("Forget this player"))
-    {
-      Plugin.Marks.Remove(key);
-
-      // Stays open on purpose. Forget deletes the record, not the person — they may still be standing in front
-      // of the user, and the window is still the answer to "who is this". Closing would also make the button
-      // feel like it dismissed something rather than deleted something.
-      _note = string.Empty;
-    }
-    UiTheme.Tooltip("Deletes the note, the colour and both ticks. Does not close this.");
   }
 
   /// <summary>
@@ -192,13 +172,30 @@ public sealed class ProfileWindow : Window
     {
       ImGui.TextColored(UiTheme.AccentBlue, key.Name);
 
+      // The Free Company sits beside the name, where the game itself puts it. The TAG, never a name: the client
+      // only ever hands over five characters, and the full name lives on the Lodestone.
+      if (row?.CompanyTag is { Length: > 0 } tag)
+      {
+        ImGui.SameLine(0, 6f * scale);
+        UiTheme.TextWrappedColored(UiTheme.Muted, $"«{tag}»");
+      }
+
+      // World, then race where it is known. OMITTED rather than dashed when it is not: a labelled "Race: —"
+      // would claim they have no race, when the truth is only that they are not standing in front of you. An
+      // absent word claims nothing, which is the honest shape once the live section's caption is gone.
       var world = mark?.HomeWorldName is { Length: > 0 } w ? w : _worldName;
-      UiTheme.TextWrappedColored(UiTheme.Muted, world.Length > 0 ? world : "Unknown world");
+      var line = world.Length > 0 ? world : "Unknown world";
+      if (row?.RaceName is { Length: > 0 } race)
+        line += $" · {race}";
+      UiTheme.TextWrappedColored(UiTheme.Muted, line);
 
       // The tag line, in the shape the mark actually carries. "No tags set" rather than an empty row, because
       // an unmarked player is the common case and a blank gap reads as a rendering fault.
       var tags = Tags(mark);
       UiTheme.TextWrappedColored(tags is null ? UiTheme.Muted : UiTheme.AccentPurple, tags ?? "— No tags set —");
+
+      if (row?.IsWatching == true)
+        UiTheme.TextWrappedColored(Plugin.Configuration.ColorWatcher, "Looking at you right now.");
     }
 
     // Past the taller of the two columns, whichever it was.
@@ -219,34 +216,60 @@ public sealed class ProfileWindow : Window
   /// </summary>
   private void DrawActions(WatcherKey key, ScentRow? row)
   {
-    if (ImGui.SmallButton("Open on Lodestone"))
-      PlayerActions.OpenLodestone(key.Name, WorldNameOf(key, row));
-    UiTheme.Tooltip("Opens their public profile in your browser. Works whether or not they are nearby.");
+    // Icons for the three that act on a character, words for the one that opens a browser. Not a style choice:
+    // the icon row is disabled as a block whenever they walk away, and a text button sitting inside that block
+    // would grey out with it despite needing nothing from the game.
+    using (ImRaii.Disabled(row is null))
+    {
+      if (IconButton(FontAwesomeIcon.PaperPlane, "target"))
+        PlayerActions.Target(row!.GameObjectId);
+      ActionTip(row, "Target them.");
+
+      ImGui.SameLine();
+
+      if (IconButton(FontAwesomeIcon.Search, "examine"))
+        PlayerActions.Examine(row!.GameObjectId);
+      ActionTip(row, "Examine them.");
+
+      ImGui.SameLine();
+
+      if (IconButton(FontAwesomeIcon.Paste, "link"))
+        PlayerActions.LinkInChat(row!);
+      ActionTip(row, "Post their name to chat as a clickable link.");
+    }
 
     ImGui.SameLine();
 
-    using (ImRaii.Disabled(row is null))
-    {
-      if (ImGui.SmallButton("Target"))
-        PlayerActions.Target(row!.GameObjectId);
-
-      ImGui.SameLine();
-
-      if (ImGui.SmallButton("Examine"))
-        PlayerActions.Examine(row!.GameObjectId);
-
-      ImGui.SameLine();
-
-      if (ImGui.SmallButton("Link in chat"))
-        PlayerActions.LinkInChat(row!);
-    }
-
-    // TooltipEvenIfDisabled, not Tooltip: ImGui stamps the disabled flag onto the item at submission, so the
-    // plain helper answers "not hovered" forever after — killing the tooltip in the one state whose entire job
-    // is to explain where the control went.
-    if (row is null)
-      UiTheme.TooltipEvenIfDisabled("Needs them nearby — these act on the character standing in front of you.");
+    // Never disabled: it needs only a name and a world, both of which this window has by definition, and it
+    // opens the user's own browser rather than reaching out itself. It is the ONE action that still works on
+    // someone the scanner has never seen — which is exactly when looking them up is most useful.
+    if (ImGui.Button("Open on Lodestone"))
+      PlayerActions.OpenLodestone(key.Name, WorldNameOf(key, row));
+    UiTheme.Tooltip("Opens their public profile in your browser. Works whether or not they are nearby.");
   }
+
+  /// <summary>
+  /// A square button drawn from the icon font.
+  ///
+  /// The id is pushed rather than baked into the label with ##, because the label IS the glyph — two icon
+  /// buttons whose glyphs happened to collide would share an ImGui id and fight over their click state.
+  /// </summary>
+  private static bool IconButton(FontAwesomeIcon icon, string id)
+  {
+    using var pushed = ImRaii.PushId(id);
+    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+      return ImGui.Button(icon.ToIconString());
+  }
+
+  /// <summary>
+  /// TooltipEvenIfDisabled, not Tooltip: ImGui stamps the disabled flag onto the item at submission, so the
+  /// plain helper answers "not hovered" forever after — killing the tooltip in the one state whose entire job is
+  /// to explain where the control went.
+  /// </summary>
+  private static void ActionTip(ScentRow? row, string what)
+    => UiTheme.TooltipEvenIfDisabled(row is null
+      ? $"{what}\r\n\r\nNeeds them nearby — this acts on the character standing in front of you."
+      : what);
 
   /// <summary>The best world name available: the mark's is authoritative, the row's is live, and the field
   /// captured at open is the last resort.</summary>
@@ -255,45 +278,6 @@ public sealed class ProfileWindow : Window
     if (Plugin.Marks.Find(key)?.HomeWorldName is { Length: > 0 } stored)
       return stored;
     return row?.HomeWorldName is { Length: > 0 } live ? live : _worldName;
-  }
-
-  /// <summary>
-  /// Who is standing there right now.
-  ///
-  /// THE HEADING IS THE STATE. Everything in here evaporates the moment they walk away, so the section says so
-  /// in its own caption rather than leaving each empty field to be misread as "this person has no race". When
-  /// there is no row there are no fields at all — a section of dashes would invite exactly the reading the
-  /// caption exists to prevent.
-  /// </summary>
-  private static void DrawLive(ScentRow? row, float scale)
-  {
-    UiTheme.SectionHeader("Right now", FontAwesomeIcon.Eye);
-    UiTheme.TextWrappedColored(UiTheme.Muted, "From the live scan. Gone the moment they walk away.");
-    ImGui.Dummy(new Vector2(0, 2f * scale));
-
-    if (row is null)
-    {
-      UiTheme.TextWrappedColored(UiTheme.Muted,
-        "Not nearby. Their job, race and Free Company are only readable while they are in range — this says "
-        + "nothing about whether they have any.");
-      return;
-    }
-
-    ImGui.TextUnformatted($"{row.JobAbbreviation} · Lv {row.Level}");
-
-    if (row.RaceName is { Length: > 0 } race)
-      ImGui.TextUnformatted(race);
-
-    // The TAG, not the name, and the label says so. The client only ever hands over the five-character tag; the
-    // full Free Company name lives on the Lodestone. Calling this "Free Company" flat would make the two look
-    // like the same fact reported twice, one of them truncated.
-    if (row.CompanyTag is { Length: > 0 } tag)
-      ImGui.TextUnformatted($"«{tag}»");
-    else
-      UiTheme.TextWrappedColored(UiTheme.Muted, "No Free Company tag showing.");
-
-    if (row.IsWatching)
-      UiTheme.TextWrappedColored(Plugin.Configuration.ColorWatcher, "Looking at you right now.");
   }
 
   /// <summary>The mark's flags as one line, or null when there is nothing to say.</summary>
@@ -407,43 +391,80 @@ public sealed class ProfileWindow : Window
       });
     UiTheme.Tooltip("Never show or announce them again. Beats Focus if they carry both.");
 
+    // The colour rides the Focus row rather than owning one of its own. It FOLDS INTO the focus slot everywhere
+    // else in the plugin — see DrawRow's name-colour chain — so it is only meaningful on a focused player, and
+    // putting it here says that by placement instead of by a caveat under a lonely swatch.
+    ImGui.SameLine(0, 18f * scale);
+
+    var color = mark?.Color ?? config.ColorFocused;
+    if (ImGui.ColorEdit4("##markcolour", ref color,
+          ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.AlphaPreview | ImGuiColorEditFlags.NoLabel))
+      Plugin.Marks.Update(key, _worldName, m => m with { Color = color });
+    UiTheme.Tooltip(focus
+      ? "Their colour in the list, on the eye, and on the nameplate."
+      : "Their colour — shows on focused players only, so this does nothing until Focus is ticked.");
+
+    ImGui.SameLine(0, 4f * scale);
+
+    // Mandatory, not a nicety: ColorEdit4 takes a non-null Vector4, so there is no path back to "no colour"
+    // through the widget itself. Without this the default is unreachable the moment the user touches the swatch.
+    using (ImRaii.Disabled(mark?.Color is null))
+    {
+      if (IconButton(FontAwesomeIcon.Undo, "resetcolour"))
+        Plugin.Marks.Update(key, _worldName, m => m with { Color = null });
+    }
+    UiTheme.TooltipEvenIfDisabled(mark?.Color is null
+      ? "Already the default focus colour."
+      : "Back to the default focus colour.");
+
     // Both at once is a contradiction the user is allowed to hold — the two flags stay independent so that
     // un-ignoring gives the focus back — but it must not be silent, or the row simply vanishes and the Focus
     // tick above looks broken.
     if (focus && ignore)
       UiTheme.TextWrappedColored(UiTheme.Muted, "Ignored, so Focus does nothing while both are ticked.");
 
-    ImGui.Dummy(new Vector2(0, 4f * scale));
-    ImGui.TextUnformatted("Note");
+    ImGui.Dummy(new Vector2(0, 6f * scale));
+
+    // MULTILINE, and the hint is painted by hand because of it. The note is the one thing on this window the
+    // user authors and it holds sentences, so InputTextWithHint — which is single-line only — would have traded
+    // the label for the room to write, which is not an improvement. There is no multiline overload that takes a
+    // hint, so the placeholder is drawn into the empty box instead: same effect, and the box keeps its width
+    // rather than spending a line on the word "Note".
+    var notePos = ImGui.GetCursorScreenPos();
 
     ImGui.SetNextItemWidth(-1);
     if (ImGui.InputTextMultiline("##profilenote", ref _note, NoteMaxLength,
-          new Vector2(0, ImGui.GetTextLineHeight() * 5f)))
+          new Vector2(0, ImGui.GetTextLineHeight() * 4f)))
       Plugin.Marks.Update(key, _worldName, m => m with { Note = _note });
-    UiTheme.Tooltip("Only you ever see this. It is kept on disk until you delete it.");
+    UiTheme.Tooltip("Kept on disk until you delete it. Nobody else can see it, and it never leaves your machine.");
+
+    // Inside the frame, offset by ImGui's own padding so it lands exactly where the caret will. Drawn after the
+    // widget so it sits on top of the empty background rather than under it.
+    if (_note.Length == 0)
+      ImGui.GetWindowDrawList().AddText(notePos + ImGui.GetStyle().FramePadding,
+        ImGui.GetColorU32(UiTheme.Muted), "Write a note — only you ever see it");
 
     ImGui.Dummy(new Vector2(0, 4f * scale));
 
-    // Colour FOLDS INTO the focus slot rather than becoming a sixth colour competing for the same cell — see
-    // DrawRow's name-colour chain. So it is only meaningful on a focused player, and saying so beats a swatch
-    // that silently does nothing.
-    var color = mark?.Color ?? config.ColorFocused;
-    if (ImGui.ColorEdit4("Colour", ref color, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.AlphaPreview))
-      Plugin.Marks.Update(key, _worldName, m => m with { Color = color });
+    // Only where there is something to delete. On an unmarked player it would be a button whose whole function
+    // is to do nothing — and MarkStore.Remove silently returns on a key it does not hold, so it would not even
+    // report its own uselessness.
+    if (mark is null)
+      return;
 
-    ImGui.SameLine();
-
-    // Mandatory, not a nicety: ColorEdit4 takes a non-null Vector4, so there is no path back to "no colour"
-    // through the widget itself. Without this the default is unreachable the moment the user touches the swatch.
-    using (ImRaii.Disabled(mark?.Color is null))
+    if (IconButton(FontAwesomeIcon.TrashAlt, "forget"))
     {
-      if (ImGui.SmallButton("Reset"))
-        Plugin.Marks.Update(key, _worldName, m => m with { Color = null });
-    }
-    UiTheme.Tooltip("Back to the default focus colour.");
+      Plugin.Marks.Remove(key);
 
-    if (!focus)
-      UiTheme.TextWrappedColored(UiTheme.Muted, "Colour shows on focused players only.");
+      // Stays open on purpose. Forget deletes the record, not the person — they may still be standing in front
+      // of the user, and the window is still the answer to "who is this". Closing would also make the button
+      // feel like it dismissed something rather than deleted something.
+      _note = string.Empty;
+    }
+    UiTheme.Tooltip("Forget this player — deletes the note, the colour and both ticks. Does not close this.");
+
+    ImGui.SameLine(0, 6f * scale);
+    UiTheme.TextWrappedColored(UiTheme.Muted, "Forget this player");
   }
 
   /// <summary>
