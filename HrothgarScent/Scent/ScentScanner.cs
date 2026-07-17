@@ -61,6 +61,15 @@ public sealed class ScentScanner : IDisposable
   /// </remarks>
   private int _previousMarkRevision = -1;
 
+  /// <summary>
+  /// Whether mark colours were reaching the plates on the previous scan, so the SWITCH itself can fire a redraw.
+  /// </summary>
+  /// <remarks>
+  /// Starts false, matching the setting's own default, so a session that begins with the feature off does not
+  /// open by asking the game to rebuild every plate for a change that did not happen.
+  /// </remarks>
+  private bool _previousPaintMarks;
+
   private Dictionary<WatcherKey, StareState> _previousWatchers = [];
 
   /// <summary>The territory <see cref="_zoneName"/> was resolved for. Framework-thread-owned; see
@@ -425,14 +434,25 @@ public sealed class ScentScanner : IDisposable
     // Its own statement rather than a clause on the one above, because the two are independently switchable and
     // an && between them would let either half silently disable the other's redraw.
     var markRevision = Plugin.Marks.Index.Revision;
-    if (config.NameplateMode != NameplateMode.Off && config.NameplateMarkColors && config.EnableNearbyList
-        && markRevision != _previousMarkRevision)
+    var paintMarks = config.NameplateMode != NameplateMode.Off && config.NameplateMarkColors
+                  && config.EnableNearbyList;
+
+    // TWO triggers, and the switch itself is one of them. Watching only the revision was wrong in the one moment
+    // that matters most: at the instant the user ticks the option the revision is whatever it already was, so
+    // nothing fires and the feature sits inert until a mark is edited or the game dirties the plate for its own
+    // reasons — the user ticks a box and watches nothing happen. Unticking was worse: the colours stayed painted.
+    //
+    // Nothing else covers it. Sync's `wanted` can be unchanged across this toggle — the watcher half alone keeps
+    // it true — so Subscribe's own Redraw is never reached, and an earlier comment here claimed the opposite.
+    // BOTH directions fire: on paints what was plain, off scrubs what was painted.
+    if (paintMarks != _previousPaintMarks || (paintMarks && markRevision != _previousMarkRevision))
       Plugin.Nameplates.Redraw();
 
-    // Updated unconditionally, like _previousWatchers below and for the same reason: tracking it only while the
-    // feature is on would make the first scan after switching it back on compare against a revision from
-    // whenever it was switched off, and fire a redraw that Sync's own Subscribe has already fired.
+    // Updated unconditionally, like _previousWatchers below: tracking the revision only while the feature is on
+    // would make the first scan after switching it back on compare against a revision from whenever it was
+    // switched off, and fire a second redraw for the toggle that has already fired its own.
     _previousMarkRevision = markRevision;
+    _previousPaintMarks = paintMarks;
 
     // Updated unconditionally, including when we chose not to record: otherwise every watcher already
     // present would re-fire the moment the window opened.
