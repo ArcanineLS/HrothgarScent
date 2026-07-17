@@ -83,8 +83,6 @@ public sealed class ScentWindow : Window
   /// only because <see cref="DrawJobIcon"/> asks for it with the non-throwing lookup.</summary>
   private const uint JobIconBase = 62100;
 
-  private const float HistoryTableHeight = 120f;
-
   /// <summary>
   /// How long <see cref="Draw"/> may go unrun before <see cref="ReleaseStrandedHoverFocus"/> calls the hover
   /// focus stranded. Far clear of a hitch or a slow frame: a false positive drops a focus target the cursor is
@@ -399,10 +397,10 @@ public sealed class ScentWindow : Window
     // bar is chrome, and HUD's whole argument is that it has none.
     var tabbed = !hud && config.EnableWatchers && config.ShowWatcherHistory;
 
-    // Both stay 0 unless a player table actually draws — MeasureDesiredHeight subtracts one from the other, so
-    // a branch that draws no table must contribute no correction. This is exactly why they are assigned from
-    // INSIDE the Nearby tab and nowhere else: measuring what the table WOULD want while the Targeted tab is up
-    // would pin the window a whole list taller than the thing on screen, every frame, until the tab changed.
+    // Assigned by whichever tab is OPEN, and only that one. Both stay 0 unless a table actually draws —
+    // MeasureDesiredHeight subtracts one from the other, so a branch that draws nothing must contribute no
+    // correction. The inactive tab's BeginTabItem returns false and its body never runs, so the two can never
+    // both write: the open tab sizes the window to its own content, and switching tabs re-sizes to the other's.
     var wanted = 0f;
     var drawn = 0f;
 
@@ -418,7 +416,7 @@ public sealed class ScentWindow : Window
 
         if (ImGui.BeginTabItem("Targeted"))
         {
-          DrawTargeted(config, scale);
+          (wanted, drawn) = DrawTargeted(config, scale, reserve);
           ImGui.EndTabItem();
         }
 
@@ -2133,7 +2131,7 @@ public sealed class ScentWindow : Window
   /// table to leave room for — the reserve that used to ask has gone with the stacking. One volatile read of an
   /// immutable list; see WatcherLog.Snapshot.
   /// </summary>
-  private static void DrawTargeted(Configuration config, float scale)
+  private static (float Wanted, float Drawn) DrawTargeted(Configuration config, float scale, float reserve)
   {
     var entries = Plugin.WatcherLog.Snapshot();
 
@@ -2160,8 +2158,28 @@ public sealed class ScentWindow : Window
       UiTheme.TextWrappedColored(UiTheme.Muted, config.KeepHistory
         ? "Nobody has watched you yet."
         : "Nobody watching right now. Not remembering.");
-      return;
+
+      // One line of text, no table: 0/0 leaves MeasureDesiredHeight to size the window to the message, exactly
+      // as DrawNearby's own empty state does. A leftover height here would reserve a table's worth of blank.
+      return (0f, 0f);
     }
+
+    // SIZED TO ITS ROWS, not a fixed box — the whole of the parity the Nearby table already has. It used to draw
+    // a fixed 120px scroll region no matter how many rows were in it, so one watcher left a tall empty grid with
+    // the column separators running down through nothing. This mirrors DrawNearby exactly:
+    // `wanted` is the natural height of the rows that will show, `drawn` clamps it to the space actually
+    // available this frame, and MeasureDesiredHeight adds the difference back so the window grows next frame to
+    // fit — up to the viewport clamp, past which the table scrolls.
+    //
+    // A row here is one framed control (the Forget button) tall, plus the table's own cell padding top and
+    // bottom — not RowHeight, which measures a plain text+icon line and would fall short of the button.
+    // Capped at the same VisibleRowCap the Nearby list uses, so the one "rows before scrolling" setting governs
+    // both tabs rather than this one keeping a second, hidden limit.
+    var rowUnit = ImGui.GetFrameHeight() + ImGui.GetStyle().CellPadding.Y * 2f;
+    var wanted = Math.Min(entries.Count, VisibleRowCap(config)) * rowUnit + 2f;
+
+    var bodyMax = ImGui.GetContentRegionAvail().Y - reserve;
+    var drawn = MathF.Min(wanted, MathF.Max(rowUnit, bodyMax));
 
     var showWhen = config.ShowTimestamps;
 
@@ -2176,7 +2194,7 @@ public sealed class ScentWindow : Window
       | ImGuiTableFlags.ScrollY;
 
     WatcherKey? toRemove = null;
-    if (ImGui.BeginTable("##watcherHistory", showWhen ? 4 : 3, flags, new Vector2(0f, HistoryTableHeight * scale)))
+    if (ImGui.BeginTable("##watcherHistory", showWhen ? 4 : 3, flags, new Vector2(0f, drawn)))
     {
       ImGui.TableSetupColumn("Who", ImGuiTableColumnFlags.WidthStretch);
       ImGui.TableSetupColumn("Times", ImGuiTableColumnFlags.WidthFixed, 46f * scale);
@@ -2251,6 +2269,8 @@ public sealed class ScentWindow : Window
     // an exception one frame later.
     if (toRemove is not null)
       Plugin.WatcherLog.Remove(toRemove.Value);
+
+    return (wanted, drawn);
   }
 
   /// <summary>
