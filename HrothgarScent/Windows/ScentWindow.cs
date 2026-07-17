@@ -692,6 +692,21 @@ public sealed class ScentWindow : Window
   }
 
   /// <summary>
+  /// Exactly wide enough for the × button, measured the same way <see cref="SettingsButtonWidth"/> measures the
+  /// cog: the glyph in the icon font plus the button's own frame padding on each side. Measured, not a literal,
+  /// so it tracks the font size and UI scale rather than being right at one of them — the whole reason the text
+  /// button's 60px was too wide once the word became a glyph.
+  /// </summary>
+  private static float ForgetColumnWidth()
+  {
+    Vector2 glyph;
+    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+      glyph = ImGui.CalcTextSize(FontAwesomeIcon.Times.ToIconString());
+
+    return glyph.X + ImGui.GetStyle().FramePadding.X * 2f;
+  }
+
+  /// <summary>
   /// The cog, right-aligned on the current toolbar line. Drawn with the icon font so it reads as the same
   /// control as Dalamud's own plugin cog.
   ///
@@ -2200,7 +2215,7 @@ public sealed class ScentWindow : Window
       ImGui.TableSetupColumn("Times", ImGuiTableColumnFlags.WidthFixed, 46f * scale);
       if (showWhen)
         ImGui.TableSetupColumn("When", ImGuiTableColumnFlags.WidthFixed, 88f * scale);
-      ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, 60f * scale);
+      ImGui.TableSetupColumn("", ImGuiTableColumnFlags.WidthFixed, ForgetColumnWidth());
 
       // Current watchers above history, then most recent first: the answer to "who is looking at me right
       // now" must never be buried under a log that happens to sort above it.
@@ -2254,10 +2269,17 @@ public sealed class ScentWindow : Window
           UiTheme.PopDimmed();
 
         ImGui.TableNextColumn();
-        if (ImGui.SmallButton("Forget"))
-          toRemove = entry.Key;
-        UiTheme.Tooltip("Drop this one from the list. Someone still watching you comes straight back as a " +
-                        "new sighting — I won't pretend nobody is there.");
+
+        // An × icon rather than the word "Forget", and the button IS the label: pushed under the row's own
+        // PushID above, so the glyph does not have to carry a unique id and two rows' buttons cannot share one.
+        // The tooltip still spells out what it does — an icon this destructive must not rely on the user
+        // guessing — and reclaims most of the 60px the text spent, which is width the truncating name column
+        // gets back.
+        using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+          if (ImGui.SmallButton(FontAwesomeIcon.Times.ToIconString()))
+            toRemove = entry.Key;
+        UiTheme.Tooltip("Forget this one. Someone still watching you comes straight back as a new sighting — " +
+                        "I won't pretend nobody is there.");
 
         ImGui.PopID();
       }
