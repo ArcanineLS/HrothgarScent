@@ -161,8 +161,8 @@ public sealed class MarkStore
           // write back what we would flatten.
           if (file.Version > CurrentFileVersion)
             GoReadOnly(
-              "marks.json was written by a newer version of HrothgarScent, so Hrothgar not writing to it. You " +
-              "can look, but changes will be lost when you restart. Update the plugin to edit them again.");
+              "marks.json was written by a newer version of HrothgarScent, so I am not writing to it. You can " +
+              "look, but changes will be lost when you restart. Update the plugin to edit them again.");
 
           Publish();
         }
@@ -186,7 +186,7 @@ public sealed class MarkStore
       // empty, and go read-only so this degraded state cannot overwrite a file that is still on disk and that a
       // later build, or the user with a text editor, might yet salvage.
       GoReadOnly(
-        "Hrothgar could not read marks.json, so nothing is being written to it. Your focus and ignore ticks " +
+        "I could not read marks.json, so nothing is being written to it. Your focus and ignore ticks " +
         "were rebuilt from the old config lists; notes and colours are only in the file. Look at it before " +
         "restarting — this session will not overwrite it.");
       Plugin.Log.Error(ex, "Could not read {File}; falling back to the legacy lists and writing nothing",

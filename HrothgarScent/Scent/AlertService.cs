@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using Dalamud.Game.Text.SeStringHandling;
+using Dalamud.Game.Text.SeStringHandling.Payloads;
 using FFXIVClientStructs.FFXIV.Client.UI;
 
 namespace HrothgarScent.Scent;
@@ -730,13 +731,29 @@ public sealed class AlertService
 
     if (config.AlertInChat)
     {
-      var (text, color) = Render(signalClass, subjects);
-      var message = new SeStringBuilder()
-        .AddUiForeground(color)
-        .AddText(text)
-        .AddUiForegroundOff()
-        .Build();
-      Plugin.ChatGui.Print(message, Plugin.ChatTag, Plugin.ChatTagColor);
+      var (named, rest, color) = Render(signalClass, subjects);
+      var message = new SeStringBuilder();
+
+      if (named is not null)
+      {
+        // Both conditions, and the second is not paranoia: FullName degrades to the bare name when the world
+        // sheet had not loaded at scan time, and a name without a world is not an identity — two players on
+        // different worlds can stand in the same room. A link built from one would target whichever the object
+        // table happened to reach first. No world, no link; the name still prints, it just does not claim to
+        // know who it means.
+        if (Plugin.TargetLink is { } link && !string.IsNullOrEmpty(named.HomeWorldName))
+          message.AddUiForeground(PlayerActions.UiForegroundLink)
+            .Add(link)
+            .AddText(named.FullName)
+            .Add(RawPayload.LinkTerminator)
+            .AddUiForegroundOff();
+        else
+          message.AddUiForeground(color).AddText(named.FullName).AddUiForegroundOff();
+      }
+
+      Plugin.ChatGui.Print(
+        message.AddUiForeground(color).AddText(rest).AddUiForegroundOff().Build(),
+        Plugin.ChatTag, Plugin.ChatTagColor);
       said = true;
     }
 
@@ -760,7 +777,17 @@ public sealed class AlertService
   /// One line per class no matter how many subjects, because a crowd is one piece of news. The single-subject
   /// forms name the player; the plural forms count them, which is the only thing that scales.
   /// </summary>
-  private static (string Text, ushort Color) Render(SignalClass signalClass, List<PendingSubject> subjects)
+  /// <returns>
+  /// The named subject if the line opens with one, and the rest of the sentence after their name.
+  ///
+  /// Split rather than pre-rendered into a string because <see cref="Emit"/> has to wrap the NAME alone in a
+  /// link payload, and a name that had already been concatenated into prose could only be found again by
+  /// searching the prose for it — which breaks the day a player is called something that also appears in the
+  /// sentence. Every named form opens with the name, so there is nothing to put before it.
+  /// </returns>
+  // 'Rest' is not available as an element name here: ValueTuple reserves it for its own eighth-element field.
+  private static (ScentRow? Named, string Tail, ushort Color) Render(
+    SignalClass signalClass, List<PendingSubject> subjects)
   {
     switch (signalClass)
     {
@@ -774,22 +801,27 @@ public sealed class AlertService
             worst = subject;
 
         var held = FormatHeld(worst.HeldMs);
-        var text = worst.Level == StareLevel.Fixation
-          ? $"Hrothgar smell {worst.Row.FullName} still watching you. {held} now."
-          : $"Hrothgar smell {worst.Row.FullName} watching you {held}.";
+        var rest = worst.Level == StareLevel.Fixation
+          ? $" is still targeting you — {held} now."
+          : $" has been targeting you for {held}.";
 
-        return (subjects.Count == 1 ? text : $"{text} And {subjects.Count - 1} more.", UiForegroundWatcher);
+        return (worst.Row, subjects.Count == 1 ? rest : $"{rest} And {subjects.Count - 1} more.",
+          UiForegroundWatcher);
       }
 
       case SignalClass.FocusArrival:
-        return (subjects.Count == 1
-          ? $"Hrothgar smell {subjects[0].Row.FullName} come close."
-          : $"Hrothgar smell {subjects.Count} you watch for come close.", UiForegroundFocus);
+        // "you watch for" is load-bearing, not flavour. This counts focus-marked ARRIVALS — never the room — so
+        // a bare "there are N players close by" is false the moment anyone else is standing there, and it
+        // contradicts the info bar's own count on the same screen. The singular form is saved by naming
+        // someone; the plural has only this phrase left to say whose arrival it means.
+        return subjects.Count == 1
+          ? (subjects[0].Row, " is close by.", UiForegroundFocus)
+          : (null, $"{subjects.Count} players you watch for are close by.", UiForegroundFocus);
 
       default:
-        return (subjects.Count == 1
-          ? $"Hrothgar smell {subjects[0].Row.FullName} watching you."
-          : $"Hrothgar smell {subjects.Count} eyes on you.", UiForegroundWatcher);
+        return subjects.Count == 1
+          ? (subjects[0].Row, " is targeting you.", UiForegroundWatcher)
+          : (null, $"There are {subjects.Count} players targeting you.", UiForegroundWatcher);
     }
   }
 

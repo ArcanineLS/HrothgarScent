@@ -201,7 +201,7 @@ public sealed class Configuration : IPluginConfiguration
   public bool ShowSearchBar { get; set; } = true;
 
   /// <summary>
-  /// Adds "Hrothgar remember" to the game's own right-click menu wherever it names a player.
+  /// Adds "Remember this Player" to the game's own right-click menu wherever it names a player.
   ///
   /// On by default — it is the one surface that reaches players the scanner cannot see at all, and a durable
   /// mark only ever happens because the user deliberately clicked it. Opt-OUT rather than opt-in because
@@ -612,6 +612,21 @@ public sealed class Configuration : IPluginConfiguration
   // ---- Misc ----
 
   public LodestoneRegion LodestoneRegion { get; set; } = LodestoneRegion.Europe;
+
+  /// <summary>
+  /// Whether a profile may fetch that player's face from the Lodestone.
+  ///
+  /// The ONLY setting in this plugin that governs a network request, which is why it exists at all rather than
+  /// being implied by the profile: everything else here reads the game client and nothing leaves the machine.
+  /// Some users will not want their client talking to a web server about who they looked up, and that is a
+  /// legitimate position even though the page is the player's own public profile and the plugin already ships a
+  /// button that opens it in their browser.
+  ///
+  /// On by default, on the same reasoning as that button: it is public data the player published, one request
+  /// per profile the user deliberately opened. Off costs the face and nothing else — the profile draws the job
+  /// icon instead and says nothing about why.
+  /// </summary>
+  public bool ShowLodestonePortraits { get; set; } = true;
 
   /// <summary>
   /// Hash of every option the view is filtered or sorted by. ScentWindow rebuilds its cached view when this

@@ -33,11 +33,14 @@ public sealed class NameplateService : IDisposable
   /// <summary>
   /// Attaches or detaches the handler to match the world, once per framework tick.
   ///
-  /// GATE #6 OF THE PvP DEFENCE, and the reason it is a subscription rather than an `if`. Gates #1-#5 are all
-  /// backstopped by the scanner publishing an empty snapshot in PvP — there is no data behind them to leak. This
-  /// surface is different in kind: it is the game's own world UI, in front of other players, in the one place
-  /// competitive integrity is actually judged. So it gets BOTH an early return in the handler AND this, exactly
-  /// as ScentScanner keeps its own two gates apart "so that no single edit can collapse both".
+  /// GATE #6 OF THE PvP DEFENCE, and the reason it is a subscription rather than an `if`. Gates #1-#4 are
+  /// backstopped by the scanner publishing an empty snapshot in PvP — there is no data behind them to leak.
+  /// Gates #5, #6 and #8 are the unbackstopped set: #5 reads the mark store, #8 reads the object table, and both
+  /// are fully populated in PvP like anywhere else, so each is the ONLY thing standing between its surface and
+  /// an enemy roster. This one is different in kind again: it is the game's own world UI, in front of other
+  /// players, in the one place where competitive integrity is actually judged. So it gets BOTH an early return
+  /// in the handler AND this, exactly as ScentScanner keeps its own two gates apart "so that no single edit can
+  /// collapse both".
   ///
   /// Driven from the framework tick rather than from TerritoryChanged, and that is not laziness — it is the
   /// documented trap. TerritoryChanged is raised from inside the TerritoryType property setter, which the game

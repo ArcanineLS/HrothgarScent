@@ -11,11 +11,14 @@
 //                 https://github.com/thakyZ/PeepingTom
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 using Dalamud.Game.Command;
 using Dalamud.Game.Gui.ContextMenu;
 using Dalamud.Game.Gui.Dtr;
 using Dalamud.Game.Text.SeStringHandling;
+using Dalamud.Game.Text.SeStringHandling.Payloads;
 using Dalamud.Interface.GameFonts;
 using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Utility;
@@ -37,6 +40,22 @@ public sealed class Plugin : IDalamudPlugin
   /// <summary>The "[HrothgarScent]" prefix on every line this plugin prints, and its colour.</summary>
   internal const string ChatTag = "HrothgarScent";
   internal const ushort ChatTagColor = 45;
+
+  /// <summary>
+  /// Identifies this plugin's one chat link. Scoped per plugin by Dalamud, so the value only has to be unique
+  /// here — there is no registry to collide with.
+  /// </summary>
+  private const uint TargetLinkCommandId = 1;
+
+  /// <summary>
+  /// The payload that makes an alert's name clickable. One for the whole plugin, not one per player: Dalamud
+  /// hands the CLICKED MESSAGE to the handler, not the payload, so identity travels in the link's own visible
+  /// text and a second payload would buy nothing.
+  ///
+  /// Null only if registration failed, which the alert path treats as "print the name as plain text" rather
+  /// than as a reason to say nothing.
+  /// </summary>
+  internal static DalamudLinkPayload? TargetLink { get; private set; }
 
   /// <summary>
   /// UIColor row id the info bar's count turns when someone is actually fixated on you — a red, matching the
@@ -91,6 +110,14 @@ public sealed class Plugin : IDalamudPlugin
 
   /// <summary>Why the alerts did or did not fire. In memory, dies at logout; see <see cref="SignalJournal"/>.</summary>
   public static SignalJournal Journal { get; private set; } = null!;
+
+  /// <summary>Faces, from the player's own public profile, only when a profile is opened. In memory, dies at
+  /// logout; see <see cref="LodestoneService"/> for why this is the one thing here that touches a network.</summary>
+  public static LodestoneService Lodestone { get; private set; } = null!;
+
+  /// <summary>The profile. A window of its own rather than a popup inside the list, because the game's own
+  /// right-click menus reach players the list has never seen and can open this with the list shut.</summary>
+  internal static ProfileWindow? Profile { get; private set; }
 
   /// <summary>Notes a cleared duty on the marks who were there. Never creates one.</summary>
   private readonly DutyService _duties;
@@ -149,6 +176,9 @@ public sealed class Plugin : IDalamudPlugin
 
     WatcherLog = new WatcherLog();
 
+    // Before AlertService, which embeds it in the very first alert it prints.
+    TargetLink = ChatGui.AddChatLinkHandler(TargetLinkCommandId, OnTargetLink);
+
     // Before AlertService, which records into it from its very first decision.
     Journal = new SignalJournal();
     Alerts = new AlertService();
@@ -159,12 +189,17 @@ public sealed class Plugin : IDalamudPlugin
     _duties = new DutyService();
     _duties.Subscribe();
 
+    // Before the windows, which ask it for a face on their first frame.
+    Lodestone = new LodestoneService();
+
     ScentWindow = new ScentWindow();
     ConfigWindow = new ConfigWindow();
+    Profile = new ProfileWindow();
     _mainWindow = ScentWindow;
     _configWindow = ConfigWindow;
     WindowSystem.AddWindow(ScentWindow);
     WindowSystem.AddWindow(ConfigWindow);
+    WindowSystem.AddWindow(Profile);
 
     CommandManager.AddHandler(CommandMain, new CommandInfo(OnCommand)
     {
@@ -243,6 +278,18 @@ public sealed class Plugin : IDalamudPlugin
     WindowSystem.RemoveAllWindows();
     _mainWindow = null;
     _configWindow = null;
+    Profile = null;
+
+    // Owns GPU textures, so it goes explicitly rather than waiting on a finalizer. Also flips its disposed flag
+    // under its own lock, so a lookup still in flight drops its texture instead of parking it in a dead cache.
+    Lodestone.Dispose();
+
+    // The lines themselves stay in the log — chat cannot be unprinted — but the links in them go dead here, and
+    // that is correct rather than a shortfall: after this there is no scanner, no PvP gate and no object table
+    // access, so a link that still fired would be reaching into the game on behalf of a plugin that no longer
+    // exists.
+    ChatGui.RemoveChatLinkHandler();
+    TargetLink = null;
 
     Scanner.Dispose();
 
@@ -382,9 +429,9 @@ public sealed class Plugin : IDalamudPlugin
 
     _dtrEntry.Tooltip = (Configuration.EnableNearbyList, Configuration.EnableWatchers) switch
     {
-      (true, true) => $"Hrothgar smell {snapshot.NearbyCount} nearby, {snapshot.WatcherCount} watching you.",
-      (true, false) => $"Hrothgar smell {snapshot.NearbyCount} nearby.",
-      _ => $"Hrothgar smell {snapshot.WatcherCount} watching you.",
+      (true, true) => $"{snapshot.NearbyCount} nearby, {snapshot.WatcherCount} watching you.",
+      (true, false) => $"{snapshot.NearbyCount} nearby.",
+      _ => $"{snapshot.WatcherCount} watching you.",
     } + stareLine + (marked ? "\nOne you marked is here." : string.Empty)
       + "\nLeft-click: open Scent. Right-click: settings.";
   }
@@ -411,14 +458,14 @@ public sealed class Plugin : IDalamudPlugin
         // including the control that would turn it back off.
         Configuration.HudMode = !Configuration.HudMode;
         Configuration.Save();
-        ChatGui.Print($"Hrothgar {(Configuration.HudMode ? "go quiet" : "come back")}.", ChatTag, ChatTagColor);
+        ChatGui.Print(Configuration.HudMode ? "Going quiet." : "Coming back.", ChatTag, ChatTagColor);
         return;
 
       default:
         // Gate #4 of the PvP defence: refuse rather than open a window that is guaranteed to be empty.
         if (ClientState.IsPvP)
         {
-          ChatGui.PrintError("Hrothgar no sniff in PvP.");
+          ChatGui.PrintError("I don't scan in PvP.");
           return;
         }
 
@@ -432,7 +479,7 @@ public sealed class Plugin : IDalamudPlugin
   ///
   /// An ALLOWLIST, and not optional. OnMenuOpened fires for every context menu in the game, and
   /// MenuTargetDefault reads its fields lazily off a persistent AgentContext — so on a menu with no player in
-  /// it, it happily reports whoever was right-clicked last. Without this, "Hrothgar remember" appears on an
+  /// it, it happily reports whoever was right-clicked last. Without this, "Remember this Player" appears on an
   /// unrelated menu and records the wrong person.
   ///
   /// null is the world/nameplate menu — right-clicking a player in the world itself. The blacklist is
@@ -446,7 +493,7 @@ public sealed class Plugin : IDalamudPlugin
   ];
 
   /// <summary>
-  /// Adds "Hrothgar remember" to the game's own right-click menu, wherever it names a player.
+  /// Adds "Remember this Player" to the game's own right-click menu, wherever it names a player.
   ///
   /// This is the one surface that reaches players the scanner never can — the friend list, Party Finder, the
   /// chat log, an FC roster — because they are not in the object table at all. It is also why the durable store
@@ -507,18 +554,21 @@ public sealed class Plugin : IDalamudPlugin
       // compliance, and it is stated as such in the README. Never touch TargetObject either: it calls into the
       // object table internally, which this thread may be on but this handler has no business doing.
       var key = new WatcherKey(name, worldId);
-      var marked = Marks.Find(key) is not null;
 
+      // ONE entry at the top level, and a submenu behind it. The game's player menu is shared real estate —
+      // screenshot any populated one and half of it is plugins — so a plugin that wants three verbs takes one
+      // row and nests them, rather than three rows and a third of the menu.
       args.AddMenuItem(new MenuItem
       {
-        Name = marked ? "Hrothgar forget" : "Hrothgar remember",
+        Name = "Scent",
         PrefixChar = 'H',
         PrefixColor = ChatTagColor,
+        IsSubmenu = true,
 
         // Primitives only. Capturing args or target would capture a pointer into a context the game reuses,
         // and every field would re-read whatever it holds by the time the user clicks — the same staleness
         // ScentRow's no-Address rule exists to prevent, one level out.
-        OnClicked = _ => ToggleMarkFromMenu(key, worldName),
+        OnClicked = clicked => OpenScentSubmenu(clicked, key, worldName),
       });
     }
     catch (Exception ex)
@@ -528,23 +578,140 @@ public sealed class Plugin : IDalamudPlugin
   }
 
   /// <summary>
+  /// Builds the Scent submenu, at click time rather than at open time.
+  ///
+  /// The mark is re-read HERE, not carried in from the parent. Between the menu opening and this submenu opening
+  /// the user may have marked or forgotten this player from another surface, and a Remember item built from a
+  /// stale read would delete a record it offered to create.
+  ///
+  /// Only the verb that applies is listed: an unmarked player gets Remember, a marked one gets Forget. A menu
+  /// that offers both always has one entry that does nothing, and the mark is a one-click toggle precisely
+  /// because it has no half-state to disambiguate.
+  /// </summary>
+  private static void OpenScentSubmenu(IMenuItemClickedArgs args, WatcherKey key, string worldName)
+  {
+    var marked = Marks.Find(key) is not null;
+
+    args.OpenSubmenu("Scent", new List<MenuItem>
+    {
+      new()
+      {
+        Name = "Profile",
+        PrefixChar = 'H',
+        PrefixColor = ChatTagColor,
+        OnClicked = _ => Profile?.Open(key, worldName),
+      },
+      new()
+      {
+        Name = marked ? "Forget this Player" : "Remember this Player",
+        PrefixChar = 'H',
+        PrefixColor = ChatTagColor,
+        OnClicked = _ => ToggleMarkFromMenu(key, worldName),
+      },
+      new()
+      {
+        Name = "Return",
+        IsReturn = true,
+      },
+    });
+  }
+
+  /// <summary>
   /// The context menu's click. Toggles the whole record: remember creates it, forget deletes it outright.
   ///
   /// Deliberately coarse. The menu is a one-click surface with no room to explain itself, and a half-state
   /// there would need a second click to mean anything; the note, the colour and the flags all live in the
   /// editor, which is where a choice belongs.
   /// </summary>
+  /// <summary>
+  /// Targets the player whose name was clicked in an alert.
+  ///
+  /// IDENTITY COMES OUT OF THE MESSAGE, which is not a workaround but the only shape Dalamud offers: the handler
+  /// is given the clicked SeString and a command id, never the payload, and DalamudLinkPayload's Extra fields
+  /// have no public setter. The alert writes exactly one link and the first text inside it is the player's
+  /// "Name@World", so reading it back is deterministic rather than a parse of prose.
+  ///
+  /// Deliberately NOT gated on the ignore list. The promise is "never SHOW or ANNOUNCE them again", and it binds
+  /// what the plugin does on its own initiative — a list it draws, a line it speaks. This is the user clicking a
+  /// specific name on a line that was already printed and cannot be unprinted. Refusing would also be
+  /// self-defeating: the only honest way to explain a dead link is to name them, which is the thing the promise
+  /// actually forbids. So the click is obeyed, and nothing new about them reaches the screen.
+  /// </summary>
+  private static void OnTargetLink(uint commandId, SeString message)
+  {
+    try
+    {
+      if (ExtractLinkedName(message) is not { } name)
+        return;
+
+      // Written by ScentRow.FullName, so the separator is always there — a row with no world resolved never
+      // gets a link in the first place, precisely because this identity would be incomplete.
+      var at = name.LastIndexOf('@');
+      if (at <= 0 || at == name.Length - 1)
+        return;
+
+      if (WorldPalette.IdOf(name[(at + 1)..]) is not { } worldId)
+        return;
+
+      PlayerActions.TargetByIdentity(new WatcherKey(name[..at], worldId));
+    }
+    catch (Exception ex)
+    {
+      Plugin.Log.Warning(ex, "OnTargetLink failed");
+    }
+  }
+
+  /// <summary>
+  /// Reads the player's "Name@World" back out of a clicked alert.
+  ///
+  /// Separated from <see cref="OnTargetLink"/> because it is the one part of this path that can be exercised
+  /// without a running game, and the one most likely to break silently. The message does not arrive as it was
+  /// built: it is encoded into the chat log and parsed back out, and SeString.Parse is free to split or merge
+  /// text runs on its own terms. Everything here is an assumption about what survives that, so it is verified
+  /// against the real encoder rather than reasoned about.
+  ///
+  /// Takes the text INSIDE the link — payloads after the DalamudLinkPayload, up to the terminator — rather than
+  /// the message's TextValue, which would flatten name, verb and duration into one string to be picked apart
+  /// with guesswork that breaks every time the copy changes.
+  /// </summary>
+  /// <returns>The linked text, or null if this message carries no usable link.</returns>
+  internal static string? ExtractLinkedName(SeString message)
+  {
+    var payloads = message.Payloads;
+    var link = payloads.FindIndex(p => p is DalamudLinkPayload);
+    if (link < 0)
+      return null;
+
+    // Concatenated, not first-only: the round trip may return the name as several adjacent runs, and taking
+    // just the first would silently target a player whose name is a PREFIX of the real one.
+    var name = new StringBuilder();
+    for (var i = link + 1; i < payloads.Count; i++)
+    {
+      if (payloads[i] is TextPayload text)
+      {
+        name.Append(text.Text);
+        continue;
+      }
+
+      // Anything that is not text ends the link's own run. The terminator is the expected one; a colour change
+      // would do just as well, and either way the name cannot continue past it.
+      break;
+    }
+
+    return name.Length == 0 ? null : name.ToString();
+  }
+
   private static void ToggleMarkFromMenu(WatcherKey key, string worldName)
   {
     if (Marks.Find(key) is not null)
     {
       Marks.Remove(key);
-      ChatGui.Print($"Hrothgar forget {key.Name}.", ChatTag, ChatTagColor);
+      ChatGui.Print($"I'll forget {key.Name}.", ChatTag, ChatTagColor);
       return;
     }
 
     Marks.Update(key, worldName, mark => mark with { Marks = mark.Marks | MarkKind.Focus });
-    ChatGui.Print($"Hrothgar remember {key.Name}.", ChatTag, ChatTagColor);
+    ChatGui.Print($"I'll remember {key.Name}.", ChatTag, ChatTagColor);
   }
 
   private void OnLogin()
@@ -565,7 +732,19 @@ public sealed class Plugin : IDalamudPlugin
   private void OnLogout(int type, int code)
   {
     WatcherLog.Clear();
+
+    // Beside WatcherLog.Clear and on the same rule, not as tidying: a cached face is session state about a
+    // stranger who did not consent to it, so it lives exactly as long as the log of who looked at you. It is
+    // also the only state here bought over a network, which makes keeping it past the session harder to defend
+    // rather than easier.
+    Lodestone.Clear();
+
     Marks.Flush();
     ScentWindow.IsOpen = false;
+
+    // The profile names a person and shows their face. Left open, it would greet the next character to log in
+    // with the last one's stranger still on screen.
+    if (Profile is not null)
+      Profile.IsOpen = false;
   }
 }

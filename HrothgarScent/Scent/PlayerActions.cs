@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Game.Text.SeStringHandling;
@@ -26,11 +27,63 @@ public static class PlayerActions
   /// <summary>
   /// UIColor row id for the chat link. 500 is what Dalamud itself uses to tint its own clickable chat text,
   /// so a link posted by this plugin looks like every other link the user already clicks.
+  ///
+  /// Shared with <see cref="AlertService"/> rather than copied: two constants would let the alert's link and
+  /// this one drift apart, and "clickable" is a promise the user reads off the colour.
   /// </summary>
-  private const ushort UiForegroundLink = 500;
+  internal const ushort UiForegroundLink = 500;
 
   public static void Target(ulong gameObjectId)
     => WithPlayer(gameObjectId, pc => Plugin.TargetManager.Target = pc, "Target");
+
+  /// <summary>
+  /// Targets a player found by NAME AND HOME WORLD rather than by object id, for the chat alert's link.
+  ///
+  /// The id is deliberately not used here, and that is the whole reason this method exists next to
+  /// <see cref="Target"/>. WithPlayer's contract holds for a row the user is looking at: worst case the id is one
+  /// rescan stale. A chat line has no such bound — it sits in the log for the rest of the session, and
+  /// WithPlayer's own comment concedes the id may be "recycled between the scan and the click". Recycled means a
+  /// DIFFERENT player now answers to that number, and SearchById would hand them over as an IPlayerCharacter
+  /// with nothing amiss. Clicking a twenty-minute-old alert would then silently target a stranger — the plugin
+  /// pointing the user at the wrong person, which is the one failure a stalker-awareness tool cannot have.
+  ///
+  /// Name+HomeWorldId is the identity the whole plugin already keys on (see <see cref="WatcherKey"/>), and it
+  /// cannot be recycled: it either matches the same human or matches nobody.
+  /// </summary>
+  /// <returns>Nothing — resolution happens later, on the framework thread. Callers cannot know the outcome.</returns>
+  public static void TargetByIdentity(WatcherKey key)
+  {
+    Plugin.Framework.RunOnFrameworkThread(() =>
+    {
+      try
+      {
+        // Gate #8 of the PvP defence, and the only one that guards a line rather than a surface. Chat cannot be
+        // unprinted: an alert raised in the open world is still sitting in the log when the user loads into a
+        // match, and every other gate has already gone dark around it. A link that still worked there would be
+        // the plugin reaching into a PvP match — exactly what "nothing raised before a PvP boundary may survive
+        // it" forbids — through the one door that boundary cannot close behind it.
+        if (Plugin.ClientState.IsPvP)
+          return;
+
+        foreach (var pc in Plugin.Objects.PlayerObjects.OfType<IPlayerCharacter>())
+        {
+          if (pc.HomeWorld.RowId != key.HomeWorldId || pc.Name.TextValue != key.Name)
+            continue;
+
+          Plugin.TargetManager.Target = pc;
+          return;
+        }
+
+        // Routine: they walked off, zoned, or the line is simply old. Silent, because the alternative is a chat
+        // line naming them — and by the time this fails the user may well have ignored them since.
+        Plugin.Log.Debug("TargetByIdentity: nobody nearby matches the link");
+      }
+      catch (Exception ex)
+      {
+        Plugin.Log.Warning(ex, "TargetByIdentity failed");
+      }
+    });
+  }
 
   public static void FocusTarget(ulong gameObjectId)
     => WithPlayer(gameObjectId, pc => Plugin.TargetManager.FocusTarget = pc, "FocusTarget");
@@ -98,7 +151,7 @@ public static class PlayerActions
         if (!string.IsNullOrEmpty(row.HomeWorldName))
           message.AddText($"@{row.HomeWorldName}");
 
-        message.AddText(" — Hrothgar know who watching.");
+        message.AddText(" — click to open their menu.");
         var built = message.Build();
         Plugin.ChatGui.Print(built, Plugin.ChatTag, Plugin.ChatTagColor);
       }
@@ -112,8 +165,17 @@ public static class PlayerActions
   /// <summary>Pure ImGui, no game state: safe to call straight from Draw with no marshalling.</summary>
   public static void CopyName(ScentRow row) => ImGui.SetClipboardText(row.FullName);
 
-  /// <summary>Opens the default browser. No game state, so no marshalling.</summary>
-  public static void OpenLodestone(ScentRow row)
+  /// <summary>Opens the default browser for a row. No game state, so no marshalling.</summary>
+  public static void OpenLodestone(ScentRow row) => OpenLodestone(row.Name, row.HomeWorldName);
+
+  /// <summary>
+  /// Opens the default browser on a name and world, with no row required.
+  ///
+  /// The row overload above is the list's door; this is the profile's. A profile can be opened on someone the
+  /// scanner has never seen — from the friend list, Party Finder or the chat log — so binding this action to a
+  /// ScentRow would disable it in exactly the case where going to look them up is most useful.
+  /// </summary>
+  public static void OpenLodestone(string name, string worldName)
   {
     try
     {
@@ -126,12 +188,12 @@ public static class PlayerActions
         _ => "eu",
       };
 
-      var url = $"https://{domain}.finalfantasyxiv.com/lodestone/character/?q={Uri.EscapeDataString(row.Name)}";
+      var url = $"https://{domain}.finalfantasyxiv.com/lodestone/character/?q={Uri.EscapeDataString(name)}";
 
       // An empty worldname parameter matches nothing rather than everything, so omit it entirely when the
       // world sheet row had not loaded at scan time.
-      if (!string.IsNullOrEmpty(row.HomeWorldName))
-        url += $"&worldname={Uri.EscapeDataString(row.HomeWorldName)}";
+      if (!string.IsNullOrEmpty(worldName))
+        url += $"&worldname={Uri.EscapeDataString(worldName)}";
 
       Util.OpenLink(url);
     }

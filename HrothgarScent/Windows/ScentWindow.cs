@@ -64,7 +64,7 @@ public sealed class ScentWindow : Window
   /// the box it describes.
   /// </summary>
   private const string SearchHelp =
-    "Bare words match the name. Hrothgar match anywhere in the word unless you say otherwise.\r\n\r\n" +
+    "Bare words match the name, anywhere in the word unless you say otherwise.\r\n\r\n" +
     "world:sarg     home world\r\n" +
     "fc:free co     free company tag\r\n" +
     "job:whm        job, short or long name\r\n" +
@@ -75,20 +75,6 @@ public sealed class ScentWindow : Window
     "sarg*  starts with      *sarg  ends with      =Bob Smith  exactly\r\n" +
     "!bob   not              !world:sarg  not on that world\r\n\r\n" +
     "Values can have spaces: fc:Free Company Name works.";
-
-  /// <summary>ImGui id of the mark editor popup. One constant because OpenPopup and BeginPopup must agree
-  /// exactly and they are in different methods.</summary>
-  private const string MarkEditorId = "##hrothgarscent-markeditor";
-
-  /// <summary>
-  /// Cap on a note. Not a storage worry — the whole file is kilobytes — but marks.json is written whole on
-  /// every edit, and an unbounded field is an invitation to paste a novel into a per-frame tooltip.
-  ///
-  /// int, not uint, and not by accident: InputTextMultiline's maxLength is Int32, and a uint here silently
-  /// resolves the call to the Span&lt;byte&gt; overload instead, which rejects the ref and reports the error
-  /// against the wrong argument entirely. Same family of trap as InputInt's format-before-flags.
-  /// </summary>
-  private const int MarkNoteMaxLength = 512;
 
   /// <summary>Ceiling for the "hide low level" filter — the throwaway alts and bots milling around aetherytes.</summary>
   private const byte LowLevelThreshold = 3;
@@ -111,7 +97,7 @@ public sealed class ScentWindow : Window
   /// Three copies of it is how one of them ends up saying something subtly different about the same state.
   /// </summary>
   private const string NoseClosed =
-    "Hrothgar nose closed — not sniffing right now. This mean Hrothgar not looking, not that nobody there.";
+    "Not scanning right now. This means I'm not looking — not that nobody is there.";
 
   private List<ScentRow> _view = [];
   private long _viewVersion = -1;
@@ -152,33 +138,6 @@ public sealed class ScentWindow : Window
   /// would look like it did nothing. This is what turns that into a sentence.
   /// </summary>
   private IReadOnlyList<string> _queryUnknownFields = [];
-
-  /// <summary>
-  /// A mark editor the row menu asked for, picked up and cleared by the next <see cref="Draw"/>.
-  ///
-  /// Deferred rather than opened where it is clicked. ImGui requires OpenPopup at the same ID scope as the
-  /// BeginPopup that shows it, and the row menu runs three scopes deep — inside a context popup, inside the
-  /// row's PushID, inside the table. Opening it there silently never appears.
-  /// </summary>
-  private WatcherKey? _editorRequest;
-
-  /// <summary>
-  /// Who the open mark editor is about.
-  ///
-  /// A key, never a GameObjectId and never a ScentRow: the editor outlives frames, and the row it was opened
-  /// from can leave the snapshot entirely while it is up — they zoned, they walked out of range, a filter
-  /// dropped them. The key still names the same person, which is the whole reason identity is Name+HomeWorld
-  /// here and not an id. See <see cref="WatcherKey"/>.
-  /// </summary>
-  private WatcherKey? _editorKey;
-
-  /// <summary>The editor's note buffer, held across frames while it is open so typing is not fighting the
-  /// store. Committed on change; see <see cref="DrawMarkEditor"/>.</summary>
-  private string _editorNote = string.Empty;
-
-  /// <summary>The world name to key a brand-new mark with, captured when the editor opened. The store needs it
-  /// to build a record, and the row it came from may be gone by the time the user types anything.</summary>
-  private string _editorWorldName = string.Empty;
 
   private ScentColumn _sortColumn;
   private bool _sortAscending;
@@ -230,7 +189,7 @@ public sealed class ScentWindow : Window
   }
 
   /// <summary>
-  /// Gate #2 of the seven-way PvP defence, plus the user's own hide-while-busy choices.
+  /// Gate #2 of the eight-way PvP defence, plus the user's own hide-while-busy choices.
   ///
   /// The PvP check is a competitive-integrity requirement and a condition of Dalamud plugin acceptance. It
   /// is deliberately not user-configurable and must never be given an option.
@@ -458,163 +417,11 @@ public sealed class ScentWindow : Window
     if (!hud)
       DrawFooter(snapshot, config, scale);
 
-    // AFTER the table, at the window's own ID scope. Both halves must live out here: OpenPopup only matches a
-    // BeginPopup at the same scope, and the row that asked for this is three scopes deep and gone by now. It is
-    // also outside every early return above, so the editor cannot be stranded open behind one.
-    DrawMarkEditorPopup(hud);
-
     MeasureDesiredHeight(hud, wanted, drawn);
 
     // Cleared here, not in the row loop: "nothing is hovered" is only knowable once every row has had its
     // chance to claim the cursor.
     ClearHoverFocusIfIdle();
-  }
-
-  /// <summary>
-  /// Opens and draws the mark editor, at the window's ID scope.
-  ///
-  /// Not in HUD mode. HUD is a read-only readout — no title bar, usually locked, sometimes click-through — and
-  /// a popup on it would be unreachable or unclosable. The row menu that would request one is disabled there, so
-  /// in practice nothing arrives; this clears the request anyway, as the backstop that keeps any future caller
-  /// from stranding a popup on a chrome-less overlay.
-  ///
-  /// Dropped rather than queued: a popup that ambushed the user on the next frame they left HUD would be a
-  /// surprise window, which is worse than nothing happening.
-  /// </summary>
-  private void DrawMarkEditorPopup(bool hud)
-  {
-    if (hud)
-    {
-      _editorRequest = null;
-      _editorKey = null;
-      return;
-    }
-
-    if (_editorRequest is { } request)
-    {
-      _editorRequest = null;
-      _editorKey = request;
-
-      // Seeded once, on open. Re-reading the store every frame would fight the user's own typing.
-      _editorNote = Plugin.Marks.Find(request)?.Note ?? string.Empty;
-      ImGui.OpenPopup(MarkEditorId);
-    }
-
-    if (_editorKey is not { } key)
-      return;
-
-    if (ImGui.BeginPopup(MarkEditorId))
-    {
-      DrawMarkEditor(key);
-      ImGui.EndPopup();
-    }
-    else
-    {
-      // ImGui closed it — the user clicked away. Drop the state so a stale key cannot reopen it later.
-      _editorKey = null;
-    }
-  }
-
-  /// <summary>
-  /// The mark editor: everything the user can say about one player, in one popup that dies when they click away.
-  ///
-  /// No window, no selection state, no navigation to back out of, and nothing to grey out while it loads —
-  /// the store is already in memory. This is the whole of the detail panel the prior art needs five nested tabs,
-  /// a second floating window and an async load-with-spinner to deliver.
-  /// </summary>
-  private void DrawMarkEditor(WatcherKey key)
-  {
-    var config = Plugin.Configuration;
-    var scale = ImGuiHelpers.GlobalScale;
-    var mark = Plugin.Marks.Find(key);
-
-    ImGui.TextColored(UiTheme.AccentBlue, $"Hrothgar remember {key.Name}");
-    ImGui.Separator();
-
-    // The world name for a record that does not exist yet comes from whatever opened the editor; an existing
-    // one carries its own, which is authoritative and may differ from a row that is no longer on screen.
-    var worldName = mark?.HomeWorldName ?? _editorWorldName;
-
-    var focus = mark?.IsFocused ?? false;
-    if (ImGui.Checkbox("Focus", ref focus))
-      Plugin.Marks.Update(key, worldName, m => m with
-      {
-        Marks = focus ? m.Marks | MarkKind.Focus : m.Marks & ~MarkKind.Focus,
-      });
-    UiTheme.Tooltip("Colour them and float them near the top of the list.");
-
-    ImGui.SameLine();
-
-    var ignore = mark?.IsIgnored ?? false;
-    if (ImGui.Checkbox("Ignore", ref ignore))
-      Plugin.Marks.Update(key, worldName, m => m with
-      {
-        Marks = ignore ? m.Marks | MarkKind.Ignore : m.Marks & ~MarkKind.Ignore,
-      });
-    UiTheme.Tooltip("Never show or announce them again. Beats Focus if they carry both.");
-
-    // Both at once is a contradiction the user is allowed to hold — the two flags stay independent so that
-    // un-ignoring gives the focus back — but it must not be silent, or the row simply vanishes and the Focus
-    // tick above looks broken.
-    if (focus && ignore)
-      UiTheme.TextWrappedColored(UiTheme.Muted, "Ignored, so Focus does nothing while both are ticked.");
-
-    ImGui.Dummy(new Vector2(0, 4f * scale));
-    ImGui.TextUnformatted("Note");
-
-    ImGui.SetNextItemWidth(-1);
-    if (ImGui.InputTextMultiline("##marknote", ref _editorNote, MarkNoteMaxLength,
-          new Vector2(0, ImGui.GetTextLineHeight() * 4f)))
-      Plugin.Marks.Update(key, worldName, m => m with { Note = _editorNote });
-    UiTheme.Tooltip("Only you ever see this. It is kept on disk until you delete it.");
-
-    ImGui.Dummy(new Vector2(0, 4f * scale));
-
-    // Colour FOLDS INTO the focus slot rather than becoming a sixth colour competing for the same cell — see
-    // DrawRow's name-colour chain. So it is only meaningful on a focused player, and saying so beats a swatch
-    // that silently does nothing.
-    var color = mark?.Color ?? config.ColorFocused;
-    if (ImGui.ColorEdit4("Colour", ref color, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.AlphaPreview))
-      Plugin.Marks.Update(key, worldName, m => m with { Color = color });
-
-    ImGui.SameLine();
-
-    // Mandatory, not a nicety: ColorEdit4 takes a non-null Vector4, so there is no path back to "no colour"
-    // through the widget itself. Without this the default is unreachable the moment the user touches the swatch.
-    using (ImRaii.Disabled(mark?.Color is null))
-    {
-      if (ImGui.SmallButton("Reset"))
-        Plugin.Marks.Update(key, worldName, m => m with { Color = null });
-    }
-    UiTheme.Tooltip("Back to the default focus colour.");
-
-    if (!focus)
-      UiTheme.TextWrappedColored(UiTheme.Muted, "Colour shows on focused players only.");
-
-    ImGui.Dummy(new Vector2(0, 4f * scale));
-    ImGui.Separator();
-
-    // Reads the live in-memory log, and does NOT persist it. How often someone stared at you is an observation
-    // about them, not something the user wrote — so it is shown here and forgotten at logout, exactly like the
-    // history pane it comes from. See WatcherLog.
-    var stares = Plugin.WatcherLog.Snapshot().FirstOrDefault(entry => entry.Key == key);
-    UiTheme.TextWrappedColored(UiTheme.Muted, stares is null
-      ? "Not seen looking at you this session."
-      : $"Looked at you {stares.Count}x this session.");
-
-    // The one durable observation, shown where it is made rather than only in a file. See MarkedPlayer.LastSeen.
-    if (mark?.LastSeen is { } lastSeen)
-      UiTheme.TextWrappedColored(UiTheme.Muted, FormatLastSeen(lastSeen, mark.LastSeenZone));
-
-    if (mark is not null)
-    {
-      if (ImGui.SmallButton("Forget this player"))
-      {
-        Plugin.Marks.Remove(key);
-        ImGui.CloseCurrentPopup();
-      }
-      UiTheme.Tooltip("Deletes the note, the colour and both ticks.");
-    }
   }
 
   /// <summary>The configured row cap, clamped where it is read. The value round-trips through a JSON file the
@@ -661,7 +468,7 @@ public sealed class ScentWindow : Window
   /// </summary>
   private static void DrawBothHalvesOff(bool hud, float scale)
   {
-    const string message = "Both halves off — no list, no watchers. Hrothgar still smell; turn one back on in " +
+    const string message = "Both halves off — no list, no watchers. I'm still scanning; turn one back on in " +
                            "settings, Filters tab.";
 
     UiTheme.Icon(FontAwesomeIcon.PowerOff, UiTheme.Muted);
@@ -694,7 +501,7 @@ public sealed class ScentWindow : Window
   /// </summary>
   private static void DrawNearbyListOff(ScentSnapshot snapshot, Configuration config, bool hud, float scale)
   {
-    const string message = "Nearby list off. Hrothgar still smell — turn it back on in settings, Filters tab.";
+    const string message = "Nearby list off. I'm still scanning — turn it back on in settings, Filters tab.";
 
     if (hud)
     {
@@ -783,7 +590,7 @@ public sealed class ScentWindow : Window
       // nothing and the box looks like it worked. This is the only thing on screen that says why.
       if (_queryUnknownFields.Count > 0)
         UiTheme.HelpMarker(UiTheme.Warn, SearchHelpGlyph,
-          $"Hrothgar not know {(_queryUnknownFields.Count == 1 ? "this" : "these")}: " +
+          $"I don't know {(_queryUnknownFields.Count == 1 ? "this" : "these")}: " +
           $"{string.Join(", ", _queryUnknownFields)}:\r\n\r\nIgnored, so everyone still shows.\r\n\r\n" +
           SearchHelp);
       else
@@ -865,7 +672,7 @@ public sealed class ScentWindow : Window
       clicked = ImGui.Button(FontAwesomeIcon.Cog.ToIconString());
     if (clicked)
       Plugin.ToggleConfigWindow();
-    UiTheme.Tooltip("Hrothgar settings");
+    UiTheme.Tooltip("Settings");
   }
 
   /// <summary>
@@ -1563,7 +1370,7 @@ public sealed class ScentWindow : Window
           if (row.IsWatching && config.EnableWatchers)
           {
             UiTheme.Icon(FontAwesomeIcon.Eye, config.ColorWatcher);
-            UiTheme.Tooltip("Hrothgar know who watching. This one target you.");
+            UiTheme.Tooltip("This one is targeting you.");
           }
 
           break;
@@ -1737,7 +1544,7 @@ public sealed class ScentWindow : Window
   /// </summary>
   private static (FontAwesomeIcon Glyph, Vector4 Color, string Tip)? MarkGlyph(MarkedPlayer mark, Configuration config)
     => !mark.HasVisibleMark ? null
-     : mark.HasNote ? (FontAwesomeIcon.StickyNote, mark.Color ?? config.ColorFocused, "Hrothgar wrote this one down.")
+     : mark.HasNote ? (FontAwesomeIcon.StickyNote, mark.Color ?? config.ColorFocused, "You wrote this one down.")
      : mark.IsIgnored ? (FontAwesomeIcon.EyeSlash, UiTheme.Muted, "Ignored. Never shown or announced.")
      : (FontAwesomeIcon.Star, mark.Color ?? config.ColorFocused, "Focused.");
 
@@ -1859,7 +1666,7 @@ public sealed class ScentWindow : Window
   /// </summary>
   private void DrawRowContextMenu(ScentRow row, bool focused, bool hud)
   {
-    ImGui.TextColored(UiTheme.AccentBlue, $"Hrothgar smell {row.Name}");
+    ImGui.TextColored(UiTheme.AccentBlue, row.Name);
     ImGui.Separator();
 
     if (ImGui.Selectable("Target"))
@@ -1911,31 +1718,19 @@ public sealed class ScentWindow : Window
 
     ImGui.Separator();
 
-    // Disabled rather than hidden in HUD, and not merely dropped: DrawMarkEditorPopup refuses to open on a
-    // chrome-less overlay, so an enabled item here would be a control that swallows every click in silence
-    // while Target and Ignore beside it work fine — which reads as the plugin being broken, not as a mode
-    // restriction. Same shape as the toolbar's dead-sort arm.
-    using (ImRaii.Disabled(hud))
-    {
-      // Deferred, never opened here: OpenPopup must be called at the same ID scope as BeginPopup, and this runs
-      // inside the row's PushID inside the table inside a context popup. Draw picks the flag up after the table
-      // has closed. See _editorKey.
-      if (ImGui.Selectable("Remember this player..."))
-      {
-        _editorRequest = row.Key;
-
-        // Captured now, while the row is in hand. A brand-new record needs a world name, and by the time the
-        // user types anything this row may be long gone from the snapshot.
-        _editorWorldName = row.HomeWorldName;
-      }
-    }
-
-    // TooltipEvenIfDisabled, not Tooltip: ImGui stamps the disabled flag onto the item at submission, so the
-    // plain helper answers "not hovered" forever after — killing the tooltip in the one state whose entire job
-    // is to explain where the control went.
-    UiTheme.TooltipEvenIfDisabled(hud
-      ? "Needs the full window — leave HUD mode to write a note."
-      : "Write a note, pick a colour, set focus and ignore — all in one place.");
+    // LIVE IN HUD, unlike the mark editor it replaces, and that is the refactor paying for itself rather than
+    // an oversight. That item was disabled here because a popup cannot open on a chrome-less, sometimes
+    // click-through overlay — it would have swallowed clicks in silence while Target and Ignore beside it
+    // worked. The profile is a Window: it brings its own title bar and its own close button, so it opens over
+    // HUD as readably as over anything else.
+    //
+    // Opened straight from here for the same reason. A Window has no "OpenPopup must share the BeginPopup ID
+    // scope" rule, which is what forced the old deferral through a request field. The world name still goes with
+    // it — a brand-new record needs one, and this row may be long gone from the snapshot by the time the user
+    // ticks anything.
+    if (ImGui.Selectable("Profile"))
+      Plugin.Profile?.Open(row.Key, row.HomeWorldName);
+    UiTheme.Tooltip("Their face, their note, their colour, and what they have done to you — all in one place.");
   }
 
   /// <summary>
@@ -1951,11 +1746,11 @@ public sealed class ScentWindow : Window
   private static void DrawEmptyState(ScentSnapshot snapshot, Configuration config, bool hud, float scale)
   {
     var (icon, brief, full) = !snapshot.Valid
-      ? (FontAwesomeIcon.EyeSlash, "Nose closed.", NoseClosed)
+      ? (FontAwesomeIcon.EyeSlash, "Not scanning.", NoseClosed)
       : snapshot.NearbyCount == 0
-        ? (FontAwesomeIcon.UserSlash, "Nobody around.", "Nobody around. Hrothgar smell only Hrothgar.")
+        ? (FontAwesomeIcon.UserSlash, "Nobody around.", "Nobody around. Just you.")
         : (FontAwesomeIcon.Filter, $"{snapshot.NearbyCount} hidden.",
-           $"Hrothgar smell {snapshot.NearbyCount} out there, but your filters hide every one.");
+           $"{snapshot.NearbyCount} out there, but your filters hide every one.");
 
     UiTheme.Icon(icon, UiTheme.Muted);
 
@@ -1992,7 +1787,7 @@ public sealed class ScentWindow : Window
   ///
   /// <see cref="ScentSnapshot.Valid"/> gates both halves, and that is not a change to the count: a snapshot from
   /// ScentScanner.Reset carries 0 and 0 because nothing was scanned, not because the room was empty, and this
-  /// line prints directly under DrawEmptyState's "Hrothgar not looking, not that nobody there". An em dash, so
+  /// line prints directly under DrawEmptyState's "I'm not looking, not that nobody is there". An em dash, so
   /// the footer refuses to answer rather than answering wrong. What the counts mean is untouched; only whether
   /// there is one to print.
   /// </summary>
@@ -2017,7 +1812,7 @@ public sealed class ScentWindow : Window
             ? $"Others near: {_shownOthers} of {snapshot.NearbyCount} shown"
             : $"Others near: {snapshot.NearbyCount}");
       UiTheme.Tooltip(snapshot.Valid
-        ? "Other people in range — you are not counted. Hrothgar smell everyone; filters only " +
+        ? "Other people in range — you are not counted. I see everyone; filters only " +
           "change what the list shows."
         : NoseClosed);
     }
@@ -2102,17 +1897,18 @@ public sealed class ScentWindow : Window
 
   private static void DrawWatcherHistory(IReadOnlyList<WatcherEntry> entries, Configuration config, float scale)
   {
-    UiTheme.SectionHeader("Hrothgar remember", FontAwesomeIcon.History);
+    UiTheme.SectionHeader("Remembered", FontAwesomeIcon.History);
 
     if (entries.Count == 0)
     {
       // KeepHistory drops non-current watchers, so with it OFF this branch is reached whenever nobody is
-      // looking at you RIGHT NOW — regardless of how many people watched you a minute ago. "Nobody watch
-      // Hrothgar yet" was therefore exactly the lie DrawEmptyState goes to such lengths to avoid: the coast
-      // reported clear because we stopped remembering, not because nothing happened.
+      // looking at you RIGHT NOW — regardless of how many people watched you a minute ago. So the OFF string
+      // has to say that it is not remembering, or it is exactly the lie DrawEmptyState goes to such lengths to
+      // avoid: the coast reported clear because we stopped remembering, not because nothing happened.
       //
-      // "you", not "Hrothgar": every other string in this plugin is about watching YOU ("Watching you: 0",
-      // "This one target you", "First watched you"), and this was the one place the subject flipped.
+      // The subject is YOU, never the plugin: every other string here is about who is watching YOU ("Watching
+      // you: 0", "This one is targeting you.", "First watched you"), and this is the easiest place to flip it
+      // by accident.
       //
       // Both strings stay SHORT deliberately. HistoryReserve budgets exactly one IconLineHeight for this message
       // and it is drawn wrapped — a longer string, or a large Dalamud font at the 420px minimum width, wraps to
@@ -2120,8 +1916,8 @@ public sealed class ScentWindow : Window
       UiTheme.Icon(FontAwesomeIcon.EyeSlash, UiTheme.Muted);
       ImGui.SameLine();
       UiTheme.TextWrappedColored(UiTheme.Muted, config.KeepHistory
-        ? "Nobody watch you yet."
-        : "Nobody watching right now. Hrothgar not remembering.");
+        ? "Nobody has watched you yet."
+        : "Nobody watching right now. Not remembering.");
       return;
     }
 
@@ -2195,7 +1991,7 @@ public sealed class ScentWindow : Window
         if (ImGui.SmallButton("Forget"))
           toRemove = entry.Key;
         UiTheme.Tooltip("Drop this one from the list. Someone still watching you comes straight back as a " +
-                        "new sighting — Hrothgar not pretend nobody there.");
+                        "new sighting — I won't pretend nobody is there.");
 
         ImGui.PopID();
       }

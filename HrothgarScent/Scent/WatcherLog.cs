@@ -68,6 +68,26 @@ public sealed class WatcherLog
 
   private IReadOnlyList<WatcherEntry> _published = [];
 
+  private int _forgotten;
+
+  /// <summary>
+  /// How many watchers this log has silently dropped this session.
+  ///
+  /// EXISTS SO THAT ABSENCE CAN BE HONEST. Eviction here is silent and unrecoverable — <see cref="Trim"/> and
+  /// <see cref="DropNonCurrent"/> delete entries, and <see cref="Sync"/> never recreates them — so from the
+  /// outside "no entry" is indistinguishable from "never looked at you". A profile that reported the second when
+  /// the first is true would be the coast-is-clear lie the whole plugin refuses, told about the one subject it
+  /// exists for. Nothing else can detect it after the fact: this is the only trace.
+  ///
+  /// It fires on DEFAULTS. HistoryLimit is 10, so the eleventh person to look at you this session evicts the
+  /// first — in a city plaza that is an ordinary afternoon, not an edge case.
+  ///
+  /// Deliberately does NOT count <see cref="Clear"/> or <see cref="Remove"/>. Those are the user's own
+  /// deliberate act on that exact person, seconds earlier; explaining their own click back to them is noise, not
+  /// honesty. Stated so this reads as a decision rather than an oversight.
+  /// </summary>
+  public int Forgotten => Volatile.Read(ref _forgotten);
+
   /// <summary>
   /// Marks who is still watching and refreshes their live data. Called on every scan, from the framework
   /// thread. Never creates entries — a player with no history who starts watching arrives via
@@ -199,6 +219,10 @@ public sealed class WatcherLog
         _entries.Clear();
         Publish();
       }
+
+      // Reset, not incremented: the log is empty by the user's own hand, and a counter still claiming people
+      // were silently dropped would caveat an emptiness the user themselves authored. See Forgotten.
+      _forgotten = 0;
     }
 
     // Outside the gate — nothing is called back into under it — and after the entries are gone: re-arming
@@ -232,6 +256,10 @@ public sealed class WatcherLog
     if (doomed is null)
       return false;
 
+    // Counted, because this is the branch that drops a watcher who is merely not staring RIGHT NOW — someone who
+    // held you for four minutes and walked away leaves nothing behind. See Forgotten.
+    _forgotten += doomed.Count;
+
     foreach (var key in doomed)
       _entries.Remove(key);
     return true;
@@ -261,6 +289,9 @@ public sealed class WatcherLog
     var take = Math.Min(_entries.Count - limit, evictable.Count);
     if (take <= 0)
       return false;
+
+    // See Forgotten. This is the branch that fires on defaults.
+    _forgotten += take;
 
     foreach (var entry in evictable.OrderBy(e => e.LastSeen).Take(take))
       _entries.Remove(entry.Key);

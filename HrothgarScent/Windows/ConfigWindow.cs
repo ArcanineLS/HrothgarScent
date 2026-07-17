@@ -50,8 +50,8 @@ public sealed class ConfigWindow : Window
   /// <summary>What a dimmed row means, in one place: the tooltip says it on the name, and both arms of that
   /// tooltip need the same sentence.</summary>
   private const string StaleHelp =
-    "Hrothgar not smell this one in a while. Maybe they stopped playing — or maybe they renamed or moved " +
-    "world, which loses the trail. Hit Renamed? to say who they are now.";
+    "Not seen in a while. Maybe they stopped playing — or maybe they renamed or moved world, which loses the " +
+    "trail. Hit Renamed? to say who they are now.";
 
   private int _selectedTab;
 
@@ -361,7 +361,7 @@ public sealed class ConfigWindow : Window
     UiTheme.Tooltip("Colours the nameplate of anyone targeting you, so you can see it without the window open. " +
                     "Nothing is added or hidden — just the colour, and only in the open world. Never in PvP.");
 
-    ConfigCheckbox("Add 'Hrothgar remember' to the game's right-click menu",
+    ConfigCheckbox("Add 'Remember this Player' to the game's right-click menu",
       () => Plugin.Configuration.ShowContextMenuMark,
       v => Plugin.Configuration.ShowContextMenuMark = v,
       "Adds an entry wherever the game shows a player's name — friend list, Party Finder, chat log, FC roster. " +
@@ -371,7 +371,7 @@ public sealed class ConfigWindow : Window
     ConfigCheckbox("Show watcher history",
       () => Plugin.Configuration.ShowWatcherHistory,
       v => Plugin.Configuration.ShowWatcherHistory = v,
-      "Show the 'Hrothgar remember' section under the player list. The history is still recorded either way.");
+      "Show the 'Remembered' section under the player list. The history is still recorded either way.");
 
     ConfigCheckbox("Use job abbreviations",
       () => Plugin.Configuration.UseJobAbbreviations,
@@ -426,7 +426,7 @@ public sealed class ConfigWindow : Window
       Plugin.Configuration.RescanIntervalMs = rescan;
       Plugin.Configuration.Save();
     }
-    UiTheme.Tooltip("How often Hrothgar sniff. Lower = snappier watcher detection, more CPU.\r\n" +
+    UiTheme.Tooltip("How often I scan. Lower = snappier watcher detection, more CPU.\r\n" +
             "250ms is imperceptible in use. Below ~100ms buys nothing.\r\n\r\n" +
             "Double-click to type an exact value.");
   }
@@ -464,8 +464,8 @@ public sealed class ConfigWindow : Window
     UiTheme.SectionHeader("Halves", FontAwesomeIcon.ToggleOn);
 
     UiTheme.TextWrappedColored(UiTheme.Muted,
-      "Hrothgar is two noses in one window: who is nearby, and who is looking at you. Turn either off to hide " +
-      "it. Hrothgar keeps sniffing either way — counts and history survive, so switching a half back on brings " +
+      "This is two lists in one window: who is nearby, and who is looking at you. Turn either off to hide it. " +
+      "Scanning carries on either way — counts and history survive, so switching a half back on brings " +
       "everything it learned while it was off.");
     ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
 
@@ -480,8 +480,8 @@ public sealed class ConfigWindow : Window
     ConfigCheckbox("Watchers",
       () => Plugin.Configuration.EnableWatchers,
       v => Plugin.Configuration.EnableWatchers = v,
-      "The eye column, the 'Hrothgar remember' history, the watching count in the server info bar, and watcher " +
-      "alerts. Hrothgar keeps recording the history while it is off.");
+      "The eye column, the 'Remembered' history, the watching count in the server info bar, and watcher " +
+      "alerts. The history keeps recording while it is off.");
   }
 
   private static void DrawRacesSection()
@@ -490,7 +490,7 @@ public sealed class ConfigWindow : Window
 
     UiTheme.TextWrappedColored(UiTheme.Muted, "Untick a race to leave it out of the list.");
     UiTheme.HelpMarker(
-      "Players who have not finished loading in have no race for Hrothgar to smell yet, and are always shown — " +
+      "Players who have not finished loading in have no race to read yet, and are always shown — " +
       "otherwise they would blink out of the list as they arrive, which looks like people going missing.\n\n" +
       "This is the only home for the race filter. The Scent window's footer says when filters are hiding people, " +
       "so a filter set here can never go unexplained over there.");
@@ -526,7 +526,7 @@ public sealed class ConfigWindow : Window
     UiTheme.SectionHeader("Who to show", FontAwesomeIcon.Filter);
 
     UiTheme.TextWrappedColored(UiTheme.Muted,
-      "Filters only change what the list shows. Hrothgar still smell everyone, so the info bar counts and the " +
+      "Filters only change what the list shows. I still see everyone, so the info bar counts and the " +
       "watcher history stay honest.");
     ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
 
@@ -629,13 +629,13 @@ public sealed class ConfigWindow : Window
       () => Plugin.Configuration.RememberLastSeen,
       v => Plugin.Configuration.RememberLastSeen = v,
       "Only for players you have marked, and only one line per person — overwritten, never a history. This is " +
-      "the one thing Hrothgar writes down that you did not type, so it has its own switch. Turning it off " +
+      "the one thing I write down that you did not type, so it has its own switch. Turning it off " +
       "keeps what is already stored; use Forget to delete a person outright.");
 
     ConfigCheckbox("Note duties you clear together",
       () => Plugin.Configuration.RememberDutyClears,
       v => Plugin.Configuration.RememberDutyClears = v,
-      "When you clear a duty, Hrothgar adds a line to the note of anyone in it you had already marked. Only " +
+      "When you clear a duty, I add a line to the note of anyone in it you had already marked. Only " +
       "them — clearing a duty with a stranger is not a reason to remember them. It goes in the note, so you " +
       "can edit or delete it like anything else you wrote.");
 
@@ -649,7 +649,7 @@ public sealed class ConfigWindow : Window
       Plugin.Configuration.MarkStaleDays = staleDays;
       Plugin.Configuration.Save();
     }
-    UiTheme.Tooltip("A mark Hrothgar has not matched in this long is dimmed, because it may have been orphaned " +
+    UiTheme.Tooltip("A mark I have not matched in this long is dimmed, because it may have been orphaned " +
                     "by a rename or a world transfer. Nothing is ever deleted by time. 0 never dims." +
                     "\r\n\r\nDouble-click to type an exact value.");
     ImGui.SameLine();
@@ -662,12 +662,12 @@ public sealed class ConfigWindow : Window
     {
       UiTheme.TextWrappedColored(UiTheme.Muted,
         "Right-click a player in the Scent window -> Remember this player. Or right-click their name anywhere " +
-        "the game shows it — friend list, Party Finder, chat — and pick Hrothgar remember.");
+        "the game shows it — friend list, Party Finder, chat — and pick Remember this Player.");
       return;
     }
 
     UiTheme.TextWrappedColored(UiTheme.Muted,
-      "Everyone Hrothgar wrote down, because you said so. Matched on name and home world, so they stay marked " +
+      "Everyone I wrote down, because you said so. Matched on name and home world, so they stay marked " +
       "across zones and sessions. Ignore beats Focus if a player carries both. Hover a name for when you last " +
       "ran into them.");
     ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
@@ -710,7 +710,7 @@ public sealed class ConfigWindow : Window
             ? $"{ScentWindow.FormatLastSeen(lastSeen, mark.LastSeenZone)}\r\n\r\n" + StaleHelp
             : ScentWindow.FormatLastSeen(lastSeen, mark.LastSeenZone));
         else if (stale)
-          UiTheme.Tooltip($"Hrothgar never smell this one since you marked them.\r\n\r\n{StaleHelp}");
+          UiTheme.Tooltip($"Never seen since you marked them.\r\n\r\n{StaleHelp}");
 
         ImGui.TableNextColumn();
         var focus = mark.IsFocused;
@@ -795,8 +795,8 @@ public sealed class ConfigWindow : Window
     ImGui.TextColored(UiTheme.AccentBlue, $"Who is {mark.FullName} now?");
     ImGui.Separator();
     UiTheme.TextWrappedColored(UiTheme.Muted,
-      "Hrothgar match on name and home world, so a rename or a transfer loses the trail. Tell Hrothgar the new " +
-      "one and everything you wrote comes with it.");
+      "Marks match on name and home world, so a rename or a transfer loses the trail. Give me the new one and " +
+      "everything you wrote comes with it.");
     ImGui.Dummy(new Vector2(0, 4f * scale));
 
     ImGui.SetNextItemWidth(220f * scale);
@@ -811,11 +811,11 @@ public sealed class ConfigWindow : Window
     var named = !string.IsNullOrWhiteSpace(_repairName);
 
     if (!named)
-      UiTheme.TextWrappedColored(UiTheme.Warn, "Hrothgar need a name.");
+      UiTheme.TextWrappedColored(UiTheme.Warn, "I need a name.");
     else if (worldId is null)
       UiTheme.TextWrappedColored(UiTheme.Warn, _repairWorld.Trim().Length == 0
-        ? "Hrothgar need a home world."
-        : $"Hrothgar not know a world called '{_repairWorld.Trim()}'.");
+        ? "I need a home world."
+        : $"I don't know a world called '{_repairWorld.Trim()}'.");
 
     ImGui.Dummy(new Vector2(0, 4f * scale));
 
@@ -983,7 +983,7 @@ public sealed class ConfigWindow : Window
       ConfigColor("Other##roleColorOther",
         () => Plugin.Configuration.RoleColorOther,
         v => Plugin.Configuration.RoleColorOther = v,
-        "Base classes, limited jobs, and anything Hrothgar does not recognise.");
+        "Base classes, limited jobs, and anything I do not recognise.");
     }
     else
     {
@@ -1104,7 +1104,7 @@ public sealed class ConfigWindow : Window
       // explanation of the 0 value — and of the double-click entry — off the two narrow words nobody hovers.
       // TooltipEvenIfDisabled because the slider inherits the disabled flag from the scope above, which the
       // plain helper answers "not hovered" to, forever.
-      UiTheme.TooltipEvenIfDisabled("How long they have to hold you before Hrothgar mentions it again. " +
+      UiTheme.TooltipEvenIfDisabled("How long they have to hold you before I mention it again. " +
                                     "0 turns this rung off.\r\n\r\nDouble-click to type an exact value.");
       ImGui.SameLine();
       ImGui.Text("seconds in");
@@ -1120,7 +1120,7 @@ public sealed class ConfigWindow : Window
         config.Save();
       }
 
-      UiTheme.TooltipEvenIfDisabled("The last thing Hrothgar says about one stare. 0 turns this rung off. " +
+      UiTheme.TooltipEvenIfDisabled("The last thing I say about one stare. 0 turns this rung off. " +
                                     "Set below the one above and it simply wins, at the lower number." +
                                     "\r\n\r\nDouble-click to type an exact value.");
       ImGui.SameLine();
@@ -1141,14 +1141,17 @@ public sealed class ConfigWindow : Window
     if (config.AlertOnStareEscalation)
     {
       var dead = new List<string>(2);
+      // The quoted labels track AlertService.Render's actual wording. They are how the user maps this warning
+      // to the line they hear; rewording one without the other leaves the warning naming an alert that no
+      // longer exists.
       if (config.StareSeconds > 0 && config.StareSeconds < config.AlertCooldownSeconds)
-        dead.Add($"'watching you' at {config.StareSeconds}s");
+        dead.Add($"'targeting you' at {config.StareSeconds}s");
       if (config.FixateSeconds > 0 && config.FixateSeconds < config.AlertCooldownSeconds)
-        dead.Add($"'still watching' at {config.FixateSeconds}s");
+        dead.Add($"'still targeting' at {config.FixateSeconds}s");
 
       if (dead.Count > 0)
         UiTheme.TextWrappedColored(UiTheme.Warn,
-          $"Hrothgar may stay quiet: {string.Join(" and ", dead)} sits inside the " +
+          $"I may stay quiet: {string.Join(" and ", dead)} sits inside the " +
           $"{config.AlertCooldownSeconds:0}s cooldown that the first alert already spent, so it will usually be " +
           "swallowed. Raise it above the cooldown, or lower the cooldown.");
     }
@@ -1237,7 +1240,7 @@ public sealed class ConfigWindow : Window
     ConfigCheckbox("Record history while the window is closed",
       () => Plugin.Configuration.RecordWhileClosed,
       v => Plugin.Configuration.RecordWhileClosed = v,
-      "Keep remembering and announcing watchers while the Scent window is shut. Off means Hrothgar only " +
+      "Keep remembering and announcing watchers while the Scent window is shut. Off means I only " +
       "remember what you were there to see.");
 
     ImGui.Dummy(new Vector2(0, 6f * ImGuiHelpers.GlobalScale));
@@ -1263,13 +1266,13 @@ public sealed class ConfigWindow : Window
   private static void DrawJournalSection()
   {
     ImGui.Dummy(new Vector2(0, 6f * ImGuiHelpers.GlobalScale));
-    UiTheme.SectionHeader("What Hrothgar decided", FontAwesomeIcon.ListUl);
+    UiTheme.SectionHeader("What I decided", FontAwesomeIcon.ListUl);
 
     var entries = Plugin.Journal.Snapshot();
     if (entries.Count == 0)
     {
       UiTheme.TextWrappedColored(UiTheme.Muted,
-        "Nothing yet. When Hrothgar says something — or stays quiet when you expected otherwise — the reason " +
+        "Nothing yet. When I say something — or stay quiet when you expected otherwise — the reason " +
         "shows up here. Kept in memory for this session only.");
       return;
     }
