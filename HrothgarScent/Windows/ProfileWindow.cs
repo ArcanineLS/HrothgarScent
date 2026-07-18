@@ -143,24 +143,64 @@ public sealed class ProfileWindow : Window
     var row = Plugin.Scanner.Snapshot.Rows.FirstOrDefault(r => r.Key == key);
 
     DrawHeader(key, mark, row, scale);
+    ImGui.Dummy(new Vector2(0, 4f * scale));
+
+    // Three tabs, one thing each, so the window is not a single scroll of everything at once. Info is who they
+    // are; Jobs is what they have levelled; Notes is what you wrote. The header above — face, name, and the live
+    // "looking at you right now" — stays out of the tabs, because the one fact this plugin exists for must never
+    // be a click away.
+    if (ImGui.BeginTabBar("##profileTabs"))
+    {
+      if (ImGui.BeginTabItem("Info"))
+      {
+        DrawInfoTab(key, mark, row, scale);
+        ImGui.EndTabItem();
+      }
+
+      if (ImGui.BeginTabItem("Jobs"))
+      {
+        DrawJobsTab(key, scale);
+        ImGui.EndTabItem();
+      }
+
+      if (ImGui.BeginTabItem("Notes"))
+      {
+        DrawNotesTab(key, mark, scale);
+        ImGui.EndTabItem();
+      }
+
+      ImGui.EndTabBar();
+    }
+  }
+
+  /// <summary>
+  /// INFO — who they are, published and observed. The Lodestone character page's fields, then what they have
+  /// actually done to you this session.
+  ///
+  /// The history sits at the BOTTOM here rather than in its own surface, because "have they targeted you" is
+  /// information about this person and this is the information tab — and the header already carries the live
+  /// "looking at you right now", so the urgent case is never behind a tab. Jobs is split out because a wall of
+  /// 34 levels would bury these four fields.
+  /// </summary>
+  private void DrawInfoTab(WatcherKey key, MarkedPlayer? mark, ScentRow? row, float scale)
+  {
+    ImGui.Dummy(new Vector2(0, 2f * scale));
+
+    if (DrawLodestoneState(key, scale) is { } profile)
+      DrawProfileFields(row, profile, scale);
+
     ImGui.Dummy(new Vector2(0, 6f * scale));
+    DrawHistory(BuildHistory(key, mark));
+  }
 
-    // The published identity, right under the face it extends — the face is itself from the Lodestone, so this
-    // reads as one block: who they are, live and published. Placed ABOVE the note deliberately: the note
-    // stretches to fill the window, so a section under it would sit permanently below the fold, and the
-    // "Load their full profile" button has to be reachable without a scroll. Its own state machine; fetched only
-    // on a click (spec 2.5, 5.4).
-    DrawLodestone(key, row, scale);
-    ImGui.Dummy(new Vector2(0, 6f * scale));
+  /// <summary>JOBS — every class and its level. Shares the Lodestone state flow with Info: both need the same
+  /// loaded page, so the Load button and every "looking / failed" line live in one place and cannot drift.</summary>
+  private void DrawJobsTab(WatcherKey key, float scale)
+  {
+    ImGui.Dummy(new Vector2(0, 2f * scale));
 
-    // BUILT BEFORE IT IS DRAWN, because the note stretches to meet it and therefore has to know how tall it will
-    // be. Its height is not a constant: a sighting is two short lines, but every "why there is no sighting"
-    // branch is a wrapped paragraph, and reserving two lines for four would push the answer below the fold in
-    // exactly the case the paragraph exists to explain.
-    var history = BuildHistory(key, mark);
-
-    DrawNote(key, mark, scale, HeightOf(history, scale));
-    DrawHistory(history);
+    if (DrawLodestoneState(key, scale) is { } profile)
+      DrawJobs(profile, scale);
   }
 
   /// <summary>
@@ -483,24 +523,31 @@ public sealed class ProfileWindow : Window
   /// as "not looked up" beside a dead button. Only once the face is Ready — the face is what carries the
   /// verified character id — does the character page become reachable, behind an explicit button (spec 2.5).
   /// </summary>
-  private void DrawLodestone(WatcherKey key, ScentRow? row, float scale)
+  /// <summary>
+  /// Resolves the Lodestone character page to a ready profile, or draws WHY it is not ready and returns null.
+  ///
+  /// Shared by the Info and Jobs tabs, which both stand on the same loaded page — so the Load button and every
+  /// "looking / private / failed" line live in exactly one place and cannot drift between the two. No section
+  /// header: the tab is the header now, which is the whole reason "Their Lodestone" and its caption are gone.
+  ///
+  /// Two state machines in sequence: the FACE lookup gates the character-page lookup, because the page is
+  /// fetched by the id the face already verified. A page 404 is <see cref="ProfileFetchState.Gone"/>, never the
+  /// face's Missing, so a second failure never erases the face already on screen above (spec 5.4).
+  /// </summary>
+  private CharacterProfile? DrawLodestoneState(WatcherKey key, float scale)
   {
-    UiTheme.SectionHeader("Their Lodestone", FontAwesomeIcon.Cloud, UiTheme.Muted);
-    UiTheme.TextWrappedColored(UiTheme.Muted, "Published by them. As of their last logout, not right now.");
-    ImGui.Dummy(new Vector2(0, 3f * scale));
-
     if (_worldName.Length == 0)
     {
       UiTheme.TextWrappedColored(UiTheme.Muted,
         "No home world known for them, and a name alone is not an identity — two players on different worlds "
         + "can share one.");
-      return;
+      return null;
     }
 
     if (!Plugin.Configuration.ShowLodestonePortraits)
     {
       UiTheme.TextWrappedColored(UiTheme.Muted, "Lodestone lookups are switched off in settings.");
-      return;
+      return null;
     }
 
     var portrait = Plugin.Lodestone.Get(key);
@@ -511,11 +558,11 @@ public sealed class ProfileWindow : Window
         // defensive branch; it offers to start the lookup rather than showing a dead "not looked up".
         if (ImGui.Button("Look them up"))
           Plugin.Lodestone.Request(key, _worldName);
-        return;
+        return null;
 
       case PortraitState.Looking:
         UiTheme.TextWrappedColored(UiTheme.Muted, "Looking them up…");
-        return;
+        return null;
 
       case PortraitState.Missing:
         // THREE indistinguishable causes — private, renamed, transferred — all return the same zero results.
@@ -526,26 +573,15 @@ public sealed class ProfileWindow : Window
           $"The Lodestone lists nobody called {key.Name} on {_worldName}. Their profile may be private, or they "
           + "may have renamed or transferred — a search cannot tell these apart. If you know they renamed, use "
           + "Renamed? in settings to point the mark at who they are now.");
-        return;
+        return null;
 
       case PortraitState.Failed:
         UiTheme.TextWrappedColored(UiTheme.Muted,
           "Could not reach the Lodestone. This says nothing about them — it is our network, not their profile.");
-        return;
-
-      case PortraitState.Ready:
-        DrawLodestoneProfile(key, row, scale);
-        return;
+        return null;
     }
-  }
 
-  /// <summary>
-  /// The character-page sub-state, shown only once the face is Ready (so the verified id exists). Its own state
-  /// machine: a page 404 is <see cref="ProfileFetchState.Gone"/>, never the face's Missing, so a second failure
-  /// never erases the face already on screen (spec 5.4).
-  /// </summary>
-  private void DrawLodestoneProfile(WatcherKey key, ScentRow? row, float scale)
-  {
+    // Face Ready → the verified id exists, so the character page may be fetched.
     var profile = Plugin.Lodestone.GetProfile(key);
     switch (profile.State)
     {
@@ -557,18 +593,18 @@ public sealed class ProfileWindow : Window
           + "job's level. None of this is in the game client.");
         UiTheme.TextWrappedColored(UiTheme.Muted,
           "One more request to Square Enix. There is no API here, so this stays a click, not automatic.");
-        return;
+        return null;
 
       case ProfileFetchState.Looking:
         UiTheme.TextWrappedColored(UiTheme.Muted, "Loading their profile…");
-        return;
+        return null;
 
       case ProfileFetchState.Gone:
         // The face stays on screen above — it was still found; only the full page is gone.
         UiTheme.TextWrappedColored(UiTheme.Warn,
           "Their Lodestone page is gone. The character has been deleted, or renamed far enough that Square Enix "
           + "dropped the page. If you know they renamed, use Renamed? in settings.");
-        return;
+        return null;
 
       case ProfileFetchState.Failed:
         UiTheme.TextWrappedColored(UiTheme.Muted,
@@ -578,12 +614,13 @@ public sealed class ProfileWindow : Window
         // permanent for the session. A click, so it stays inside the user-initiated rule; a repaint never retries.
         if (ImGui.Button("Try again"))
           Plugin.Lodestone.RetryProfile(key, _worldName);
-        return;
+        return null;
 
       case ProfileFetchState.Ready:
-        DrawProfileFields(row, profile, scale);
-        return;
+        return profile;
     }
+
+    return null;
   }
 
   /// <summary>
@@ -620,9 +657,8 @@ public sealed class ProfileWindow : Window
     // NOT "None" and never a dash: an absent GC could equally be a non-NA region hiding an enlisted player.
     Field("Grand Company", gc, "Not shown on their Lodestone page.", labelWidth);
 
-    ImGui.Dummy(new Vector2(0, 4f * scale));
-    DrawJobs(profile, scale);
-
+    // Jobs are NOT here — they are their own tab, because thirty-four levels under these four fields would bury
+    // them. Nameday/Guardian/City-state stay, collapsed, as the trivia they are.
     ImGui.Dummy(new Vector2(0, 2f * scale));
     DrawMore(profile, labelWidth);
   }
@@ -755,28 +791,22 @@ public sealed class ProfileWindow : Window
   /// <param name="reserveBelow">
   /// How much room the history underneath needs, so the note can take everything else.
   /// </param>
-  private void DrawNote(WatcherKey key, MarkedPlayer? mark, float scale, float reserveBelow)
+  /// <summary>NOTES — the one thing on this window the user writes, given the whole tab. The note box fills the
+  /// body down to the Forget button, so a long note gets room and a short one is not squeezed by anything.</summary>
+  private void DrawNotesTab(WatcherKey key, MarkedPlayer? mark, float scale)
   {
-    ImGui.Separator();
     ImGui.Dummy(new Vector2(0, 2f * scale));
 
-    // MULTILINE, and the hint is painted by hand because of it. The note is the one thing on this window the
-    // user authors and it holds sentences, so InputTextWithHint — which is single-line only — would have traded
-    // the label for the room to write, which is not an improvement. There is no multiline overload that takes a
-    // hint, so the placeholder is drawn into the empty box instead: same effect, and the box keeps its width
-    // rather than spending a line on the word "Note".
+    // MULTILINE, and the hint is painted by hand because of it. The note holds sentences, so InputTextWithHint
+    // — which is single-line only — would have traded the room to write for a label, which is not an
+    // improvement. There is no multiline overload that takes a hint, so the placeholder is drawn into the empty
+    // box instead: same effect, and the box keeps its width rather than spending a line on the word "Note".
     var notePos = ImGui.GetCursorScreenPos();
 
-    // STRETCHES to meet the history below. Everything else on this window is sized by its content; the note has
-    // no natural height — it is an empty box the user may put one line or ten in — so it is the only thing here
-    // that can absorb a resize. A fixed four lines left a dead gap under it that grew with every drag, on the
-    // one field whose whole purpose is room to write.
-    //
-    // Floored at three lines rather than allowed to collapse: on a window dragged short the note would otherwise
-    // shrink to nothing while the history it is yielding to stays fully drawn, which inverts the priority — the
-    // history is two lines of recall, the note is the only thing here the user actually authors.
-    var reserve = reserveBelow + (mark is null ? 0f : ImGui.GetFrameHeight() + ImGui.GetStyle().ItemSpacing.Y)
-                + 8f * scale;
+    // FILLS the tab body, down to the Forget button below it. The note has no natural height — it is an empty
+    // box the user may put one line or ten in — so it takes whatever the window gives it. Floored at three lines
+    // so a window dragged short does not collapse the one field the user actually authors to nothing.
+    var reserve = (mark is null ? 0f : ImGui.GetFrameHeight() + ImGui.GetStyle().ItemSpacing.Y) + 8f * scale;
     var noteHeight = Math.Max(ImGui.GetTextLineHeight() * 3f, ImGui.GetContentRegionAvail().Y - reserve);
 
     ImGui.SetNextItemWidth(-1);
@@ -851,27 +881,6 @@ public sealed class ProfileWindow : Window
         : $"Last Seen: {ScentWindow.FormatAgo(lastSeen)}, {mark.LastSeenZone}", UiTheme.Muted));
 
     return lines;
-  }
-
-  /// <summary>
-  /// How tall <see cref="DrawHistory"/> will be, measured from the strings it is actually about to draw.
-  ///
-  /// Measured rather than assumed because the paragraphs wrap, and wrapping depends on a window width the user
-  /// can drag. A constant would be right at one width and wrong at every other — pushing the history off the
-  /// bottom on a narrow window, which is the one place it must not go.
-  /// </summary>
-  private static float HeightOf(List<(string Text, Vector4 Color)> lines, float scale)
-  {
-    var style = ImGui.GetStyle();
-    var wrap = ImGui.GetContentRegionAvail().X;
-
-    // The separator and the breathing room above it.
-    var height = style.ItemSpacing.Y * 2f + 4f * scale;
-
-    foreach (var (text, _) in lines)
-      height += ImGui.CalcTextSize(text, false, wrap).Y + style.ItemSpacing.Y;
-
-    return height;
   }
 
   private static void DrawHistory(List<(string Text, Vector4 Color)> lines)
