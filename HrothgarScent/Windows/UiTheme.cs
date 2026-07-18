@@ -138,8 +138,8 @@ internal static class UiTheme
     if (showNav)
     {
       if (TitleIconButton("##titleHud", FontAwesomeIcon.Desktop, new Vector2(x, btnY), btnSize, purpleHover))
-        Plugin.ToggleHud();
-      Tooltip("HUD mode — the quiet, chrome-less Scent window.");
+        Plugin.ToggleMainWindow();
+      Tooltip("Show or hide the Scent window.");
       x -= btnSize + spacing;
 
       if (TitleIconButton("##titleConfig", FontAwesomeIcon.Cog, new Vector2(x, btnY), btnSize, purpleHover))

@@ -385,6 +385,12 @@ public sealed class Plugin : IDalamudPlugin
   /// reason <see cref="ToggleConfigWindow"/> exists.</summary>
   internal static void ToggleJournalWindow() => _journalWindow?.Toggle();
 
+  /// <summary>Shows or hides the main Scent window — the HUD. The static twin of <see cref="ToggleMainUI"/>,
+  /// reachable from the shared title bar's HUD button without the plugin instance, the same reason
+  /// <see cref="ToggleConfigWindow"/> exists. This toggles the window's VISIBILITY; the quiet, chrome-less styling
+  /// is a different switch, <see cref="ToggleHud"/>.</summary>
+  internal static void ToggleMainWindow() => _mainWindow?.Toggle();
+
   /// <summary>Toggles HUD mode — the quiet, chrome-less Scent window. The one action shared by the /hscent hud
   /// command and the title bar's HUD button, so the two cannot drift.</summary>
   internal static void ToggleHud()
