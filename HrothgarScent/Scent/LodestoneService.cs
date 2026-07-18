@@ -113,6 +113,13 @@ public sealed class CharacterProfile
   /// <summary>Where they STARTED, not where they are. Kept away from anything about location for that reason.</summary>
   public string? CityState { get; set; }
 
+  /// <summary>
+  /// The player's own Lodestone self-introduction — their public bio. Free text they wrote, with &lt;br&gt;
+  /// turned into newlines and entities decoded. Null under Ready == they left it blank (verified: the div is
+  /// present but empty, or absent), so the Comment section omits itself rather than drawing an empty box.
+  /// </summary>
+  public string? SelfIntroduction { get; set; }
+
   /// <summary>Empty under Ready == the page changed shape; all 34 slots always render, or none do.</summary>
   public IReadOnlyList<JobSlot> Jobs { get; set; } = [];
 
@@ -179,7 +186,21 @@ public sealed class FieldOpProgress
 
   /// <summary>Occult Crescent's "Knowledge Level".</summary>
   public int? KnowledgeLevel { get; set; }
+
+  /// <summary>
+  /// Occult Crescent's Phantom Jobs, in page order. Empty when the character has never entered it, which is the
+  /// same honest "no progress" as a null level — the section just shows nothing.
+  /// </summary>
+  public IReadOnlyList<PhantomJob> PhantomJobs { get; set; } = [];
 }
+
+/// <summary>
+/// One Occult Crescent Phantom Job. <paramref name="Level"/> is the raw Lodestone string ("Lv. 6") rather than
+/// an int, because the page prints it that way and it is display-only — nothing computes on it, so re-parsing to
+/// a number and reformatting would just be a place to introduce a bug. <paramref name="Mastered"/> is the
+/// page's own "MASTERED" flag.
+/// </summary>
+public readonly record struct PhantomJob(string Name, string Level, bool Mastered);
 
 /// <summary>
 /// One job slot from the character page. <paramref name="Level"/> null == the Lodestone printed "-": not
@@ -343,6 +364,31 @@ public sealed class LodestoneService : IDisposable
   /// </summary>
   private static readonly Regex FieldOpPattern = new(
     """character__job__level">(\d+)</div>\s*<div class="character__job__name">(Elemental Level|Resistance Rank|Knowledge Level)</div>""",
+    RegexOptions.Compiled);
+
+  /// <summary>
+  /// The player's self-introduction, anchored on its own class. Singleline so a multi-line bio is captured
+  /// whole; the &lt;br&gt; tags inside are turned into newlines afterward, not matched here.
+  /// </summary>
+  private static readonly Regex SelfIntroPattern = new(
+    """character__selfintroduction">(.*?)</div>""",
+    RegexOptions.Singleline | RegexOptions.Compiled);
+
+  /// <summary>Turns the self-introduction's &lt;br&gt; (with or without a slash or spaces) into a newline, before
+  /// the remaining tags are stripped.</summary>
+  private static readonly Regex BrPattern = new("""<br\s*/?>""", RegexOptions.Compiled);
+
+  /// <summary>Any leftover HTML tag, stripped from the self-introduction after the breaks are converted — a bio
+  /// can carry stray markup the game's own client renders as nothing.</summary>
+  private static readonly Regex TagPattern = new("<[^>]+>", RegexOptions.Compiled);
+
+  /// <summary>
+  /// One Occult Crescent Phantom Job: name, "Lv. N", and optionally the "MASTERED" flag. On the /class_job/
+  /// sub-page's support-job block, which sits in the main content BEFORE ldst__side, so the sliced page cannot
+  /// let the stranger feed supply one. The master group is optional — a job below its cap has no such div.
+  /// </summary>
+  private static readonly Regex PhantomJobPattern = new(
+    """character__support_job__name">([^<]+)</p>\s*<p class="character__support_job__level">([^<]+)</p>(?:\s*<p class="character__support_job__master">([^<]+)</p>)?""",
     RegexOptions.Compiled);
 
   /// <summary>
@@ -763,10 +809,31 @@ public sealed class LodestoneService : IDisposable
     if (CityStatePattern.Match(html) is { Success: true } cs)
       profile.CityState = WebUtility.HtmlDecode(cs.Groups[1].Value).Trim();
 
+    profile.SelfIntroduction = ParseSelfIntroduction(html);
     profile.Jobs = ParseJobs(html);
     profile.FreeCompanyCrestUrls = ParseCrestUrls(html);
 
     return profile;
+  }
+
+  /// <summary>
+  /// The player's bio, or null when they left it blank.
+  ///
+  /// Breaks first, then tags: &lt;br&gt; becomes a newline so the shape the player wrote is kept, and any other
+  /// stray markup is then stripped rather than shown raw. Decoded last, so an entity that decodes to '&lt;' is
+  /// not itself mistaken for a tag. Empty after all that — the div exists but holds nothing — returns null, so
+  /// the Comment section omits itself rather than drawing an empty box.
+  /// </summary>
+  private static string? ParseSelfIntroduction(string html)
+  {
+    if (SelfIntroPattern.Match(html) is not { Success: true } m)
+      return null;
+
+    var text = BrPattern.Replace(m.Groups[1].Value, "\n");
+    text = TagPattern.Replace(text, string.Empty);
+    text = WebUtility.HtmlDecode(text).Trim();
+
+    return text.Length > 0 ? text : null;
   }
 
   /// <summary>
@@ -1027,8 +1094,18 @@ public sealed class LodestoneService : IDisposable
       }
     }
 
-    // A page that passed identity but listed no field-op progress settles Ready with all three null — a real
-    // "they have done none of this", omitted from the display, not a failure.
+    // Phantom Jobs — Occult Crescent's own job system, read from the SAME sliced main content, so the stranger
+    // feed cannot supply one. Name and level are the page's raw strings; MASTERED is present only above the cap.
+    var phantoms = new List<PhantomJob>();
+    foreach (Match m in PhantomJobPattern.Matches(main))
+      phantoms.Add(new PhantomJob(
+        WebUtility.HtmlDecode(m.Groups[1].Value).Trim(),
+        WebUtility.HtmlDecode(m.Groups[2].Value).Trim(),
+        m.Groups[3].Success));
+    progress.PhantomJobs = phantoms;
+
+    // A page that passed identity but listed no field-op progress settles Ready with all three null and no
+    // phantom jobs — a real "they have done none of this", omitted from the display, not a failure.
     return progress;
   }
 

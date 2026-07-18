@@ -190,7 +190,10 @@ public sealed class ProfileWindow : Window
     if (DrawLodestoneState(key, scale) is { } profile)
       DrawProfileFields(row, profile, scale);
 
+    // The plugin's OWN observations, under their own header — what Hrothgar has seen, kept distinct from the
+    // Lodestone facts above it. This is the direct-observation half: targeted you, last seen, and so on.
     ImGui.Dummy(new Vector2(0, 6f * scale));
+    UiTheme.SectionHeader("Scent");
     DrawHistory(BuildHistory(key, mark));
   }
 
@@ -203,12 +206,16 @@ public sealed class ProfileWindow : Window
     if (DrawLodestoneState(key, scale) is not { } profile)
       return;
 
-    // Field-op levels ride at the TOP, from a SECOND, independent fetch fired ONLY from here — a profile opened
-    // to Info or Notes never spends the request. Reached only once the main page is Ready (DrawLodestoneState
-    // returned non-null), so this extra request is gated behind the profile already being loaded.
-    DrawFieldOps(key, scale);
-
+    UiTheme.SectionHeader("Jobs");
     DrawJobs(profile, scale);
+
+    // The field ops are their OWN section under their own header, below the jobs — and from a SECOND, independent
+    // fetch fired ONLY from here, so a profile opened to Info or Notes never spends the request. Reached only once
+    // the main page is Ready (DrawLodestoneState returned non-null), so this extra request is gated behind the
+    // profile already being loaded.
+    ImGui.Dummy(new Vector2(0, 6f * scale));
+    UiTheme.SectionHeader("Field Operations / Occult Crescent");
+    DrawFieldOps(key, scale);
   }
 
   /// <summary>
@@ -691,6 +698,16 @@ public sealed class ProfileWindow : Window
     Field("Guardian", profile.Guardian, "Not shown on their Lodestone page.", labelWidth);
     DrawCityStateField(profile, labelWidth, scale);
 
+    // The player's own bio, its own section under the fields — but ONLY when they wrote one. A "Comment" header
+    // over an empty box would announce a blank as if it were content, so a null self-introduction omits the
+    // whole section. Free text they published, wrapped and read-only; it can hold anything the game renders.
+    if (profile.SelfIntroduction is { Length: > 0 } bio)
+    {
+      ImGui.Dummy(new Vector2(0, 4f * scale));
+      UiTheme.SectionHeader("Comment");
+      UiTheme.TextWrappedColored(UiTheme.Muted, bio);
+    }
+
     // Jobs are NOT here — they are their own tab, because thirty-four levels under these fields would bury them.
   }
 
@@ -925,23 +942,60 @@ public sealed class ProfileWindow : Window
     }
   }
 
-  /// <summary>The three field-op levels, each OMITTED when absent — a character with no field-op progress at all
-  /// draws nothing here (they are supplementary, not a labelled slot that must show "none"). Label + number, no
-  /// icon: the Lodestone's field-op glyphs are webfont, not game icons, so a word is the honest render.</summary>
+  /// <summary>
+  /// The three field-op levels and the phantom jobs, each OMITTED when absent. Because the "Field Operations"
+  /// section header is now always drawn above this, a character with NONE of it gets one honest line rather than
+  /// an orphaned header over a blank — the old "draw nothing at all" would have left the header hanging.
+  ///
+  /// Levels are label + number, no icon: the Lodestone's field-op glyphs are webfont, not game icons, so a word
+  /// is the honest render.
+  /// </summary>
   private static void DrawFieldOpLevels(FieldOpProgress fieldOps, float scale)
   {
-    if (fieldOps.ElementalLevel is null && fieldOps.ResistanceRank is null && fieldOps.KnowledgeLevel is null)
-      return;
-
     var labelWidth = 150f * scale;
+    var any = false;
+
     if (fieldOps.ElementalLevel is { } elemental)
+    {
       Field("Elemental Level", elemental.ToString(), string.Empty, labelWidth);
+      any = true;
+    }
     if (fieldOps.ResistanceRank is { } resistance)
+    {
       Field("Resistance Rank", resistance.ToString(), string.Empty, labelWidth);
+      any = true;
+    }
     if (fieldOps.KnowledgeLevel is { } knowledge)
+    {
       Field("Knowledge Level", knowledge.ToString(), string.Empty, labelWidth);
+      any = true;
+    }
+
+    if (fieldOps.PhantomJobs.Count > 0)
+    {
+      DrawPhantomJobs(fieldOps.PhantomJobs, labelWidth, scale);
+      any = true;
+    }
+
+    if (!any)
+      UiTheme.TextWrappedColored(UiTheme.Muted, "No Eureka, Bozja or Occult Crescent progress on their Lodestone.");
 
     ImGui.Dummy(new Vector2(0, 6f * scale));
+  }
+
+  /// <summary>
+  /// Occult Crescent's Phantom Jobs, under their own sub-label. Name and the page's own "Lv. N", with the
+  /// page's MASTERED flag kept — it is the one bit of state the level number does not carry. Text only: phantom
+  /// jobs are not real ClassJobs, so there is no game icon to resolve, and inventing one is the trap the whole
+  /// icon path avoids.
+  /// </summary>
+  private static void DrawPhantomJobs(IReadOnlyList<PhantomJob> phantoms, float labelWidth, float scale)
+  {
+    ImGui.Dummy(new Vector2(0, 4f * scale));
+    UiTheme.TextWrappedColored(UiTheme.AccentBlue, "Phantom Jobs");
+
+    foreach (var job in phantoms)
+      Field(job.Name, job.Mastered ? $"{job.Level} · Mastered" : job.Level, string.Empty, labelWidth);
   }
 
   /// <summary>A Muted label at a fixed column, then the value — or, when the value is null, the sentence naming
@@ -1072,7 +1126,7 @@ public sealed class ProfileWindow : Window
 
   private static void DrawHistory(List<(string Text, Vector4 Color)> lines)
   {
-    ImGui.Separator();
+    // No separator: the "Scent" section header above already draws the break. This is only the lines.
     foreach (var (text, color) in lines)
       UiTheme.TextWrappedColored(color, text);
   }
