@@ -4,6 +4,7 @@ using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
+using Dalamud.Interface.Textures.TextureWraps;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
@@ -199,8 +200,15 @@ public sealed class ProfileWindow : Window
   {
     ImGui.Dummy(new Vector2(0, 2f * scale));
 
-    if (DrawLodestoneState(key, scale) is { } profile)
-      DrawJobs(profile, scale);
+    if (DrawLodestoneState(key, scale) is not { } profile)
+      return;
+
+    // Field-op levels ride at the TOP, from a SECOND, independent fetch fired ONLY from here — a profile opened
+    // to Info or Notes never spends the request. Reached only once the main page is Ready (DrawLodestoneState
+    // returned non-null), so this extra request is gated behind the profile already being loaded.
+    DrawFieldOps(key, scale);
+
+    DrawJobs(profile, scale);
   }
 
   /// <summary>
@@ -644,8 +652,11 @@ public sealed class ProfileWindow : Window
   {
     var labelWidth = 130f * scale;
 
-    // The only source of the FC NAME — the live row carries only a ≤5-char tag. Null is a verified "no FC".
-    Field("Free Company", profile.FreeCompanyName, "Not in a Free Company.", labelWidth);
+    UiTheme.SectionHeader("Character Profile");
+
+    // Free Company — the only source of the FC NAME (the live row carries only a ≤5-char tag), with its 3-layer
+    // Lodestone crest beside it. A null name is a verified "no FC", drawn as its own sentence.
+    DrawFreeCompanyField(profile, labelWidth, scale);
 
     // Race is the page sentinel, so it is never absent under Ready. Built from the three glyph-decoded parts.
     var race = Join(" · ", profile.Race, profile.Clan, profile.Gender);
@@ -664,24 +675,127 @@ public sealed class ProfileWindow : Window
 
     Field("Title", profile.Title, "No title equipped.", labelWidth);
 
+    // Grand Company — text only. The GrandCompany sheet carries no icon column (verified), so there is no local
+    // icon to resolve, and inventing one is exactly what part 5 forbids; "company · rank" is the honest render.
     var gc = profile.GrandCompany is { Length: > 0 } company
       ? profile.GrandCompanyRank is { Length: > 0 } rank ? $"{company} · {rank}" : company
       : null;
     // NOT "None" and never a dash: an absent GC could equally be a non-NA region hiding an enlisted player.
     Field("Grand Company", gc, "Not shown on their Lodestone page.", labelWidth);
 
-    // Jobs are NOT here — they are their own tab, because thirty-four levels under these four fields would bury
-    // them. Nameday/Guardian/City-state stay, collapsed, as the trivia they are.
-    ImGui.Dummy(new Vector2(0, 2f * scale));
-    DrawMore(profile, labelWidth);
+    // Nameday, Guardian and City-state are ORDINARY inline fields now, no longer folded away — they are the
+    // character page's own fields alongside the rest. City-state carries its local Town game icon; the other two
+    // are plain text. (City-state is still where they STARTED, not where they are, and nothing on this window
+    // pretends otherwise — the old caveat held that line by wording, not by hiding the field.)
+    Field("Nameday", profile.Nameday, "Not shown on their Lodestone page.", labelWidth);
+    Field("Guardian", profile.Guardian, "Not shown on their Lodestone page.", labelWidth);
+    DrawCityStateField(profile, labelWidth, scale);
+
+    // Jobs are NOT here — they are their own tab, because thirty-four levels under these fields would bury them.
   }
 
   /// <summary>
-  /// Jobs and levels: a two-column grid, levelled first, under a heading that carries the "n of N" summary.
+  /// The Free Company row: the 3-layer Lodestone crest, then the name — or the verified "no FC" sentence.
   ///
-  /// A dash, not a zero, and a sentence to explain it: an unlevelled slot is a REAL state, distinct from a job
-  /// that failed to parse, and the whole point of capturing "-" rather than "" is to keep the two apart. Zero
-  /// jobs is Failed-shaped, not a fact about them, so it says the page changed shape.
+  /// The crest is three PNGs (background, emblem, frame) drawn OVERLAID on one line-high rect via the draw list,
+  /// the same AddImage path the avatar uses — ImGui.Image would lay them side by side. They exist only once the
+  /// profile is loaded and only when there actually is an FC, so nothing here is ever speculative.
+  /// </summary>
+  private static void DrawFreeCompanyField(CharacterProfile profile, float labelWidth, float scale)
+  {
+    UiTheme.TextWrappedColored(UiTheme.Muted, "Free Company");
+    ImGui.SameLine(labelWidth);
+
+    if (profile.FreeCompanyName is not { Length: > 0 } name)
+    {
+      UiTheme.TextWrappedColored(UiTheme.Muted, "Not in a Free Company.");
+      return;
+    }
+
+    if (profile.FreeCompanyCrest is { Count: > 0 } crest)
+    {
+      DrawCrest(crest, scale);
+      ImGui.SameLine(0, 6f * scale);
+    }
+
+    ImGui.TextUnformatted(name);
+  }
+
+  /// <summary>Draws the crest layers overlaid on one text-line-high square and advances the cursor past it. Layer
+  /// 0 (background) first, on the SAME rect — three AddImage calls, because ImGui.Image would place them in a row.
+  /// This is DrawAvatar's own draw-list path, so it leans on no ImGui.Image overload.</summary>
+  private static void DrawCrest(IReadOnlyList<IDalamudTextureWrap> layers, float scale)
+  {
+    var size = ImGui.GetTextLineHeight();
+    var pos = ImGui.GetCursorScreenPos();
+    var draw = ImGui.GetWindowDrawList();
+
+    foreach (var layer in layers)
+      draw.AddImage(layer.Handle, pos, pos + new Vector2(size, size));
+
+    // Claim the square in the layout so the name SameLines correctly after it.
+    ImGui.Dummy(new Vector2(size, size));
+  }
+
+  /// <summary>The City-state row: its local Town game icon, then the name — or the "not shown" sentence. On a
+  /// name that does not resolve to a Town row (or whose texture is not ready yet) the icon is silently omitted
+  /// and the name draws alone; never a guessed icon.</summary>
+  private static void DrawCityStateField(CharacterProfile profile, float labelWidth, float scale)
+  {
+    UiTheme.TextWrappedColored(UiTheme.Muted, "City-state");
+    ImGui.SameLine(labelWidth);
+
+    if (profile.CityState is not { Length: > 0 } city)
+    {
+      UiTheme.TextWrappedColored(UiTheme.Muted, "Not shown on their Lodestone page.");
+      return;
+    }
+
+    if (TownPalette.IconIdOf(city) is { } iconId
+        && Plugin.Textures.TryGetFromGameIcon(new(iconId), out var shared)
+        && shared.TryGetWrap(out var wrap, out _))
+    {
+      var size = ImGui.GetTextLineHeight();
+      ImGui.Image(wrap.Handle, new Vector2(size, size));
+      ImGui.SameLine(0, 6f * scale);
+    }
+
+    ImGui.TextUnformatted(city);
+  }
+
+  /// <summary>
+  /// The Jobs tab's role grouping, as SLOT-INDEX templates over the Lodestone's fixed 34-slot order (verified
+  /// across both captures — slots 0-33 in document order across the four character__level__list blocks).
+  ///
+  /// SLOT INDEX, NOT resolved role, is the grouping key, for one concrete reason: the only base class shared by
+  /// two jobs is Arcanist (Summoner AND Scholar), and they sit in different buckets — a character with neither
+  /// levelled shows "Arcanist" in BOTH slots, indistinguishable by name. Slot is <see cref="JobSlot"/>'s own
+  /// declared stable key; the tooltip text is explicitly not. Icons still come from the sheet name-map, so the
+  /// "no hardcoded ClassJob ids" rule — which is about the icon ids — is kept.
+  ///
+  /// The order within each group is the task's requested job order, which the page's own slot order already
+  /// matches — EXCEPT that Beastmaster sits inside the melee block (slot 14) and Blue Mage inside the mag-ranged
+  /// block (slot 22), so Limited pulls those two out by index; and the page lists crafters (23-30) before
+  /// gatherers (31-33), so this lists gatherers first, as asked.
+  /// </summary>
+  private static readonly (string Role, int[] Slots)[] JobGroups =
+  [
+    ("Tank",            [0, 1, 2, 3]),
+    ("Healer",          [4, 5, 6, 7]),
+    ("Melee",           [8, 9, 10, 11, 12, 13]),
+    ("Physical Ranged", [15, 16, 17]),
+    ("Magical Ranged",  [18, 19, 20, 21]),
+    ("Limited",         [22, 14]),
+    ("Gatherer",        [31, 32, 33]),
+    ("Crafter",         [23, 24, 25, 26, 27, 28, 29, 30]),
+  ];
+
+  /// <summary>
+  /// Jobs and levels, grouped by role in game order, each with its game job icon.
+  ///
+  /// Zero jobs is Failed-shaped, not a fact about them, so it still says the page changed shape. Every slot is
+  /// shown, levelled or not — an unlevelled slot is a REAL state ("——"), the whole reason "-" is captured rather
+  /// than dropped — and the role/game order is kept as-is, NOT sorted levelled-first (spec 2).
   /// </summary>
   private static void DrawJobs(CharacterProfile profile, float scale)
   {
@@ -692,59 +806,59 @@ public sealed class ProfileWindow : Window
       return;
     }
 
+    // Index by Slot so each group pulls its members by position — the disambiguator the tooltip name cannot be
+    // (see JobGroups). A shape change that drops a slot leaves a gap the group skips rather than crashes on.
+    var bySlot = new Dictionary<int, JobSlot>(profile.Jobs.Count);
+    foreach (var job in profile.Jobs)
+      bySlot[job.Slot] = job;
+
     var levelled = profile.Jobs.Count(j => j.Level.HasValue);
-
-    // Separate stable id from the label so a redraw cannot reset the open state. The label carries no '%'.
-    var open = ImGui.TreeNodeEx("ls-jobs", ImGuiTreeNodeFlags.DefaultOpen, "Jobs and levels");
-    ImGui.SameLine(0, 12f * scale);
     UiTheme.TextWrappedColored(UiTheme.Muted, $"{levelled} of {profile.Jobs.Count} levelled");
+    ImGui.Dummy(new Vector2(0, 4f * scale));
 
-    if (!open)
-      return;
+    // Where the level number sits, measured from the line's left edge — past the icon and the widest job name —
+    // so the numbers line up down the whole tab regardless of name length.
+    var levelX = 210f * scale;
 
-    // Levelled first (highest level first, a plain "best first"), then the "-" slots. Slot breaks ties so the
-    // order is stable frame to frame. Column-major into two columns so 34 rows are not one long scroll.
-    var sorted = profile.Jobs
-      .OrderBy(j => j.Level.HasValue ? 0 : 1)
-      .ThenByDescending(j => j.Level ?? 0)
-      .ThenBy(j => j.Slot)
-      .ToList();
-
-    var rows = (sorted.Count + 1) / 2;
-
-    if (ImGui.BeginTable("##ls-jobtable", 4, ImGuiTableFlags.SizingStretchProp))
+    foreach (var (role, slots) in JobGroups)
     {
-      ImGui.TableSetupColumn("##name-a", ImGuiTableColumnFlags.WidthStretch);
-      ImGui.TableSetupColumn("##lv-a", ImGuiTableColumnFlags.WidthFixed);
-      ImGui.TableSetupColumn("##name-b", ImGuiTableColumnFlags.WidthStretch);
-      ImGui.TableSetupColumn("##lv-b", ImGuiTableColumnFlags.WidthFixed);
+      ImGui.TextColored(UiTheme.AccentPurple, role);
 
-      for (var r = 0; r < rows; r++)
+      foreach (var slot in slots)
       {
-        ImGui.TableNextRow();
-        DrawJobCell(sorted, r, 0);
-        DrawJobCell(sorted, r + rows, 2);
+        if (bySlot.TryGetValue(slot, out var job))
+          DrawJobRow(job, levelX, scale);
       }
 
-      ImGui.EndTable();
+      ImGui.Dummy(new Vector2(0, 4f * scale));
     }
 
     UiTheme.TextWrappedColored(UiTheme.Muted, "—— means they have not unlocked or levelled it.");
-    ImGui.TreePop();
   }
 
-  /// <summary>One name/level pair in the job grid, or nothing when the column has run out of jobs.</summary>
-  private static void DrawJobCell(List<JobSlot> sorted, int index, int nameColumn)
+  /// <summary>
+  /// One job: its game icon, name and level on a line.
+  ///
+  /// The icon is resolved from the ClassJob sheet by NAME — a levelled slot's job name OR an unlevelled slot's
+  /// base-class name, both of which the sheet map covers — via ITextureProvider.TryGetFromGameIcon(62100 + id).
+  /// On a name that does not resolve, NO icon is drawn (a wrong icon is worse than none); the square is reserved
+  /// either way so the names stay aligned. "——" for a null level, never "0" or blank: the Lodestone printed "-".
+  /// </summary>
+  private static void DrawJobRow(JobSlot job, float levelX, float scale)
   {
-    if (index >= sorted.Count)
-      return;
+    var size = ImGui.GetTextLineHeight();
 
-    var job = sorted[index];
+    if (JobIconMap.IconIdFor(job.Name) is { } iconId
+        && Plugin.Textures.TryGetFromGameIcon(new(iconId), out var shared)
+        && shared.TryGetWrap(out var wrap, out _))
+      ImGui.Image(wrap.Handle, new Vector2(size, size));
+    else
+      ImGui.Dummy(new Vector2(size, size));
 
-    ImGui.TableSetColumnIndex(nameColumn);
+    ImGui.SameLine(0, 6f * scale);
     ImGui.TextUnformatted(job.Name);
 
-    ImGui.TableSetColumnIndex(nameColumn + 1);
+    ImGui.SameLine(levelX);
     if (job.Level is { } level)
       ImGui.TextUnformatted(level.ToString());
     else
@@ -753,21 +867,81 @@ public sealed class ProfileWindow : Window
   }
 
   /// <summary>
-  /// The collapsed extras. Nameday, Guardian and City-state answer none of the three questions this window is
-  /// for, so they are folded away by default; City-state especially is where they STARTED, kept well clear of
-  /// anything about where they were last seen.
+  /// The field-op levels at the TOP of the Jobs tab, and the state of the SECOND fetch that gets them.
+  ///
+  /// Mirrors the main page's Idle/Looking/Failed handling in DrawLodestoneState, driven from THIS tab's own draw
+  /// so the /class_job/ request is only ever made when the Jobs tab is viewed — and honouring
+  /// AutoLoadLodestoneProfile the same way the main page does: auto-fetch when on, a deliberate button when off.
+  /// Single-flight makes the per-frame call safe: it launches once, then the state is Looking and this returns.
   /// </summary>
-  private static void DrawMore(CharacterProfile profile, float labelWidth)
+  private void DrawFieldOps(WatcherKey key, float scale)
   {
-    if (!ImGui.TreeNodeEx("ls-more", ImGuiTreeNodeFlags.None, "More from their Lodestone"))
+    var fieldOps = Plugin.Lodestone.GetFieldOps(key);
+    switch (fieldOps.State)
+    {
+      case FieldOpFetchState.Idle:
+        // Auto-load, when the user opted into the extra requests. The main page is already Ready by the time this
+        // draws, so this adds exactly one request, and only for a profile whose Jobs tab was actually opened.
+        if (Plugin.Configuration.AutoLoadLodestoneProfile)
+        {
+          Plugin.Lodestone.RequestFieldOps(key, _worldName);
+          UiTheme.TextWrappedColored(UiTheme.Muted, "Loading field-op levels…");
+          return;
+        }
+
+        // The deliberate second click, when auto-load is off — a THIRD Lodestone request in total, so it stays
+        // opt-in exactly like the full page above it.
+        if (ImGui.Button("Load field-op levels"))
+          Plugin.Lodestone.RequestFieldOps(key, _worldName);
+        UiTheme.Tooltip("Eureka, Bozja and Occult Crescent progress lives on a second Lodestone page — one more "
+          + "request to Square Enix, only if you want it.");
+        ImGui.Dummy(new Vector2(0, 6f * scale));
+        return;
+
+      case FieldOpFetchState.Looking:
+        UiTheme.TextWrappedColored(UiTheme.Muted, "Loading field-op levels…");
+        return;
+
+      case FieldOpFetchState.Gone:
+        // Rare — the sub-page exists whenever the main page did. Says nothing about them; a neutral line, no retry.
+        UiTheme.TextWrappedColored(UiTheme.Muted, "Their field-op page could not be found.");
+        ImGui.Dummy(new Vector2(0, 6f * scale));
+        return;
+
+      case FieldOpFetchState.Failed:
+        UiTheme.TextWrappedColored(UiTheme.Muted,
+          "Could not read their field-op levels. This says nothing about them — it is our network, or Square Enix "
+          + "changed the page.");
+        // The only retry path: RequestFieldOps refuses anything but Idle, so without this a transient failure is
+        // permanent for the session. A click, so it stays inside the user-initiated rule; a repaint never retries.
+        if (ImGui.Button("Try again"))
+          Plugin.Lodestone.RetryFieldOps(key, _worldName);
+        ImGui.Dummy(new Vector2(0, 6f * scale));
+        return;
+
+      case FieldOpFetchState.Ready:
+        DrawFieldOpLevels(fieldOps, scale);
+        return;
+    }
+  }
+
+  /// <summary>The three field-op levels, each OMITTED when absent — a character with no field-op progress at all
+  /// draws nothing here (they are supplementary, not a labelled slot that must show "none"). Label + number, no
+  /// icon: the Lodestone's field-op glyphs are webfont, not game icons, so a word is the honest render.</summary>
+  private static void DrawFieldOpLevels(FieldOpProgress fieldOps, float scale)
+  {
+    if (fieldOps.ElementalLevel is null && fieldOps.ResistanceRank is null && fieldOps.KnowledgeLevel is null)
       return;
 
-    const string unknown = "Not shown on their Lodestone page.";
-    Field("Nameday", profile.Nameday, unknown, labelWidth);
-    Field("Guardian", profile.Guardian, unknown, labelWidth);
-    Field("City-state", profile.CityState, unknown, labelWidth);
+    var labelWidth = 150f * scale;
+    if (fieldOps.ElementalLevel is { } elemental)
+      Field("Elemental Level", elemental.ToString(), string.Empty, labelWidth);
+    if (fieldOps.ResistanceRank is { } resistance)
+      Field("Resistance Rank", resistance.ToString(), string.Empty, labelWidth);
+    if (fieldOps.KnowledgeLevel is { } knowledge)
+      Field("Knowledge Level", knowledge.ToString(), string.Empty, labelWidth);
 
-    ImGui.TreePop();
+    ImGui.Dummy(new Vector2(0, 6f * scale));
   }
 
   /// <summary>A Muted label at a fixed column, then the value — or, when the value is null, the sentence naming

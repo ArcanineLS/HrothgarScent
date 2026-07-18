@@ -115,6 +115,70 @@ public sealed class CharacterProfile
 
   /// <summary>Empty under Ready == the page changed shape; all 34 slots always render, or none do.</summary>
   public IReadOnlyList<JobSlot> Jobs { get; set; } = [];
+
+  /// <summary>
+  /// The three Free Company crest layer URLs — background, emblem, frame — in DOM order, which is also bottom-to-
+  /// top draw order. Empty when the character has no Free Company.
+  ///
+  /// Scoped to the crest__image div at parse time, NOT captured page-wide: the character page also carries a
+  /// "top Free Companies" ranking feed of stranger crests (verified: the company-less capture has nine such
+  /// _40x40 PNGs and no crest block), and an unscoped scrape would paint one of THOSE on a company-less player.
+  /// Same sidebar trap the rest of this parser is written against, in image form.
+  /// </summary>
+  public IReadOnlyList<string> FreeCompanyCrestUrls { get; set; } = [];
+
+  /// <summary>
+  /// The crest layers downloaded, or null until fetched (and null when there is no FC, or a layer failed). Drawn
+  /// overlaid on ONE rect, layer 0 first. THE ONE THING <see cref="LodestoneService"/>'s profile cache holds that
+  /// owns a GPU texture — so unlike every string here it must be disposed, in Clear and on a generation miss, or
+  /// the logout race leaks it exactly as the face would.
+  /// </summary>
+  public IReadOnlyList<IDalamudTextureWrap>? FreeCompanyCrest { get; set; }
+}
+
+/// <summary>
+/// State of the FIELD-OPERATION fetch — Eureka, Bozja and Occult Crescent progress, which lives ONLY on the
+/// character's /class_job/ sub-page and never on the main page. A machine of its own, mirroring
+/// <see cref="ProfileFetchState"/>, because it is a third independent network fact: a second on-demand request,
+/// fired only when the Jobs tab is actually viewed, so a profile opened only to Info or Notes never spends it.
+/// </summary>
+public enum FieldOpFetchState : byte
+{
+  /// <summary>Nobody has viewed the Jobs tab (or clicked Load). No request made and none will be until they do.</summary>
+  Idle,
+
+  /// <summary>In flight.</summary>
+  Looking,
+
+  /// <summary>The sub-page was fetched AND its identity re-checked. Any of the three levels may still be null —
+  /// that is a character with no field-op progress, a legitimate Ready, not a parse gap.</summary>
+  Ready,
+
+  /// <summary>The sub-page 404s. Rare — it exists whenever the main page did — and says nothing about them.</summary>
+  Gone,
+
+  /// <summary>Network, rate limit, the page changed shape, OR it failed the identity re-check. Says NOTHING about
+  /// the player: a page that is about someone else settles here, never Ready-with-null-levels.</summary>
+  Failed,
+}
+
+/// <summary>
+/// One player's field-operation progress, parsed from the /class_job/ sub-page. Each level null == that content
+/// not started, a real state omitted from the display, never a placeholder. Holds no textures — strings and ints
+/// only — so its cache only needs clearing, not disposing.
+/// </summary>
+public sealed class FieldOpProgress
+{
+  public FieldOpFetchState State { get; set; } = FieldOpFetchState.Idle;
+
+  /// <summary>Eureka's "Elemental Level".</summary>
+  public int? ElementalLevel { get; set; }
+
+  /// <summary>Bozja's "Resistance Rank".</summary>
+  public int? ResistanceRank { get; set; }
+
+  /// <summary>Occult Crescent's "Knowledge Level".</summary>
+  public int? KnowledgeLevel { get; set; }
 }
 
 /// <summary>
@@ -256,6 +320,32 @@ public sealed class LodestoneService : IDisposable
     """class="js__tooltip"\s*data-tooltip="([^"]+)">(\d+|-)</li>""", RegexOptions.Compiled);
 
   /// <summary>
+  /// The Free Company crest: the crest__image div and everything up to its close. Scoped FIRST, because the
+  /// three layer &lt;img&gt;s inside it are the ONLY _40x40 crest PNGs on the page that belong to this player —
+  /// the rest are a stranger "top FCs" ranking feed. Singleline so the capture spans the three img tags; g1 is
+  /// then re-scanned by <see cref="CrestLayerPattern"/>. A character with no FC renders no such div, so the
+  /// capture simply fails and the layer list stays empty.
+  /// </summary>
+  private static readonly Regex FreeCompanyCrestPattern = new(
+    """character__freecompany__crest__image">(.*?)</div>""",
+    RegexOptions.Singleline | RegexOptions.Compiled);
+
+  /// <summary>One crest layer URL, read only from inside the <see cref="FreeCompanyCrestPattern"/> capture. The
+  /// img digit is not pinned (img1..imgN), matching the face pattern's reasoning.</summary>
+  private static readonly Regex CrestLayerPattern = new(
+    """src="(https://img\d\.finalfantasyxiv\.com/c/[^"]+_40x40\.png)""", RegexOptions.Compiled);
+
+  /// <summary>
+  /// One field-op level on the /class_job/ sub-page: "Elemental Level" (Eureka), "Resistance Rank" (Bozja) or
+  /// "Knowledge Level" (Occult Crescent). Anchored on the PLAIN character__job__name div — a real job on this
+  /// same page carries character__job__name js__tooltip, so this can never catch one — and the alternation pins
+  /// it to exactly the three field-op labels. g1 is the level, g2 the label.
+  /// </summary>
+  private static readonly Regex FieldOpPattern = new(
+    """character__job__level">(\d+)</div>\s*<div class="character__job__name">(Elemental Level|Resistance Rank|Knowledge Level)</div>""",
+    RegexOptions.Compiled);
+
+  /// <summary>
   /// Guards <see cref="_cache"/>. Written by Draw (which calls <see cref="Request"/>) and by the completion of
   /// an async lookup on a thread-pool thread, so the two genuinely race. Uncontended in practice — a handful of
   /// entries, touched on a click.
@@ -279,6 +369,15 @@ public sealed class LodestoneService : IDisposable
   /// record, exactly as <see cref="_cache"/> does.
   /// </summary>
   private readonly Dictionary<WatcherKey, CharacterProfile> _profiles = [];
+
+  /// <summary>
+  /// Every player whose /class_job/ sub-page was asked about this session — the field-op levels. A THIRD
+  /// dictionary under the same <see cref="_gate"/>, separate from <see cref="_profiles"/> so a sub-page failure
+  /// can never touch the main page above it, and so the extra request it represents is only ever made for a
+  /// profile whose Jobs tab was actually opened. In memory, never persisted, wiped in <see cref="Clear"/> at
+  /// logout on the same terms as the rest. Doubles as the single-flight record, exactly as the others do.
+  /// </summary>
+  private readonly Dictionary<WatcherKey, FieldOpProgress> _fieldOps = [];
 
   private bool _disposed;
 
@@ -514,6 +613,12 @@ public sealed class LodestoneService : IDisposable
         return;
       }
 
+      // The FC crest is three MORE requests — the most any one profile load adds — so they fire only HERE, after
+      // a parse that actually found crest URLs (a company-less character has none), never speculatively and never
+      // for a list. They ride the same generation guard: SettleProfile disposes the wraps on a gen miss.
+      if (profile.FreeCompanyCrestUrls.Count > 0)
+        profile.FreeCompanyCrest = await FetchCrest(profile.FreeCompanyCrestUrls).ConfigureAwait(false);
+
       SettleProfile(key, profile, gen);
     }
     catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
@@ -530,6 +635,48 @@ public sealed class LodestoneService : IDisposable
       Plugin.Log.Warning(ex, "Lodestone character page failed");
       SettleProfile(key, new CharacterProfile { State = ProfileFetchState.Failed }, gen);
     }
+  }
+
+  /// <summary>
+  /// Downloads the crest layers and uploads them, or returns null if any layer fails.
+  ///
+  /// Catches its OWN exceptions rather than letting them fail the profile: a crest is a decoration and the FC
+  /// name still shows without it, so a network hiccup on a 40x40 PNG must not turn a good page into Failed. Drops
+  /// whatever loaded before the failure so a half-set of layers is never drawn — three or none, like the page.
+  /// The uploads use the same any-thread CreateFromImageAsync door the face does.
+  /// </summary>
+  private static async Task<IReadOnlyList<IDalamudTextureWrap>?> FetchCrest(IReadOnlyList<string> urls)
+  {
+    var wraps = new List<IDalamudTextureWrap>(urls.Count);
+    try
+    {
+      foreach (var url in urls)
+      {
+        var bytes = await Http.GetByteArrayAsync(url).ConfigureAwait(false);
+        wraps.Add(await Plugin.Textures.CreateFromImageAsync(bytes).ConfigureAwait(false));
+      }
+
+      return wraps;
+    }
+    catch (Exception ex)
+    {
+      Plugin.Log.Warning(ex, "Lodestone FC crest fetch failed");
+      foreach (var wrap in wraps)
+        wrap.Dispose();
+      return null;
+    }
+  }
+
+  /// <summary>Frees a profile's crest layers, if it carried any. The one texture-owning field on
+  /// <see cref="CharacterProfile"/>, so this is called wherever a profile is dropped — Clear, and the
+  /// SettleProfile generation-miss branch — exactly as the face texture is.</summary>
+  private static void DisposeCrest(CharacterProfile profile)
+  {
+    if (profile.FreeCompanyCrest is not { } crest)
+      return;
+
+    foreach (var wrap in crest)
+      wrap.Dispose();
   }
 
   /// <summary>
@@ -617,8 +764,30 @@ public sealed class LodestoneService : IDisposable
       profile.CityState = WebUtility.HtmlDecode(cs.Groups[1].Value).Trim();
 
     profile.Jobs = ParseJobs(html);
+    profile.FreeCompanyCrestUrls = ParseCrestUrls(html);
 
     return profile;
+  }
+
+  /// <summary>
+  /// The three Free Company crest layer URLs, in draw order, or empty when there is no FC.
+  ///
+  /// Scoped to the crest__image div FIRST and the layers read only from inside it — the page's stranger "top FCs"
+  /// ranking feed carries the same _40x40 crest PNGs, and a page-wide scrape returns one of those on a company-
+  /// less character. The div is absent when there is no FC, so the capture fails and this returns empty, matching
+  /// <see cref="CharacterProfile.FreeCompanyName"/>'s own null in that case.
+  /// </summary>
+  private static IReadOnlyList<string> ParseCrestUrls(string html)
+  {
+    var block = FreeCompanyCrestPattern.Match(html);
+    if (!block.Success)
+      return [];
+
+    var urls = new List<string>(3);
+    foreach (Match layer in CrestLayerPattern.Matches(block.Groups[1].Value))
+      urls.Add(layer.Groups[1].Value);
+
+    return urls;
   }
 
   /// <summary>
@@ -685,11 +854,195 @@ public sealed class LodestoneService : IDisposable
     {
       // Disposed at unload, or the session cleared out from under this fetch at logout (gen moved). Nothing will
       // ever draw it, and keeping it would carry a just-ended session's stranger into the next — the persistence
-      // rule this whole cache is written to keep. See _generation.
+      // rule this whole cache is written to keep. See _generation. The crest layers this fetch just built are
+      // ours; dropping them here is what stops that same race from leaking a stranger's crest past the Dispose
+      // that should have freed it, exactly as the face Settle does with its texture.
+      if (_disposed || gen != _generation)
+      {
+        DisposeCrest(profile);
+        return;
+      }
+
+      _profiles[key] = profile;
+    }
+  }
+
+  // ── The /class_job/ sub-page: a THIRD lookup, on the id the face already verified, for the field-op levels the
+  //    main page does not carry. Its own state, dictionary, settle and regexes, sharing only the generation guard
+  //    and Clear() with the two above; fired only from the Jobs tab so it is never spent on a profile not opened
+  //    to Jobs. ──────────────────────────────────────────────────────────────────────────────────────────────
+
+  /// <summary>What is known about this player's field-op levels right now. Safe every frame; never starts
+  /// anything — mirrors <see cref="GetProfile"/>.</summary>
+  public FieldOpProgress GetFieldOps(WatcherKey key)
+  {
+    lock (_gate)
+      return _fieldOps.TryGetValue(key, out var progress) ? progress : new FieldOpProgress();
+  }
+
+  /// <summary>
+  /// Asks the Lodestone for this player's /class_job/ sub-page, once, using the id the FACE match verified.
+  ///
+  /// Refuses unless the face is <see cref="PortraitState.Ready"/> with a non-zero id — same gate as
+  /// <see cref="RequestProfile"/>, and for the same reason: the sub-page is fetched by that id and NEVER by a
+  /// re-search. Single-flighted exactly like the others — flip to Looking BEFORE the request so a tab redrawing
+  /// sixty times a second asks once. THE ONE ADDITIONAL REQUEST the Jobs tab makes; do not call it from a list,
+  /// a scan, a timer, or Open — only from the Jobs tab's own draw.
+  /// </summary>
+  public void RequestFieldOps(WatcherKey key, string worldName)
+  {
+    uint characterId;
+    int gen;
+    lock (_gate)
+    {
+      // No verified face, no sub-page. The id is the only thing that reaches the network, and it must have come
+      // from the three-condition face match, not a fresh search.
+      if (!_cache.TryGetValue(key, out var portrait)
+          || portrait.State != PortraitState.Ready || portrait.CharacterId == 0)
+        return;
+
+      characterId = portrait.CharacterId;
+
+      // Single-flight: anything but Idle has been asked already.
+      if (_fieldOps.TryGetValue(key, out var existing) && existing.State != FieldOpFetchState.Idle)
+        return;
+
+      _fieldOps[key] = new FieldOpProgress { State = FieldOpFetchState.Looking };
+      gen = _generation;
+    }
+
+    // Fire-and-forget: nothing waits for this. FetchFieldOps catches its own exceptions.
+    _ = Task.Run(() => FetchFieldOps(key, worldName, characterId, gen));
+  }
+
+  /// <summary>
+  /// Retries a sub-page fetch that FAILED — the one path back to Idle, and a click, never a repaint. Mirrors
+  /// <see cref="RetryProfile"/>: <see cref="RequestFieldOps"/> refuses anything but Idle, so a transient failure
+  /// would otherwise be permanent for the session. Gone is a fact, not a fault, so it is not reset.
+  /// </summary>
+  public void RetryFieldOps(WatcherKey key, string worldName)
+  {
+    lock (_gate)
+    {
+      if (_fieldOps.TryGetValue(key, out var existing) && existing.State == FieldOpFetchState.Failed)
+        _fieldOps[key] = new FieldOpProgress { State = FieldOpFetchState.Idle };
+    }
+
+    RequestFieldOps(key, worldName);
+  }
+
+  private async Task FetchFieldOps(WatcherKey key, string worldName, uint characterId, int gen)
+  {
+    try
+    {
+      var url = $"https://{Region()}.finalfantasyxiv.com/lodestone/character/{characterId}/class_job/";
+
+      // UTF-8 explicitly, matching FetchProfile: a charset guess is not worth the risk on a page read for exact
+      // labels and numbers.
+      var bytes = await Http.GetByteArrayAsync(url).ConfigureAwait(false);
+      var html = Encoding.UTF8.GetString(bytes);
+
+      if (ParseFieldOps(html, key, worldName) is not { } progress)
+      {
+        // The page is about someone else, or its shape changed. Failed, whose contract is "says nothing about the
+        // player" — never Ready with null levels, which would assert "no field-op progress" about a page we could
+        // not even confirm is theirs.
+        SettleFieldOps(key, new FieldOpProgress { State = FieldOpFetchState.Failed }, gen);
+        return;
+      }
+
+      SettleFieldOps(key, progress, gen);
+    }
+    catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+    {
+      // A 404 on an id resolved moments ago: the sub-page is gone. Its own state, never the face's Missing.
+      SettleFieldOps(key, new FieldOpProgress { State = FieldOpFetchState.Gone }, gen);
+    }
+    catch (Exception ex)
+    {
+      Plugin.Log.Warning(ex, "Lodestone class_job sub-page failed");
+      SettleFieldOps(key, new FieldOpProgress { State = FieldOpFetchState.Failed }, gen);
+    }
+  }
+
+  /// <summary>
+  /// Parses the /class_job/ sub-page's field-op levels, or returns null so the caller settles
+  /// <see cref="FieldOpFetchState.Failed"/>.
+  ///
+  /// THE SENTINEL DIFFERS FROM THE MAIN PAGE. The Race/Clan/Gender block is ABSENT here (verified), so this must
+  /// NOT reuse it — the guard is the IDENTITY RE-CHECK alone: the page's own printed name and world must
+  /// Ordinal-match the person asked for, exactly as ParseProfile does, or the page is rejected. That is what
+  /// keeps the field-op read honest against a sub-page that failed to load into the activity-feed shell.
+  ///
+  /// THE SIDEBAR TRAP, again: this page carries the same global stranger activity feed. The field-op scrape is
+  /// anchored to the main content by slicing off everything from the first ldst__side — the feed's container —
+  /// mirroring JobListPattern's scope-then-scan. (Belt-and-braces: a real job's name div carries js__tooltip and
+  /// the field-op div does not, so the pattern already cannot catch a job — but the slice matches the discipline
+  /// the rest of this file keeps.)
+  /// </summary>
+  private static FieldOpProgress? ParseFieldOps(string html, WatcherKey key, string worldName)
+  {
+    var pageName = ProfileNamePattern.Match(html);
+    var pageWorld = ProfileWorldPattern.Match(html);
+    if (!pageName.Success || !pageWorld.Success)
+      return null;
+
+    // Ordinal, never a culture compare — the same rule the face Match and ParseProfile follow.
+    var name = WebUtility.HtmlDecode(pageName.Groups[1].Value).Trim();
+    if (!string.Equals(name, key.Name, StringComparison.Ordinal))
+    {
+      Plugin.Log.Warning("Lodestone class_job page name mismatch: page '{Page}', expected '{Expected}'",
+        name, key.Name);
+      return null;
+    }
+
+    var world = WebUtility.HtmlDecode(pageWorld.Groups[1].Value).Trim();
+    var bracket = world.IndexOf('[');
+    if (bracket > 0)
+      world = world[..bracket].Trim();
+
+    if (!string.Equals(world, worldName, StringComparison.Ordinal))
+    {
+      Plugin.Log.Warning("Lodestone class_job page world mismatch: page '{Page}', expected '{Expected}'",
+        world, worldName);
+      return null;
+    }
+
+    // Slice off the stranger activity feed before scanning; fall back to the whole page if the marker is absent.
+    var side = html.IndexOf("ldst__side", StringComparison.Ordinal);
+    var main = side > 0 ? html[..side] : html;
+
+    var progress = new FieldOpProgress { State = FieldOpFetchState.Ready };
+    foreach (Match m in FieldOpPattern.Matches(main))
+    {
+      // int.TryParse guards a shape change; the regex already pins g1 to \d+.
+      if (!int.TryParse(m.Groups[1].Value, out var level))
+        continue;
+
+      switch (m.Groups[2].Value)
+      {
+        case "Elemental Level": progress.ElementalLevel = level; break;
+        case "Resistance Rank": progress.ResistanceRank = level; break;
+        case "Knowledge Level": progress.KnowledgeLevel = level; break;
+      }
+    }
+
+    // A page that passed identity but listed no field-op progress settles Ready with all three null — a real
+    // "they have done none of this", omitted from the display, not a failure.
+    return progress;
+  }
+
+  private void SettleFieldOps(WatcherKey key, FieldOpProgress progress, int gen)
+  {
+    lock (_gate)
+    {
+      // Disposed at unload, or the session cleared under this fetch at logout (gen moved). Holds no textures, so
+      // unlike SettleProfile there is nothing to dispose — just refuse to resurrect a just-ended session's
+      // stranger. See _generation.
       if (_disposed || gen != _generation)
         return;
 
-      _profiles[key] = profile;
+      _fieldOps[key] = progress;
     }
   }
 
@@ -716,9 +1069,16 @@ public sealed class LodestoneService : IDisposable
         portrait.Texture?.Dispose();
       _cache.Clear();
 
-      // The character-page cache dies with the session too. It holds no textures — just parsed strings — so it
-      // only needs clearing, not disposing, but it dies here for the same reason and on the same terms.
+      // The character-page cache dies with the session too. It now holds the FC crest textures, so — unlike
+      // before — it must be DISPOSED, not merely cleared: the crest layers are ours exactly as the face is, and
+      // leaking them past logout is the same fault, one dictionary over.
+      foreach (var profile in _profiles.Values)
+        DisposeCrest(profile);
       _profiles.Clear();
+
+      // The field-op sub-page cache dies with the session on the same terms. Ints and strings only — no textures
+      // — so it only needs clearing.
+      _fieldOps.Clear();
 
       // Past this point, any fetch launched before now belongs to a session that has ended: bumping the
       // generation makes its settle a no-op instead of a resurrection. Under the lock, so a settle cannot read
