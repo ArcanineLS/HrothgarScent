@@ -151,6 +151,60 @@ public sealed class AlertService
   /// </summary>
   private readonly Dictionary<SignalClass, SignalOutcome> _lastJournalled = [];
 
+  /// <summary>
+  /// Guards <see cref="_quieted"/>: the render thread toggles it from a row menu, the framework thread reads it
+  /// on every raise. A HashSet mutated on one thread and read on another tears — the same race, and the same
+  /// answer, as <see cref="WatcherLog"/>'s gate. Uncontended in practice: a click against a handful of reads.
+  /// </summary>
+  private readonly object _quietGate = new();
+
+  /// <summary>
+  /// Players the user has said "I have seen this one, stop interrupting me" about, for this session only.
+  ///
+  /// A STRICTLY WEAKER, EPHEMERAL SIBLING OF IGNORE, and the difference is the whole point. Ignore is the
+  /// plugin's oldest promise — "never show or announce them again" — durable, absolute, and it hides the player
+  /// from every surface. This hides nothing: a quieted watcher still sits in the list, still wears the eye,
+  /// still counts. Only the ALERT is suppressed, and only until logout. It fills the gap Ignore is too strong
+  /// for — the friend cycling targets, the passer-by the user has assessed and is fine with — so the permanent
+  /// tool stays reserved for the players who have earned it, instead of being reached for out of annoyance.
+  ///
+  /// In memory, dies at logout, never written down: a stranger the user merely stopped being pinged about did
+  /// not consent to a durable record any more than a watcher did. See <see cref="ClearQuieted"/> and the
+  /// persistence rule the whole plugin keeps.
+  /// </summary>
+  private readonly HashSet<WatcherKey> _quieted = [];
+
+  /// <summary>Whether alerts about this player are quieted for the session. Safe from any thread.</summary>
+  public bool IsQuieted(WatcherKey key)
+  {
+    lock (_quietGate)
+      return _quieted.Contains(key);
+  }
+
+  /// <summary>
+  /// Flips the session-quiet on this player. One click, because the state has two values and no third to
+  /// disambiguate — the same coarseness the mark toggle keeps for the same reason.
+  /// </summary>
+  /// <returns>The new state: true if now quieted.</returns>
+  public bool ToggleQuiet(WatcherKey key)
+  {
+    lock (_quietGate)
+    {
+      if (_quieted.Remove(key))
+        return false;
+      _quieted.Add(key);
+      return true;
+    }
+  }
+
+  /// <summary>Forgets every session-quiet, at logout. The world these judgements were about has ended, and
+  /// keeping them would carry one session's "I'm fine with this stranger" into the next.</summary>
+  public void ClearQuieted()
+  {
+    lock (_quietGate)
+      _quieted.Clear();
+  }
+
   /// <summary>One class's waiting signal.</summary>
   private sealed class PendingSignal
   {
@@ -230,6 +284,7 @@ public sealed class AlertService
 
     var marks = Plugin.Marks.Index;
     var filtered = 0;
+    var quieted = 0;
 
     foreach (var escalation in escalations)
     {
@@ -249,12 +304,26 @@ public sealed class AlertService
         continue;
       }
 
+      // Quieted counts and spends the rung exactly as the filters above do — the user has assessed this player
+      // and asked not to be interrupted, so a held rung must not resurface the moment the quiet is lifted. Its
+      // own count and reason, because "you quieted this one" is a different thing the user did than "you set a
+      // rule" and the journal must not blur the two.
+      if (IsQuieted(row.Key))
+      {
+        escalation.State.Level = escalation.Level;
+        quieted++;
+        continue;
+      }
+
       Offer(SignalClass.StareEscalation, row, escalation.Level, escalation.HeldMs, escalation.State);
     }
 
     if (filtered > 0)
       Plugin.Journal.Record(SignalClass.StareEscalation, SignalOutcome.Filtered, filtered,
         "you asked not to hear about them");
+    if (quieted > 0)
+      Plugin.Journal.Record(SignalClass.StareEscalation, SignalOutcome.Filtered, quieted,
+        "quieted for this session");
   }
 
   /// <summary>
@@ -278,6 +347,7 @@ public sealed class AlertService
 
     var marks = Plugin.Marks.Index;
     var filtered = 0;
+    var quieted = 0;
 
     foreach (var row in fresh)
     {
@@ -293,12 +363,21 @@ public sealed class AlertService
         continue;
       }
 
+      if (IsQuieted(row.Key))
+      {
+        quieted++;
+        continue;
+      }
+
       Offer(SignalClass.NewWatcher, row);
     }
 
     if (filtered > 0)
       Plugin.Journal.Record(SignalClass.NewWatcher, SignalOutcome.Filtered, filtered,
         "you asked not to hear about them");
+    if (quieted > 0)
+      Plugin.Journal.Record(SignalClass.NewWatcher, SignalOutcome.Filtered, quieted,
+        "quieted for this session");
   }
 
   /// <summary>
@@ -322,6 +401,7 @@ public sealed class AlertService
 
     var marks = Plugin.Marks.Index;
     var filtered = 0;
+    var quieted = 0;
 
     foreach (var row in arrived)
     {
@@ -334,11 +414,24 @@ public sealed class AlertService
         continue;
       }
 
+      // Quieted applies to a focused arrival too: focus says "tell me when this person shows up", quiet says
+      // "not for now" — the more recent, weaker judgement wins for the session, and Ignore above still overrules
+      // both. A focused player is the most likely to be quieted, because they are the ones you asked to hear
+      // about and so the ones who can become too much in a crowd.
+      if (IsQuieted(row.Key))
+      {
+        quieted++;
+        continue;
+      }
+
       Offer(SignalClass.FocusArrival, row);
     }
 
     if (filtered > 0)
       Plugin.Journal.Record(SignalClass.FocusArrival, SignalOutcome.Filtered, filtered, "on the ignore list");
+    if (quieted > 0)
+      Plugin.Journal.Record(SignalClass.FocusArrival, SignalOutcome.Filtered, quieted,
+        "quieted for this session");
   }
 
   /// <summary>
@@ -516,6 +609,7 @@ public sealed class AlertService
       // Counted per class, never journalled per subject: a filtered 24-man alliance would otherwise be
       // twenty-four rows every scan, which is the whole ring twice a second. The count IS the entry.
       var ignored = 0;
+      var quieted = 0;
       var expired = 0;
       var stale = 0;
 
@@ -527,6 +621,17 @@ public sealed class AlertService
           SpendOne(subject);
           (gone ??= []).Add(key);
           ignored++;
+          continue;
+        }
+
+        // Quieted since it was raised — the user clicked "stop pinging me about this one" while it sat in the
+        // cooldown. A refusal like ignore: spend the rung and drop it, or the quiet would take effect only on
+        // the NEXT episode and this one would still fire the instant the cooldown lifts.
+        if (IsQuieted(key))
+        {
+          SpendOne(subject);
+          (gone ??= []).Add(key);
+          quieted++;
           continue;
         }
 
@@ -552,6 +657,8 @@ public sealed class AlertService
       // ("something was eaten, and this rule ate it") without reopening the roster.
       if (ignored > 0)
         Plugin.Journal.Record(signalClass, SignalOutcome.Filtered, ignored, "on the ignore list");
+      if (quieted > 0)
+        Plugin.Journal.Record(signalClass, SignalOutcome.Filtered, quieted, "quieted for this session");
       if (expired > 0)
         Plugin.Journal.Record(signalClass, SignalOutcome.Expired, expired, "waited too long to still be news");
       if (stale > 0)

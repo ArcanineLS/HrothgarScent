@@ -739,6 +739,10 @@ public sealed class Plugin : IDalamudPlugin
     // rather than easier.
     Lodestone.Clear();
 
+    // The session-quiet judgements ("I've seen this stranger, I'm fine") go with the session that formed them,
+    // on the same rule: a stranger the user merely stopped being pinged about earned no durable record.
+    Alerts.ClearQuieted();
+
     Marks.Flush();
     ScentWindow.IsOpen = false;
 

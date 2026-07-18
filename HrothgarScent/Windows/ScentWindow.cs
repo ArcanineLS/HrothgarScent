@@ -1969,6 +1969,17 @@ public sealed class ScentWindow : Window
                       "they come into range. Undo it here or in the config window's Filters tab.");
     }
 
+    // The soft, temporary sibling of Ignore, placed right above it so the two read as an escalation: quiet them
+    // for now, or ignore them for good. It touches the alert bus, not the mark store — nothing is written down,
+    // they stay in the list with their eye, and it is forgotten at logout. See AlertService's _quieted.
+    var quieted = Plugin.Alerts.IsQuieted(row.Key);
+    if (ImGui.Selectable(quieted ? "Stop quieting alerts" : "Quiet alerts this session"))
+      Plugin.Alerts.ToggleQuiet(row.Key);
+    UiTheme.Tooltip(quieted
+      ? "Alerts about this one are muted for the session. Click to start hearing them again."
+      : "Seen this one and you're fine with them? Stop the alerts but keep them in the list, with their eye — "
+      + "for this session only. Not the permanent Ignore below.");
+
     if (ImGui.Selectable("Ignore this player"))
       Plugin.Marks.Update(row.Key, row.HomeWorldName, mark => mark with { Marks = mark.Marks | MarkKind.Ignore });
     UiTheme.Tooltip("Never show or announce them again. Beats Focus if they carry both. Undo it in the config " +
