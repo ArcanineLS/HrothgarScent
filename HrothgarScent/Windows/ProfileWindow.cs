@@ -145,6 +145,14 @@ public sealed class ProfileWindow : Window
     DrawHeader(key, mark, row, scale);
     ImGui.Dummy(new Vector2(0, 6f * scale));
 
+    // The published identity, right under the face it extends — the face is itself from the Lodestone, so this
+    // reads as one block: who they are, live and published. Placed ABOVE the note deliberately: the note
+    // stretches to fill the window, so a section under it would sit permanently below the fold, and the
+    // "Load their full profile" button has to be reachable without a scroll. Its own state machine; fetched only
+    // on a click (spec 2.5, 5.4).
+    DrawLodestone(key, row, scale);
+    ImGui.Dummy(new Vector2(0, 6f * scale));
+
     // BUILT BEFORE IT IS DRAWN, because the note stretches to meet it and therefore has to know how tall it will
     // be. Its height is not a constant: a sighting is two short lines, but every "why there is no sighting"
     // branch is a wrapped paragraph, and reserving two lines for four would push the answer below the fold in
@@ -466,6 +474,275 @@ public sealed class ProfileWindow : Window
     };
     UiTheme.Tooltip(tip);
   }
+
+  /// <summary>
+  /// "Their Lodestone" — the published character page, and the ONE user-initiated fetch of it.
+  ///
+  /// Seven outer states, and the order is load-bearing: the empty-world and settings checks come BEFORE the face
+  /// state, because a lookup that was never started (an empty world early-returns in the service) must not read
+  /// as "not looked up" beside a dead button. Only once the face is Ready — the face is what carries the
+  /// verified character id — does the character page become reachable, behind an explicit button (spec 2.5).
+  /// </summary>
+  private void DrawLodestone(WatcherKey key, ScentRow? row, float scale)
+  {
+    UiTheme.SectionHeader("Their Lodestone", FontAwesomeIcon.Cloud, UiTheme.Muted);
+    UiTheme.TextWrappedColored(UiTheme.Muted, "Published by them. As of their last logout, not right now.");
+    ImGui.Dummy(new Vector2(0, 3f * scale));
+
+    if (_worldName.Length == 0)
+    {
+      UiTheme.TextWrappedColored(UiTheme.Muted,
+        "No home world known for them, and a name alone is not an identity — two players on different worlds "
+        + "can share one.");
+      return;
+    }
+
+    if (!Plugin.Configuration.ShowLodestonePortraits)
+    {
+      UiTheme.TextWrappedColored(UiTheme.Muted, "Lodestone lookups are switched off in settings.");
+      return;
+    }
+
+    var portrait = Plugin.Lodestone.Get(key);
+    switch (portrait.State)
+    {
+      case PortraitState.Idle:
+        // Reachable only if Open() skipped the face request. Open() always requests today, so this is a
+        // defensive branch; it offers to start the lookup rather than showing a dead "not looked up".
+        if (ImGui.Button("Look them up"))
+          Plugin.Lodestone.Request(key, _worldName);
+        return;
+
+      case PortraitState.Looking:
+        UiTheme.TextWrappedColored(UiTheme.Muted, "Looking them up…");
+        return;
+
+      case PortraitState.Missing:
+        // THREE indistinguishable causes — private, renamed, transferred — all return the same zero results.
+        // Name them all and claim none: a precise explanation of the WRONG nothing carries false authority and
+        // is worse than a vague one. (This is the bug the portrait tooltip already had to fix; do not reintroduce
+        // it by picking one cause.)
+        UiTheme.TextWrappedColored(UiTheme.Warn,
+          $"The Lodestone lists nobody called {key.Name} on {_worldName}. Their profile may be private, or they "
+          + "may have renamed or transferred — a search cannot tell these apart. If you know they renamed, use "
+          + "Renamed? in settings to point the mark at who they are now.");
+        return;
+
+      case PortraitState.Failed:
+        UiTheme.TextWrappedColored(UiTheme.Muted,
+          "Could not reach the Lodestone. This says nothing about them — it is our network, not their profile.");
+        return;
+
+      case PortraitState.Ready:
+        DrawLodestoneProfile(key, row, scale);
+        return;
+    }
+  }
+
+  /// <summary>
+  /// The character-page sub-state, shown only once the face is Ready (so the verified id exists). Its own state
+  /// machine: a page 404 is <see cref="ProfileFetchState.Gone"/>, never the face's Missing, so a second failure
+  /// never erases the face already on screen (spec 5.4).
+  /// </summary>
+  private void DrawLodestoneProfile(WatcherKey key, ScentRow? row, float scale)
+  {
+    var profile = Plugin.Lodestone.GetProfile(key);
+    switch (profile.State)
+    {
+      case ProfileFetchState.Idle:
+        // The one deliberate fetch. Never on Open, never on a timer, never for a list (spec 4-E).
+        if (ImGui.Button("Load their full profile"))
+          Plugin.Lodestone.RequestProfile(key, _worldName);
+        UiTheme.Tooltip("Fetches their public character page: Free Company, race, title, Grand Company and every "
+          + "job's level. None of this is in the game client.");
+        UiTheme.TextWrappedColored(UiTheme.Muted,
+          "One more request to Square Enix. There is no API here, so this stays a click, not automatic.");
+        return;
+
+      case ProfileFetchState.Looking:
+        UiTheme.TextWrappedColored(UiTheme.Muted, "Loading their profile…");
+        return;
+
+      case ProfileFetchState.Gone:
+        // The face stays on screen above — it was still found; only the full page is gone.
+        UiTheme.TextWrappedColored(UiTheme.Warn,
+          "Their Lodestone page is gone. The character has been deleted, or renamed far enough that Square Enix "
+          + "dropped the page. If you know they renamed, use Renamed? in settings.");
+        return;
+
+      case ProfileFetchState.Failed:
+        UiTheme.TextWrappedColored(UiTheme.Muted,
+          "Could not read their profile page. This says nothing about them — it is our network, or Square Enix "
+          + "changed the page.");
+        // The ONLY retry path: RequestProfile refuses anything but Idle, so without this a transient failure is
+        // permanent for the session. A click, so it stays inside the user-initiated rule; a repaint never retries.
+        if (ImGui.Button("Try again"))
+          Plugin.Lodestone.RetryProfile(key, _worldName);
+        return;
+
+      case ProfileFetchState.Ready:
+        DrawProfileFields(row, profile, scale);
+        return;
+    }
+  }
+
+  /// <summary>
+  /// The parsed fields under Ready. Every absence is spelled out as its own sentence naming WHICH nothing it is,
+  /// never left blank — a blank in a labelled section reads as a rendering fault (spec 5.4).
+  /// </summary>
+  private void DrawProfileFields(ScentRow? row, CharacterProfile profile, float scale)
+  {
+    var labelWidth = 130f * scale;
+
+    // The only source of the FC NAME — the live row carries only a ≤5-char tag. Null is a verified "no FC".
+    Field("Free Company", profile.FreeCompanyName, "Not in a Free Company.", labelWidth);
+
+    // Race is the page sentinel, so it is never absent under Ready. Built from the three glyph-decoded parts.
+    var race = Join(" · ", profile.Race, profile.Clan, profile.Gender);
+    Field("Race", race.Length > 0 ? race : null, "Not shown on their Lodestone page.", labelWidth);
+
+    // THE CONTRADICTION RULE: the live scan and the Lodestone can legitimately disagree — a Fantasia between
+    // their last logout and now. Live wins, and the window says so out loud rather than silently picking one.
+    // Branch on RaceId, never the string: RaceName is "Unknown" for both an unloaded and an unrecognised race.
+    if (row is { RaceId: not 0 } && profile.Race is { Length: > 0 } lodeRace
+        && !row.RaceName.StartsWith(lodeRace, StringComparison.Ordinal))
+    {
+      ImGui.SetCursorPosX(ImGui.GetCursorPosX() + labelWidth);
+      UiTheme.TextWrappedColored(UiTheme.Muted,
+        $"The live scan says {row.RaceName}. The Lodestone updates when they log out.");
+    }
+
+    Field("Title", profile.Title, "No title equipped.", labelWidth);
+
+    var gc = profile.GrandCompany is { Length: > 0 } company
+      ? profile.GrandCompanyRank is { Length: > 0 } rank ? $"{company} · {rank}" : company
+      : null;
+    // NOT "None" and never a dash: an absent GC could equally be a non-NA region hiding an enlisted player.
+    Field("Grand Company", gc, "Not shown on their Lodestone page.", labelWidth);
+
+    ImGui.Dummy(new Vector2(0, 4f * scale));
+    DrawJobs(profile, scale);
+
+    ImGui.Dummy(new Vector2(0, 2f * scale));
+    DrawMore(profile, labelWidth);
+  }
+
+  /// <summary>
+  /// Jobs and levels: a two-column grid, levelled first, under a heading that carries the "n of N" summary.
+  ///
+  /// A dash, not a zero, and a sentence to explain it: an unlevelled slot is a REAL state, distinct from a job
+  /// that failed to parse, and the whole point of capturing "-" rather than "" is to keep the two apart. Zero
+  /// jobs is Failed-shaped, not a fact about them, so it says the page changed shape.
+  /// </summary>
+  private static void DrawJobs(CharacterProfile profile, float scale)
+  {
+    if (profile.Jobs.Count == 0)
+    {
+      UiTheme.TextWrappedColored(UiTheme.Muted,
+        "Their Lodestone did not list any jobs — the page has probably changed shape.");
+      return;
+    }
+
+    var levelled = profile.Jobs.Count(j => j.Level.HasValue);
+
+    // Separate stable id from the label so a redraw cannot reset the open state. The label carries no '%'.
+    var open = ImGui.TreeNodeEx("ls-jobs", ImGuiTreeNodeFlags.DefaultOpen, "Jobs and levels");
+    ImGui.SameLine(0, 12f * scale);
+    UiTheme.TextWrappedColored(UiTheme.Muted, $"{levelled} of {profile.Jobs.Count} levelled");
+
+    if (!open)
+      return;
+
+    // Levelled first (highest level first, a plain "best first"), then the "-" slots. Slot breaks ties so the
+    // order is stable frame to frame. Column-major into two columns so 34 rows are not one long scroll.
+    var sorted = profile.Jobs
+      .OrderBy(j => j.Level.HasValue ? 0 : 1)
+      .ThenByDescending(j => j.Level ?? 0)
+      .ThenBy(j => j.Slot)
+      .ToList();
+
+    var rows = (sorted.Count + 1) / 2;
+
+    if (ImGui.BeginTable("##ls-jobtable", 4, ImGuiTableFlags.SizingStretchProp))
+    {
+      ImGui.TableSetupColumn("##name-a", ImGuiTableColumnFlags.WidthStretch);
+      ImGui.TableSetupColumn("##lv-a", ImGuiTableColumnFlags.WidthFixed);
+      ImGui.TableSetupColumn("##name-b", ImGuiTableColumnFlags.WidthStretch);
+      ImGui.TableSetupColumn("##lv-b", ImGuiTableColumnFlags.WidthFixed);
+
+      for (var r = 0; r < rows; r++)
+      {
+        ImGui.TableNextRow();
+        DrawJobCell(sorted, r, 0);
+        DrawJobCell(sorted, r + rows, 2);
+      }
+
+      ImGui.EndTable();
+    }
+
+    UiTheme.TextWrappedColored(UiTheme.Muted, "—— means they have not unlocked or levelled it.");
+    ImGui.TreePop();
+  }
+
+  /// <summary>One name/level pair in the job grid, or nothing when the column has run out of jobs.</summary>
+  private static void DrawJobCell(List<JobSlot> sorted, int index, int nameColumn)
+  {
+    if (index >= sorted.Count)
+      return;
+
+    var job = sorted[index];
+
+    ImGui.TableSetColumnIndex(nameColumn);
+    ImGui.TextUnformatted(job.Name);
+
+    ImGui.TableSetColumnIndex(nameColumn + 1);
+    if (job.Level is { } level)
+      ImGui.TextUnformatted(level.ToString());
+    else
+      // "——", never "0" and never blank: the Lodestone printed "-", meaning not unlocked or not levelled.
+      UiTheme.TextWrappedColored(UiTheme.Muted, "——");
+  }
+
+  /// <summary>
+  /// The collapsed extras. Nameday, Guardian and City-state answer none of the three questions this window is
+  /// for, so they are folded away by default; City-state especially is where they STARTED, kept well clear of
+  /// anything about where they were last seen.
+  /// </summary>
+  private static void DrawMore(CharacterProfile profile, float labelWidth)
+  {
+    if (!ImGui.TreeNodeEx("ls-more", ImGuiTreeNodeFlags.None, "More from their Lodestone"))
+      return;
+
+    const string unknown = "Not shown on their Lodestone page.";
+    Field("Nameday", profile.Nameday, unknown, labelWidth);
+    Field("Guardian", profile.Guardian, unknown, labelWidth);
+    Field("City-state", profile.CityState, unknown, labelWidth);
+
+    ImGui.TreePop();
+  }
+
+  /// <summary>A Muted label at a fixed column, then the value — or, when the value is null, the sentence naming
+  /// which nothing it is. Absence is a sentence here, never a blank cell.</summary>
+  private static void Field(string label, string? value, string absent, float labelWidth)
+  {
+    UiTheme.TextWrappedColored(UiTheme.Muted, label);
+    ImGui.SameLine(labelWidth);
+
+    if (string.IsNullOrEmpty(value))
+    {
+      UiTheme.TextWrappedColored(UiTheme.Muted, absent);
+      return;
+    }
+
+    ImGui.PushTextWrapPos(0f);
+    ImGui.TextUnformatted(value);
+    ImGui.PopTextWrapPos();
+  }
+
+  /// <summary>Joins the non-empty parts with <paramref name="sep"/> — for the Race · Clan · Gender line, where
+  /// any one part could be missing without the others.</summary>
+  private static string Join(string sep, params string?[] parts)
+    => string.Join(sep, parts.Where(p => !string.IsNullOrEmpty(p)));
 
   /// <summary>
   /// The note, and the button that deletes the record it belongs to.
