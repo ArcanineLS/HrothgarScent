@@ -5,6 +5,8 @@ using Dalamud.Bindings.ImGui;
 using Dalamud.Interface;
 using Dalamud.Interface.ManagedFontAtlas;
 using Dalamud.Interface.Utility;
+using Dalamud.Interface.Windowing;
+using Dalamud.Utility;
 
 namespace HrothgarScent.Windows;
 
@@ -32,6 +34,262 @@ internal static class UiTheme
   public static readonly Vector4 Muted = new(0.651f, 0.651f, 0.651f, 1f);
 
   public static Vector4 BoolColor(bool value) => value ? AccentBlue : Bad;
+
+  /// <summary>The plugin's repository, opened by the custom title bar's link button.</summary>
+  public const string RepoUrl = "https://github.com/ArcanineLS/HrothgarScent";
+
+  /// <summary>
+  /// The plugin's shared custom title bar: a purple header band with an eye icon, a left-aligned title, a
+  /// draggable region, and reimplemented link + close buttons. Drawn at the top of any window that sets
+  /// <see cref="ImGuiWindowFlags.NoTitleBar"/>, so the config, journal and profile read as one plugin rather
+  /// than three different chromes.
+  ///
+  /// Lifted verbatim from the config window — which was the only window that had it — because the profile and
+  /// journal were asked for "the same top bar as config", and one copy is the only thing that keeps that true
+  /// as the bar changes. The window itself owns close (a window cannot flip its own IsOpen from a static
+  /// helper), so it passes an <paramref name="onClose"/>.
+  /// </summary>
+  /// <param name="title">The title text, drawn beside the eye icon.</param>
+  /// <param name="scale"><see cref="ImGuiHelpers.GlobalScale"/>, threaded in so this makes no second read of it.</param>
+  /// <param name="onClose">Invoked when the × is clicked — typically <c>() =&gt; IsOpen = false</c>.</param>
+  /// <param name="titleColor">Colour of the title text; defaults to <see cref="AccentBlue"/> as the config bar used.</param>
+  /// <param name="linkUrl">Opened by the link button. Null draws no link button.</param>
+  /// <param name="showNav">Whether to draw the Journal/Config/HUD nav trio. False leaves ONLY close (plus the link
+  /// if <paramref name="linkUrl"/> is set) — the portrait window wants a bare bar, not a launcher.</param>
+  /// <returns>Whether the draggable region was double-clicked this frame — the window's cue to toggle collapse.
+  /// The custom bar cannot use ImGui's native collapse (NoTitleBar leaves nothing to un-collapse from), so the
+  /// window owns the collapsed state and skips its body; see <see cref="CollapsedConstraints"/>.</returns>
+  public static bool DrawWindowTitleBar(string title, float scale, Action onClose, Vector4? titleColor = null,
+    string? linkUrl = RepoUrl, bool showNav = true)
+  {
+    var drawList = ImGui.GetWindowDrawList();
+    var style = ImGui.GetStyle();
+
+    var origin = ImGui.GetCursorScreenPos();            // content top-left (inside window padding)
+    var winPos = ImGui.GetWindowPos();
+    var winSize = ImGui.GetWindowSize();
+    var contentWidth = ImGui.GetContentRegionAvail().X;
+
+    // Compact title row. The band spans flush to the window's top and side edges (up into the padding) so it
+    // reads as a real title bar; interactive elements are centred in the full bar.
+    var contentRowHeight = ImGui.GetTextLineHeight() + 4f * scale;
+    var bandMin = winPos;
+    var bandMax = new Vector2(winPos.X + winSize.X, origin.Y + contentRowHeight);
+    var barTop = winPos.Y;
+    var barHeight = bandMax.Y - barTop;
+
+    drawList.PushClipRect(winPos, new Vector2(winPos.X + winSize.X, winPos.Y + winSize.Y), false);
+    drawList.AddRectFilled(bandMin, bandMax, ImGui.GetColorU32(new Vector4(0.18f, 0.14f, 0.27f, 1f)),
+      style.WindowRounding, ImDrawFlags.RoundCornersTop);
+    drawList.AddLine(new Vector2(bandMin.X, bandMax.Y), new Vector2(bandMax.X, bandMax.Y),
+      ImGui.GetColorU32(AccentPurple), 1.5f * scale);
+    drawList.PopClipRect();
+
+    var btnSize = barHeight - 6f * scale;
+    var spacing = 4f * scale;
+    // close, plus the optional repo link, plus the optional journal/config/hud nav trio. The trio is on every
+    // window's bar so any of them is one click away from anywhere in the plugin (the repo-button pattern,
+    // extended) — except where a window asks for a bare bar (the portrait), which drops both the trio and the link.
+    var buttonCount = 1 + (linkUrl is null ? 0 : 1) + (showNav ? 3 : 0);
+    var buttonsWidth = (btnSize + spacing) * buttonCount + spacing;
+
+    // Drag handle across the bar (excluding the right button cluster). A single drag moves the window; a
+    // double-click on it (no movement, so the drag branch never fires) asks the window to collapse.
+    ImGui.SetCursorScreenPos(new Vector2(origin.X, barTop));
+    ImGui.InvisibleButton("##titleDrag", new Vector2(MathF.Max(1f, contentWidth - buttonsWidth), barHeight));
+    if (ImGui.IsItemActive() && ImGui.IsMouseDragging(ImGuiMouseButton.Left))
+      ImGui.SetWindowPos(ImGui.GetWindowPos() + ImGui.GetIO().MouseDelta);
+    var doubleClicked = ImGui.IsItemHovered() && ImGui.IsMouseDoubleClicked(ImGuiMouseButton.Left);
+
+    // Title: eye icon + name, centred in the full bar height.
+    var iconStr = FontAwesomeIcon.Eye.ToIconString();
+    Vector2 iconSize;
+    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+      iconSize = ImGui.CalcTextSize(iconStr);
+    var titleSize = ImGui.CalcTextSize(title);
+
+    var iconPos = new Vector2(origin.X + 2f * scale, barTop + (barHeight - iconSize.Y) * 0.5f);
+    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+      drawList.AddText(iconPos, ImGui.GetColorU32(AccentPurple), iconStr);
+
+    var titlePos = new Vector2(iconPos.X + iconSize.X + 8f * scale, barTop + (barHeight - titleSize.Y) * 0.5f);
+    drawList.AddText(titlePos, ImGui.GetColorU32(titleColor ?? AccentBlue), title);
+
+    // Right-side buttons, laid out RIGHT TO LEFT: close, [repo link], hud, config, journal. Each step walks the
+    // cursor left by one button + gap, so adding or dropping the link needs no other arithmetic.
+    var purpleHover = new Vector4(AccentPurple.X, AccentPurple.Y, AccentPurple.Z, 0.45f);
+    var btnY = barTop + (barHeight - btnSize) * 0.5f;
+    var x = origin.X + contentWidth - btnSize;
+
+    if (TitleIconButton("##titleClose", FontAwesomeIcon.Times, new Vector2(x, btnY), btnSize,
+          new Vector4(Bad.X, Bad.Y, Bad.Z, 0.6f)))
+      onClose();
+    Tooltip("Close");
+    x -= btnSize + spacing;
+
+    if (linkUrl is not null)
+    {
+      if (TitleIconButton("##titleLink", FontAwesomeIcon.Link, new Vector2(x, btnY), btnSize, purpleHover))
+        Util.OpenLink(linkUrl);
+      Tooltip("Open the repository");
+      x -= btnSize + spacing;
+    }
+
+    if (showNav)
+    {
+      if (TitleIconButton("##titleHud", FontAwesomeIcon.Desktop, new Vector2(x, btnY), btnSize, purpleHover))
+        Plugin.ToggleHud();
+      Tooltip("HUD mode — the quiet, chrome-less Scent window.");
+      x -= btnSize + spacing;
+
+      if (TitleIconButton("##titleConfig", FontAwesomeIcon.Cog, new Vector2(x, btnY), btnSize, purpleHover))
+        Plugin.ToggleConfigWindow();
+      Tooltip("Settings.");
+      x -= btnSize + spacing;
+
+      if (TitleIconButton("##titleJournal", FontAwesomeIcon.Book, new Vector2(x, btnY), btnSize, purpleHover))
+        Plugin.ToggleJournalWindow();
+      Tooltip("The journal — everyone you've marked (and, if you record them, met).");
+    }
+
+    // Content starts below the band.
+    ImGui.SetCursorScreenPos(new Vector2(origin.X, bandMax.Y + 6f * scale));
+
+    return doubleClicked;
+  }
+
+  /// <summary>
+  /// Window size constraints that lock the window to just the title bar at its current width — a window's
+  /// collapsed state. Call it right after <see cref="DrawWindowTitleBar"/> returns true, assign it to
+  /// SizeConstraints, skip the body and return; the constraint takes effect on the next frame's Begin, a
+  /// one-frame settle that is invisible. Height is measured from the cursor (which sits just below the bar), and
+  /// the width is held at the window's current width so collapsing shrinks height alone. Pixel units, matching
+  /// the portrait window's own size-lock.
+  /// </summary>
+  public static WindowSizeConstraints CollapsedConstraints()
+  {
+    // DIVIDED by GlobalScale: Dalamud multiplies SizeConstraints by it before handing them to ImGui, so a raw
+    // pixel measurement here would come out double-scaled at any non-100% UI scale. Cancelling it now keeps the
+    // collapsed window exactly the pixel height measured.
+    var scale = ImGuiHelpers.GlobalScale;
+    var padding = ImGui.GetStyle().WindowPadding;
+    var height = (ImGui.GetCursorScreenPos().Y - ImGui.GetWindowPos().Y + padding.Y) / scale;
+    var width = ImGui.GetWindowSize().X / scale;
+    return new WindowSizeConstraints
+    {
+      MinimumSize = new Vector2(width, height),
+      MaximumSize = new Vector2(width, height),
+    };
+  }
+
+  /// <summary>
+  /// Double-click-to-collapse for a window with a RANGE size constraint (config, journal, profile). One instance
+  /// per window — it replaces a bare <c>bool</c> because doing this correctly means REMEMBERING the expanded size.
+  ///
+  /// The bug it exists to fix: a window has ONE stored size in ImGui, and collapsing (min == max == title bar)
+  /// squashes it. Expanding then restored a RANGE constraint (min..max), against which ImGui clamps the now-tiny
+  /// stored size UP to the range MINIMUM — so the window sprang back to its default size, never the size it had
+  /// before collapsing. This captures the size on the way down and forces it back for a single frame on the way
+  /// up, after which the window resizes freely again. A FIXED (min == max) window never had the bug — its
+  /// constraint alone restores it — and this stays correct for those too.
+  ///
+  /// The portrait window does NOT use this: it is content-sized, so skipping its body already shrinks it, with no
+  /// stored range to spring back from.
+  /// </summary>
+  internal sealed class CollapseController
+  {
+    private bool _collapsed;
+
+    /// <summary>The size to put back on expand, unscaled (Dalamud multiplies <see cref="Window.Size"/> by
+    /// GlobalScale), captured the instant before collapse squashes it.</summary>
+    private Vector2 _expandedSize;
+
+    /// <summary>Set on expand; forces <see cref="_expandedSize"/> back for exactly the next frame, then clears.</summary>
+    private bool _restore;
+
+    public bool Collapsed => _collapsed;
+
+    /// <summary>
+    /// Call right after <see cref="DrawWindowTitleBar"/>, feeding its return value as <paramref name="doubleClicked"/>
+    /// — <c>if (_collapse.Handle(this, DrawWindowTitleBar(...), _normal)) return;</c>. Arguments evaluate left to
+    /// right, so the bar is drawn (moving the cursor below it) before the collapsed height is measured. Returns
+    /// whether the window is now collapsed; the caller skips its body and returns on true.
+    /// </summary>
+    public bool Handle(Window window, bool doubleClicked, WindowSizeConstraints normal)
+    {
+      var scale = ImGuiHelpers.GlobalScale;
+
+      if (doubleClicked)
+      {
+        if (!_collapsed)
+        {
+          // The collapse constraint only takes effect next frame, so the window is still at its expanded size
+          // right now — the one moment to record it. Stored unscaled to match how Window.Size is applied.
+          _expandedSize = ImGui.GetWindowSize() / scale;
+          _collapsed = true;
+        }
+        else
+        {
+          _collapsed = false;
+          _restore = true;
+        }
+      }
+
+      if (_collapsed)
+      {
+        window.SizeConstraints = CollapsedConstraints();
+        return true;
+      }
+
+      window.SizeConstraints = normal;
+      if (_restore)
+      {
+        // One frame of ImGuiCond.Always to overwrite the squashed stored size with the real one; the range
+        // constraint alone would clamp the tiny window up to its minimum instead. Cleared immediately so the very
+        // next frame stops forcing and the user can resize again.
+        window.Size = _expandedSize;
+        window.SizeCondition = ImGuiCond.Always;
+        _restore = false;
+      }
+      else
+      {
+        // Not forcing any size: the window keeps whatever ImGui stored, and stays freely resizable. (This also
+        // retires the constructor's FirstUseEver seed, which has already been applied by the time Handle runs.)
+        window.Size = null;
+      }
+
+      return false;
+    }
+  }
+
+  /// <summary>
+  /// Draw-list based icon button for <see cref="DrawWindowTitleBar"/>, so the glyph is centred by its real size
+  /// and never clipped by frame padding (which is what cut off the icon when using <see cref="ImGui.Button"/> at
+  /// a small size).
+  /// </summary>
+  private static bool TitleIconButton(string id, FontAwesomeIcon icon, Vector2 pos, float size, Vector4 hoverColor)
+  {
+    ImGui.SetCursorScreenPos(pos);
+    ImGui.InvisibleButton(id, new Vector2(size, size));
+    var hovered = ImGui.IsItemHovered();
+    var clicked = ImGui.IsItemClicked(ImGuiMouseButton.Left);
+
+    var drawList = ImGui.GetWindowDrawList();
+    if (hovered)
+      drawList.AddRectFilled(pos, new Vector2(pos.X + size, pos.Y + size), ImGui.GetColorU32(hoverColor), 4f);
+
+    var iconStr = icon.ToIconString();
+    Vector2 glyphSize;
+    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+      glyphSize = ImGui.CalcTextSize(iconStr);
+
+    var glyphPos = new Vector2(pos.X + (size - glyphSize.X) * 0.5f, pos.Y + (size - glyphSize.Y) * 0.5f);
+    var iconColor = hovered ? new Vector4(1f, 1f, 1f, 1f) : Muted;
+    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
+      drawList.AddText(glyphPos, ImGui.GetColorU32(iconColor), iconStr);
+
+    return clicked;
+  }
 
   /// <summary>Renders a FontAwesome glyph inline using the icon font.</summary>
   public static void Icon(FontAwesomeIcon icon, Vector4? color = null)

@@ -579,6 +579,32 @@ public sealed class Configuration : IPluginConfiguration
   public bool RememberLastSeen { get; set; } = true;
 
   /// <summary>
+  /// Record EVERY player who comes near you into a durable log the journal can browse — not just the ones you
+  /// deliberately marked.
+  ///
+  /// OFF by default, and that default is the plugin's whole ethos in one switch. Everywhere else this plugin
+  /// refuses to write a stranger to disk by proximity — it is the anti-pattern the design was built against (see
+  /// <see cref="Scent.MarkStore"/>). This is the deliberate opt-OUT of that refusal, for a user who wants an
+  /// "everyone I've met" log and accepts the trade: the names and worlds of strangers, kept on their own disk. It
+  /// is a SEPARATE store (<see cref="Scent.SeenLog"/>, seen.json). By default it is UNLIMITED — it keeps everyone,
+  /// PlayerTrack-style — but <see cref="NearbyLogLimit"/> can put a cap back on. The marks store is untouched by it.
+  /// </summary>
+  public bool RecordAllNearby { get; set; } = false;
+
+  /// <summary>
+  /// A cap on how many nearby players <see cref="Scent.SeenLog"/> keeps, or 0 for UNLIMITED (the default). When
+  /// positive, the least-recently-seen are evicted past it; enforced on write as well as at the slider, since it
+  /// round-trips through a hand-editable file. A positive value is floored at <see cref="NearbyLogLimitMin"/> so a
+  /// tiny cap cannot thrash; 0 disables eviction entirely.
+  /// </summary>
+  public int NearbyLogLimit { get; set; } = 0;
+
+  /// <summary>Floor for a POSITIVE cap; 0 means unlimited and bypasses this.</summary>
+  public const int NearbyLogLimitMin = 50;
+
+  public const int NearbyLogLimitMax = 20000;
+
+  /// <summary>
   /// Dim a mark Hrothgar has not seen in this many days, so a record that has quietly stopped matching anybody
   /// can be found and fixed. 0 never dims.
   ///
@@ -590,15 +616,15 @@ public sealed class Configuration : IPluginConfiguration
   public int MarkStaleDays { get; set; } = 30;
 
   /// <summary>
-  /// Add a line to a marked player's note when you clear a duty together.
+  /// Record a duty you cleared together on a marked player's Encounters, aggregated one row per fight.
   ///
   /// ONLY players already marked, and it never creates a record: a duty completing is not a deliberate user
   /// act, so it cannot be the reason someone is remembered. Everyone else in the party stays a stranger.
   ///
   /// On by default, on the same argument as LastSeen: you already told Hrothgar to remember this person, and
-  /// "we cleared this together" is the kind of thing remembering someone is FOR. It writes into the note — a
-  /// string the user owns and can edit or delete — rather than a field of its own, so nothing here grows a
-  /// history the user cannot reach.
+  /// "we cleared this together" is the kind of thing remembering someone is FOR. It lands as a structured
+  /// <see cref="Scent.DutyEncounter"/> — one row per fight, so it stays bounded no matter how many times you run
+  /// it — read by the profile's Encounters tab. The note is left alone for what the user actually typed.
   /// </summary>
   public bool RememberDutyClears { get; set; } = true;
 
@@ -657,6 +683,26 @@ public sealed class Configuration : IPluginConfiguration
   /// fetch fires from the Info/Jobs tab's own draw, so a profile only ever opened to Notes spends no request.
   /// </summary>
   public bool AutoLoadLodestoneProfile { get; set; } = false;
+
+  /// <summary>
+  /// Automatically capture a player's rendered portrait from their Adventurer Plate when you open it, and save
+  /// it, so clicking their profile picture later shows the face they published instead of only the flat
+  /// Lodestone thumbnail.
+  ///
+  /// OFF by default, and that default is load-bearing twice over. It reads the game's rendered plate texture —
+  /// deeper into the client than anything else here — so it is opt-in on the same "your client, your call"
+  /// reasoning as <see cref="ShowLodestonePortraits"/>. And it is the one feature in the plugin that could not be
+  /// exercised without the running game before shipping, so it stays experimental until the user turns it on and
+  /// confirms it. Nothing is captured, and the plate is not even read, while this is off.
+  ///
+  /// Clicking a profile picture captures on demand whenever a plate is open regardless of this switch — that is
+  /// the deliberate per-click path; this only governs the automatic "grab it as I open plates" convenience.
+  ///
+  /// UNLIKE the Lodestone face, a captured portrait IS written to disk (a PNG per player under the config
+  /// folder), so it survives restarts — a durable record, but one authored by the user's own click, exactly as a
+  /// mark is. See <see cref="Scent.PortraitService"/>.
+  /// </summary>
+  public bool CaptureInGamePortraits { get; set; } = false;
 
   /// <summary>
   /// Hash of every option the view is filtered or sorted by. ScentWindow rebuilds its cached view when this

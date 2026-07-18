@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Frozen;
+using System.Collections.Generic;
 using System.Numerics;
 using System.Text.Json.Serialization;
 
@@ -84,6 +85,81 @@ public sealed record MarkedPlayer(
   /// be read; see ScentScanner.ZoneName for why that is a real state and not a failure.</summary>
   public string LastSeenZone { get; init; } = LastSeenZone;
 
+  private readonly IReadOnlyList<string> _tags = [];
+
+  /// <summary>
+  /// Custom category tags the user filed this player under — "static", "gil buyer", "cool crafter", anything.
+  ///
+  /// USER-AUTHORED, so unlike every other list here they KEEP a record alive (see <see cref="IsEmpty"/>): a
+  /// player the user categorised is a player the user pointed at, exactly as a note or a colour is. That is the
+  /// line that separates this one member from the four observational ones below it. Ordinal-distinct and
+  /// insertion-ordered; the store dedupes and trims on the way in, so nothing downstream has to.
+  ///
+  /// Null-coalescing init setter because marks.json is hand-editable: a literal <c>"Tags": null</c> would
+  /// otherwise NRE the first time anything read Count. Same defence the store's duplicate-key handling is.
+  /// </summary>
+  public IReadOnlyList<string> Tags
+  {
+    get => _tags;
+    init => _tags = value ?? [];
+  }
+
+  /// <summary>
+  /// When the plugin FIRST saw this marked player near you. The sibling of <see cref="LastSeen"/>, and it lives
+  /// under the same three-part licence: it exists only for players already marked, it is one timestamp rather
+  /// than a history, and it is switchable off with the same setting. OBSERVATION, not word — so like LastSeen it
+  /// is explicitly NOT a reason a record survives (<see cref="IsEmpty"/>).
+  /// </summary>
+  public DateTimeOffset? FirstSeen { get; init; }
+
+  /// <summary>
+  /// How many distinct times — reunions, not scans — this marked player has been seen near you.
+  ///
+  /// A single counter overwritten in place, NOT a per-sighting log: the thing that must never grow is a row per
+  /// encounter, and this is one integer that steps by one on the same reunion boundary <see cref="LastSeen"/>
+  /// already throttles to (see MarkStore.RecordSeen). Observation, so it does not keep a record alive.
+  /// </summary>
+  public int SeenCount { get; init; }
+
+  private readonly IReadOnlyList<DutyEncounter> _encounters = [];
+
+  /// <summary>
+  /// Duties cleared together, aggregated one row per fight. The STRUCTURED home of what used to be appended to
+  /// the note as "Cleared X together." lines — moved out so the note is purely what the user typed, and so the
+  /// data can be counted and sorted instead of read as prose.
+  ///
+  /// Observation, not a deliberate mark — a duty completing is not the user pointing at anyone — so it never
+  /// keeps a record alive, and DutyService still writes here ONLY for players already marked. Aggregated per
+  /// distinct duty (see <see cref="DutyEncounter"/>) so a static farmed for a year stays bounded by the number
+  /// of fights, never by the number of clears: the same refusal-to-grow the whole store is built on.
+  /// </summary>
+  public IReadOnlyList<DutyEncounter> Encounters
+  {
+    get => _encounters;
+    init => _encounters = value ?? [];
+  }
+
+  private readonly IReadOnlyList<PastIdentity> _nameHistory = [];
+
+  /// <summary>
+  /// Names and worlds this player went by before the user repaired the mark with Renamed?.
+  ///
+  /// The honest half of the rename story the store could not tell before: <see cref="MarkStore.Rename"/> only
+  /// ever moved a mark forward and forgot where it came from. Written ONLY by that deliberate repair, so it is
+  /// bounded by human effort — a handful of entries at the very most — never by anything automatic. Observation,
+  /// so it does not keep a record alive.
+  /// </summary>
+  public IReadOnlyList<PastIdentity> NameHistory
+  {
+    get => _nameHistory;
+    init => _nameHistory = value ?? [];
+  }
+
+  /// <summary>Whether the user has filed this player under any tag. Drives <see cref="IsEmpty"/> and the header's
+  /// tag line.</summary>
+  [JsonIgnore]
+  public bool HasTags => _tags.Count > 0;
+
   /// <summary>
   /// Whether there is a note. DERIVED, never stored as a <see cref="MarkKind"/> flag.
   ///
@@ -116,9 +192,15 @@ public sealed record MarkedPlayer(
   /// were, un-ticking the last mark would leave behind a row that says only "you were near this person at this
   /// time, here" — a durable record of a stranger's movements, authored by nobody, which is precisely the
   /// artifact this whole store exists to refuse. Untick everything and the observation goes with the record.
+  ///
+  /// A TAG counts, on the same footing as a note or a colour: it is a thing the user typed about this person,
+  /// so a player filed under only a tag is a player deliberately kept. <see cref="FirstSeen"/>,
+  /// <see cref="SeenCount"/>, <see cref="Encounters"/> and <see cref="NameHistory"/> DO NOT count, for exactly
+  /// the reason LastSeen does not: they are all observations, and an observation is never the reason a record
+  /// outlives the mark that authored it. Forget everything the user said and every observation goes too.
   /// </summary>
   [JsonIgnore]
-  public bool IsEmpty => Marks == MarkKind.None && !HasNote && Color is null;
+  public bool IsEmpty => Marks == MarkKind.None && !HasNote && Color is null && !HasTags;
 
   /// <summary>
   /// Whether this record has anything to SHOW for itself — a glyph on the row, a marker on the info bar.
@@ -139,6 +221,33 @@ public sealed record MarkedPlayer(
   public bool HasVisibleMark => HasNote || IsFocused || IsIgnored;
 
   /// <summary>Display form, matching <see cref="ScentRow.FullName"/>.</summary>
+  [JsonIgnore]
+  public string FullName => string.IsNullOrEmpty(HomeWorldName) ? Name : $"{Name}@{HomeWorldName}";
+}
+
+/// <summary>
+/// One kind of duty cleared with a marked player, aggregated over every time it was cleared.
+///
+/// A row per DISTINCT fight, never a row per clear — <see cref="Count"/> carries "how many times" so the list
+/// cannot grow past the number of duties in the game no matter how many times a static runs one. This is the
+/// structured replacement for DutyService's old "Cleared X together." note line: same fact, but countable and
+/// sortable rather than prose the user then could not do anything with. <see cref="FirstCleared"/> and
+/// <see cref="LastCleared"/> bracket the run; on a single clear they are equal.
+/// </summary>
+public sealed record DutyEncounter(string DutyName, int Count, DateTimeOffset FirstCleared, DateTimeOffset LastCleared);
+
+/// <summary>
+/// A name and world this player went by before the user re-pointed the mark with Renamed?.
+///
+/// The OLD identity, captured at the moment <see cref="MarkStore.Rename"/> moves the record — so the History
+/// tab can show where a mark came from, which the store used to simply forget. Bounded by the number of times a
+/// human repaired this one record. <see cref="ChangedOn"/> is when the repair happened, not when the rename did:
+/// the game never tells us the latter, and claiming a precise date we cannot know would be the kind of confident
+/// wrong answer the rest of this plugin refuses.
+/// </summary>
+public sealed record PastIdentity(string Name, uint HomeWorldId, string HomeWorldName, DateTimeOffset ChangedOn)
+{
+  /// <summary>Display form, matching <see cref="MarkedPlayer.FullName"/>.</summary>
   [JsonIgnore]
   public string FullName => string.IsNullOrEmpty(HomeWorldName) ? Name : $"{Name}@{HomeWorldName}";
 }

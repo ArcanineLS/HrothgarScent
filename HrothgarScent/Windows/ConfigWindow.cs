@@ -14,8 +14,6 @@ namespace HrothgarScent.Windows;
 
 public sealed class ConfigWindow : Window
 {
-  private const string RepoUrl = "https://github.com/ArcanineLS/HrothgarScent";
-
   /// <summary>
   /// The chat SFX the game exposes as &lt;se.1&gt;..&lt;se.16&gt;. Built once: Combo wants a string array,
   /// and rebuilding one every frame would allocate sixteen strings for a menu that never changes.
@@ -62,22 +60,30 @@ public sealed class ConfigWindow : Window
   private string _repairName = string.Empty;
   private string _repairWorld = string.Empty;
 
+  /// <summary>Double-click-to-collapse state; remembers the expanded size across a collapse. See
+  /// <see cref="UiTheme.CollapseController"/>.</summary>
+  private readonly UiTheme.CollapseController _collapse = new();
+
+  private readonly WindowSizeConstraints _normalConstraints = new()
+  {
+    MinimumSize = new Vector2(540, 500),
+    MaximumSize = new Vector2(float.MaxValue, float.MaxValue),
+  };
+
   public ConfigWindow()
     : base("HrothgarScent",
         ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoScrollbar)
   {
-    SizeConstraints = new WindowSizeConstraints
-    {
-      MinimumSize = new Vector2(540, 500),
-      MaximumSize = new Vector2(float.MaxValue, float.MaxValue),
-    };
+    SizeConstraints = _normalConstraints;
   }
 
   public override void Draw()
   {
     var scale = ImGuiHelpers.GlobalScale;
 
-    DrawCustomTitleBar(scale);
+    if (_collapse.Handle(this,
+          UiTheme.DrawWindowTitleBar("Scent Config", scale, () => IsOpen = false), _normalConstraints))
+      return;
 
     var railWidth = 48f * scale;
     var barHeight = ImGui.GetTextLineHeightWithSpacing() + 8f * scale;
@@ -177,105 +183,6 @@ public sealed class ConfigWindow : Window
     if (UiTheme.NavButton(icon, _selectedTab == index, size, label, index))
       _selectedTab = index;
     ImGui.Spacing();
-  }
-
-  /// <summary>
-  /// Fully custom title bar (the window uses <see cref="ImGuiWindowFlags.NoTitleBar"/>). Draws a
-  /// purple header band with the title, a draggable region, and reimplemented link + close buttons.
-  /// </summary>
-  private void DrawCustomTitleBar(float scale)
-  {
-    var drawList = ImGui.GetWindowDrawList();
-    var style = ImGui.GetStyle();
-
-    var origin = ImGui.GetCursorScreenPos();            // content top-left (inside window padding)
-    var winPos = ImGui.GetWindowPos();
-    var winSize = ImGui.GetWindowSize();
-    var contentWidth = ImGui.GetContentRegionAvail().X;
-
-    // Compact title row. The band spans flush to the window's top and side edges (up into the
-    // padding) so it reads as a real title bar; interactive elements are centered in the full bar.
-    var contentRowHeight = ImGui.GetTextLineHeight() + 4f * scale;
-    var bandMin = winPos;
-    var bandMax = new Vector2(winPos.X + winSize.X, origin.Y + contentRowHeight);
-    var barTop = winPos.Y;
-    var barHeight = bandMax.Y - barTop;
-
-    drawList.PushClipRect(winPos, new Vector2(winPos.X + winSize.X, winPos.Y + winSize.Y), false);
-    drawList.AddRectFilled(bandMin, bandMax, ImGui.GetColorU32(new Vector4(0.18f, 0.14f, 0.27f, 1f)),
-      style.WindowRounding, ImDrawFlags.RoundCornersTop);
-    drawList.AddLine(new Vector2(bandMin.X, bandMax.Y), new Vector2(bandMax.X, bandMax.Y),
-      ImGui.GetColorU32(UiTheme.AccentPurple), 1.5f * scale);
-    drawList.PopClipRect();
-
-    var btnSize = barHeight - 6f * scale;
-    var spacing = 4f * scale;
-    var buttonsWidth = (btnSize + spacing) * 2f + spacing;
-
-    // Drag handle across the bar (excluding the right button cluster).
-    ImGui.SetCursorScreenPos(new Vector2(origin.X, barTop));
-    ImGui.InvisibleButton("##titleDrag", new Vector2(MathF.Max(1f, contentWidth - buttonsWidth), barHeight));
-    if (ImGui.IsItemActive() && ImGui.IsMouseDragging(ImGuiMouseButton.Left))
-      ImGui.SetWindowPos(ImGui.GetWindowPos() + ImGui.GetIO().MouseDelta);
-
-    // Title: eye icon + name, centered in the full bar height.
-    var iconStr = FontAwesomeIcon.Eye.ToIconString();
-    Vector2 iconSize;
-    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-      iconSize = ImGui.CalcTextSize(iconStr);
-    var titleSize = ImGui.CalcTextSize("HrothgarScent");
-
-    var iconPos = new Vector2(origin.X + 2f * scale, barTop + (barHeight - iconSize.Y) * 0.5f);
-    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-      drawList.AddText(iconPos, ImGui.GetColorU32(UiTheme.AccentPurple), iconStr);
-
-    var titlePos = new Vector2(iconPos.X + iconSize.X + 8f * scale, barTop + (barHeight - titleSize.Y) * 0.5f);
-    drawList.AddText(titlePos, ImGui.GetColorU32(UiTheme.AccentBlue), "HrothgarScent");
-
-    // Right-side buttons: link, then close (right-aligned, centered vertically in the bar).
-    var contentRight = origin.X + contentWidth;
-    var btnY = barTop + (barHeight - btnSize) * 0.5f;
-    var closePos = new Vector2(contentRight - btnSize, btnY);
-    var linkPos = new Vector2(closePos.X - btnSize - spacing, btnY);
-
-    if (TitleIconButton("##titleLink", FontAwesomeIcon.Link, linkPos, btnSize,
-          new Vector4(UiTheme.AccentPurple.X, UiTheme.AccentPurple.Y, UiTheme.AccentPurple.Z, 0.45f)))
-      Util.OpenLink(RepoUrl);
-    UiTheme.Tooltip("Open the repository");
-
-    if (TitleIconButton("##titleClose", FontAwesomeIcon.Times, closePos, btnSize,
-          new Vector4(UiTheme.Bad.X, UiTheme.Bad.Y, UiTheme.Bad.Z, 0.6f)))
-      IsOpen = false;
-    UiTheme.Tooltip("Close");
-
-    // Content starts below the band.
-    ImGui.SetCursorScreenPos(new Vector2(origin.X, bandMax.Y + 6f * scale));
-  }
-
-  // Draw-list based icon button so the glyph is centered by its real size and never clipped by
-  // frame padding (which is what cut off the icon when using ImGui.Button at a small size).
-  private static bool TitleIconButton(string id, FontAwesomeIcon icon, Vector2 pos, float size, Vector4 hoverColor)
-  {
-    ImGui.SetCursorScreenPos(pos);
-    ImGui.InvisibleButton(id, new Vector2(size, size));
-    var hovered = ImGui.IsItemHovered();
-    var clicked = ImGui.IsItemClicked(ImGuiMouseButton.Left);
-
-    var drawList = ImGui.GetWindowDrawList();
-    if (hovered)
-      drawList.AddRectFilled(pos, new Vector2(pos.X + size, pos.Y + size), ImGui.GetColorU32(hoverColor), 4f);
-
-    var iconStr = icon.ToIconString();
-    Vector2 glyphSize;
-    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-      glyphSize = ImGui.CalcTextSize(iconStr);
-
-    var glyphPos = new Vector2(pos.X + (size - glyphSize.X) * 0.5f, pos.Y + (size - glyphSize.Y) * 0.5f);
-    var iconColor = hovered ? new Vector4(1f, 1f, 1f, 1f) : UiTheme.Muted;
-    using (Plugin.PluginInterface.UiBuilder.IconFontHandle.Push())
-      drawList.AddText(glyphPos, ImGui.GetColorU32(iconColor), iconStr);
-
-    return clicked;
   }
 
   /// <summary>Config-bound checkbox that saves on change and shows a hover tooltip.</summary>
@@ -495,6 +402,19 @@ public sealed class ConfigWindow : Window
     }
     UiTheme.Tooltip("Which regional Lodestone the profile reads and the 'Search on Lodestone' action opens. " +
             "They all hold the same characters; this only picks the language.");
+
+    ImGui.Dummy(new Vector2(0, 6f * ImGuiHelpers.GlobalScale));
+
+    ConfigCheckbox("Recapture portraits when you open an Adventurer Plate (experimental)",
+      () => Plugin.Configuration.CaptureInGamePortraits,
+      v => Plugin.Configuration.CaptureInGamePortraits = v,
+      "Every time you open a player's Adventurer Plate, copy the rendered portrait and save it — refreshing " +
+      "what you already had — so clicking their profile picture shows the face they published, kept current.\r\n\r\n" +
+      "Reads the game's own plate texture, deeper into the client than anything else here — so it is off by " +
+      "default and marked experimental. You can always capture by hand from the portrait window (click a profile " +
+      "picture) whether or not this is on; the switch only governs the automatic version.\r\n\r\n" +
+      "Saved portraits ARE written to disk (a PNG per player, in the plugin's config folder) so they survive " +
+      "restarts — unlike the Lodestone face. Delete the folder to clear them.");
   }
 
   // ---- Filters ----
@@ -680,12 +600,12 @@ public sealed class ConfigWindow : Window
       "the one thing I write down that you did not type, so it has its own switch. Turning it off " +
       "keeps what is already stored; use Forget to delete a person outright.");
 
-    ConfigCheckbox("Note duties you clear together",
+    ConfigCheckbox("Record duties you clear together",
       () => Plugin.Configuration.RememberDutyClears,
       v => Plugin.Configuration.RememberDutyClears = v,
-      "When you clear a duty, I add a line to the note of anyone in it you had already marked. Only " +
-      "them — clearing a duty with a stranger is not a reason to remember them. It goes in the note, so you " +
-      "can edit or delete it like anything else you wrote.");
+      "When you clear a duty, I add it to the Encounters tab of anyone in it you had already marked. Only " +
+      "them — clearing a duty with a stranger is not a reason to remember them. It is kept as data, one row per " +
+      "fight, so your notes stay yours; Forget a player to clear it.");
 
     ImGui.AlignTextToFramePadding();
     ImGui.Text("Dim a mark unseen for:");
@@ -703,7 +623,47 @@ public sealed class ConfigWindow : Window
     ImGui.SameLine();
     ImGui.Text("days");
 
+    // ABOVE the empty-marks return like RememberLastSeen, and for a stronger version of the same reason: this is
+    // the one switch that reverses the plugin's refusal to write strangers to disk, so it must be findable and
+    // settable before — and whether or not — the user has marked anybody.
     ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
+    UiTheme.AccentSeparator(UiTheme.Warn, 1f);
+
+    ConfigCheckbox("Record every nearby player into the journal",
+      () => Plugin.Configuration.RecordAllNearby,
+      v => Plugin.Configuration.RecordAllNearby = v,
+      "OFF by default, and deliberately — everything else here only remembers players YOU point at. This logs " +
+      "everyone who comes near you, their name and world, to a file on your disk, so the journal's All tab can " +
+      "show people you never marked.\r\n\r\n" +
+      "It is a separate log that keeps everyone by default (set a cap below if you'd rather bound it), and it " +
+      "never touches your marks. Turn it off any time; the journal can clear it.");
+
+    if (Plugin.Configuration.RecordAllNearby)
+    {
+      ImGui.Indent();
+      ImGui.AlignTextToFramePadding();
+      ImGui.Text("Keep at most:");
+      ImGui.SameLine();
+      var limit = Plugin.Configuration.NearbyLogLimit;
+      ImGui.SetNextItemWidth(160f * ImGuiHelpers.GlobalScale);
+      // Min 0, where 0 = unlimited (the default) and the slider shows "unlimited" rather than a number.
+      if (UiTheme.SliderIntManual("##nearbyLogLimit", ref limit, 0, Configuration.NearbyLogLimitMax,
+            limit <= 0 ? "unlimited" : "%d"))
+      {
+        // Snap a positive cap up to the floor so the stored value matches what the log actually keeps: EvictToCap
+        // clamps any positive cap to NearbyLogLimitMin, so without this a typed "10" would read back "10 players"
+        // while the log quietly held 50. 0 (unlimited) passes through untouched.
+        Plugin.Configuration.NearbyLogLimit = limit > 0 ? Math.Max(limit, Configuration.NearbyLogLimitMin) : 0;
+        Plugin.Configuration.Save();
+      }
+      UiTheme.Tooltip("0 keeps everyone (unlimited, the default). Set a number to cap it — past that, the " +
+                      "least-recently-seen are dropped.\r\n\r\nDouble-click to type an exact value.");
+      ImGui.SameLine();
+      ImGui.Text(limit <= 0 ? "(unlimited)" : "players");
+      ImGui.Unindent();
+    }
+
+    UiTheme.AccentSeparator(UiTheme.Warn, 1f);
 
     var marks = Plugin.Marks.All();
     if (marks.Count == 0)

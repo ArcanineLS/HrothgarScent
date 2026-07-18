@@ -39,4 +39,8 @@ internal sealed class MarkFileV1
 /// </summary>
 [JsonSourceGenerationOptions(WriteIndented = true, IncludeFields = true)]
 [JsonSerializable(typeof(MarkFileV1))]
+// Reachable through MarkedPlayer, but named explicitly so a change to their shape is a compile-time contract with
+// the generator rather than something that quietly falls back to reflection (which the plugin does not ship).
+[JsonSerializable(typeof(DutyEncounter))]
+[JsonSerializable(typeof(PastIdentity))]
 internal sealed partial class MarkJson : JsonSerializerContext;

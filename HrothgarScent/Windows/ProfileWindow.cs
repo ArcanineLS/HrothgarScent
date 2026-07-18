@@ -74,8 +74,27 @@ public sealed class ProfileWindow : Window
   /// <summary>The note buffer, held across frames so typing is not fighting the store. Committed on change.</summary>
   private string _note = string.Empty;
 
-  public ProfileWindow() : base("Profile##hrothgarscent-profile")
+  /// <summary>The add-a-tag box's text, held across frames. Cleared on commit; shared by whichever profile is
+  /// open, since only one is ever open at a time.</summary>
+  private string _tagInput = string.Empty;
+
+  /// <summary>Double-click-to-collapse state. Remembers the expanded size so expand restores it, not the
+  /// constraint minimum — see <see cref="UiTheme.CollapseController"/>.</summary>
+  private readonly UiTheme.CollapseController _collapse = new();
+
+  private readonly WindowSizeConstraints _normalConstraints = new()
   {
+    MinimumSize = new Vector2(500, 360),
+    MaximumSize = new Vector2(900, 1200),
+  };
+
+  public ProfileWindow() : base("Profile##hrothgarscent-profile",
+      ImGuiWindowFlags.NoTitleBar | ImGuiWindowFlags.NoScrollbar)
+  {
+    // NoTitleBar because it wears the plugin's own custom bar now (the same one config and journal wear), and
+    // NoScrollbar because the tabs live in their own scrolling child — so the header and that bar stay pinned
+    // while a long Jobs list scrolls under them.
+    //
     // Wider than MinimumSize below, deliberately: a first-use size UNDER the minimum is a window that opens
     // already being clamped, i.e. a default the constraint immediately overrules.
     Size = new Vector2(540, 520);
@@ -84,11 +103,7 @@ public sealed class ProfileWindow : Window
     // ticks, the swatch and its reset all sit on one line, and ImGui does not wrap a SameLine chain — it runs
     // off the edge. Everything scales together (Dalamud multiplies these by GlobalScale), so this holds at any
     // UI scale; it is the row's content that pins it, and anything added to that row has to be paid for here.
-    SizeConstraints = new WindowSizeConstraints
-    {
-      MinimumSize = new Vector2(500, 360),
-      MaximumSize = new Vector2(900, 1200),
-    };
+    SizeConstraints = _normalConstraints;
   }
 
   /// <summary>
@@ -128,6 +143,15 @@ public sealed class ProfileWindow : Window
 
   public override void Draw()
   {
+    var scale = ImGuiHelpers.GlobalScale;
+
+    // The player's own name IS the title now — the window is about one person, and the custom bar has the room
+    // the default one's fixed "Profile" label did not. Falls back to "Profile" only in the nobody-selected state.
+    if (_collapse.Handle(this,
+          UiTheme.DrawWindowTitleBar(_key is { } named ? named.Name : "Profile", scale, () => IsOpen = false),
+          _normalConstraints))
+      return;
+
     if (_key is not { } key)
     {
       // Reachable: Dalamud restores IsOpen from its own window state before anything calls Open.
@@ -136,7 +160,6 @@ public sealed class ProfileWindow : Window
     }
 
     var mark = Plugin.Marks.Find(key);
-    var scale = ImGuiHelpers.GlobalScale;
 
     // Resolved ONCE, at the top, and passed down. Null means "not standing near you right now" — never "no such
     // person" — and every consumer below has to say which of those it means. Re-reading it per section would let
@@ -146,10 +169,12 @@ public sealed class ProfileWindow : Window
     DrawHeader(key, mark, row, scale);
     ImGui.Dummy(new Vector2(0, 4f * scale));
 
-    // Three tabs, one thing each, so the window is not a single scroll of everything at once. Info is who they
-    // are; Jobs is what they have levelled; Notes is what you wrote. The header above — face, name, and the live
-    // "looking at you right now" — stays out of the tabs, because the one fact this plugin exists for must never
-    // be a click away.
+    // The tabs live in a scrolling child so the header — face, name, and the live "looking at you right now" —
+    // and the title bar stay pinned while a long Jobs list scrolls. Five tabs, one thing each: who they are,
+    // what they levelled, what you cleared together, what they used to be called, and what you wrote. Encounters
+    // and History sit between Jobs and Notes because they are observed facts about the person, like Info and
+    // Jobs; the note is the one thing the USER authored, so it stays last.
+    ImGui.BeginChild("##profileBody", ImGui.GetContentRegionAvail());
     if (ImGui.BeginTabBar("##profileTabs"))
     {
       if (ImGui.BeginTabItem("Info"))
@@ -164,14 +189,33 @@ public sealed class ProfileWindow : Window
         ImGui.EndTabItem();
       }
 
+      if (ImGui.BeginTabItem("Encounters"))
+      {
+        DrawEncountersTab(mark, scale);
+        ImGui.EndTabItem();
+      }
+
+      if (ImGui.BeginTabItem("History"))
+      {
+        DrawHistoryTab(mark, scale);
+        ImGui.EndTabItem();
+      }
+
       if (ImGui.BeginTabItem("Notes"))
       {
         DrawNotesTab(key, mark, scale);
         ImGui.EndTabItem();
       }
 
+      if (ImGui.BeginTabItem("Settings"))
+      {
+        DrawSettingsTab(key, mark, scale);
+        ImGui.EndTabItem();
+      }
+
       ImGui.EndTabBar();
     }
+    ImGui.EndChild();
   }
 
   /// <summary>
@@ -191,10 +235,103 @@ public sealed class ProfileWindow : Window
       DrawProfileFields(row, profile, scale);
 
     // The plugin's OWN observations, under their own header — what Hrothgar has seen, kept distinct from the
-    // Lodestone facts above it. This is the direct-observation half: targeted you, last seen, and so on.
+    // Lodestone facts above it. The durable "seen near you" half, then the session "targeting you" half.
     ImGui.Dummy(new Vector2(0, 6f * scale));
     UiTheme.SectionHeader("Scent");
-    DrawHistory(BuildHistory(key, mark));
+    DrawScentSection(key, mark, scale);
+  }
+
+  /// <summary>SETTINGS — the per-player controls that are not verbs on the action row: the custom tags. Its own
+  /// tab so filing someone has room, and so the Info tab stays a readout rather than a form.</summary>
+  private void DrawSettingsTab(WatcherKey key, MarkedPlayer? mark, float scale)
+  {
+    ImGui.Dummy(new Vector2(0, 2f * scale));
+    UiTheme.SectionHeader("Tags");
+    DrawTagsEditor(key, mark, scale);
+  }
+
+  /// <summary>
+  /// The tag chips and their editor. The profile's own copy of the journal's tag surface —
+  /// the same <see cref="MarkStore"/> methods, so the two cannot disagree — because filing a person is exactly
+  /// the kind of thing you do while you have their profile open.
+  ///
+  /// Adding a tag to an unmarked player MARKS them: a tag is user-authored, so it is a deliberate act that
+  /// creates the record, the same way ticking Focus would. That is why this draws for mark == null too.
+  /// </summary>
+  private void DrawTagsEditor(WatcherKey key, MarkedPlayer? mark, float scale)
+  {
+    ImGui.AlignTextToFramePadding();
+    UiTheme.TextWrappedColored(UiTheme.Muted, "Tags");
+    ImGui.SameLine(0, 8f * scale);
+
+    var tags = mark?.Tags ?? [];
+    if (tags.Count == 0)
+    {
+      ImGui.AlignTextToFramePadding();
+      UiTheme.TextWrappedColored(UiTheme.Muted, "none");
+    }
+    else
+    {
+      // Each tag is a chip with its own remove ×, drawn inline. Removing the last one un-marks a tags-only
+      // record — the store's delete-when-empty rule, which now counts tags.
+      foreach (var tag in tags)
+      {
+        ImGui.SameLine(0, 4f * scale);
+        ImGui.AlignTextToFramePadding();
+        UiTheme.TextWrappedColored(UiTheme.AccentPurple, tag);
+        ImGui.SameLine(0, 2f * scale);
+        using (ImRaii.PushId($"untag{tag}"))
+          if (ImGui.SmallButton("×"))
+            Plugin.Marks.RemoveTag(key, tag);
+      }
+    }
+
+    // The add box on its own line, so a long chip run does not push it off the edge.
+    var canAdd = (mark?.Tags.Count ?? 0) < MarkStore.MaxTagsPerPlayer;
+    using (ImRaii.Disabled(!canAdd))
+    {
+      ImGui.SetNextItemWidth(180f * scale);
+      var entered = ImGui.InputTextWithHint("##addtag", "Add a tag…", ref _tagInput, MarkStore.TagMaxLength,
+        ImGuiInputTextFlags.EnterReturnsTrue);
+      ImGui.SameLine();
+      if ((ImGui.Button("Add##tag") || entered) && !string.IsNullOrWhiteSpace(_tagInput))
+      {
+        Plugin.Marks.AddTag(key, _worldName, _tagInput);
+        _tagInput = string.Empty;
+      }
+    }
+    if (!canAdd)
+      UiTheme.TextWrappedColored(UiTheme.Muted, $"That's the most tags one player can carry ({MarkStore.MaxTagsPerPlayer}).");
+  }
+
+  /// <summary>
+  /// The Scent readout: the durable "seen near you" half, then the session "targeting you" half.
+  ///
+  /// A plain field grid — the value, or "N/A" when there is none. The split is still labelled because it is
+  /// real: the top four are written to disk and only ever for marked players (see MarkedPlayer.FirstSeen); the
+  /// bottom two come from the in-memory watcher log and reset at logout, which the "(this session)" says.
+  /// </summary>
+  private void DrawScentSection(WatcherKey key, MarkedPlayer? mark, float scale)
+  {
+    var labelWidth = 140f * scale;
+
+    // "N/A" is the absent value everywhere here, so a null field reads as a blank cell rather than a sentence.
+    UiTheme.TextWrappedColored(UiTheme.AccentBlue, "Seen near you");
+    Field("First Seen", mark?.FirstSeen is { } first ? ScentWindow.FormatAgo(first) : null, "N/A", labelWidth);
+    Field("Last Seen", mark?.LastSeen is { } last ? ScentWindow.FormatAgo(last) : null, "N/A", labelWidth);
+    Field("Last Location", string.IsNullOrEmpty(mark?.LastSeenZone) ? null : mark!.LastSeenZone, "N/A", labelWidth);
+    Field("Seen Count", mark is { SeenCount: > 0 } seen ? seen.SeenCount.ToString() : null, "N/A", labelWidth);
+
+    ImGui.Dummy(new Vector2(0, 6f * scale));
+    UiTheme.TextWrappedColored(UiTheme.AccentBlue, "Targeting you (this session)");
+
+    var stares = Plugin.WatcherLog.Snapshot().FirstOrDefault(entry => entry.Key == key);
+    Field("Target Count", stares is { Count: > 0 } ? stares.Count.ToString() : null, "N/A", labelWidth);
+    Field("Target Duration", stares is { TotalStareMs: > 0 } ? FormatDwell(stares.TotalStareMs) : null, "N/A", labelWidth);
+
+    // Social emotes aimed at you this session — /pet, /hug, /dote and the rest. Session-only, like the stares.
+    var emotes = Plugin.Emotes.CountFor(key);
+    Field("Emotes on you", emotes > 0 ? emotes.ToString() : null, "N/A", labelWidth);
   }
 
   /// <summary>JOBS — every class and its level. Shares the Lodestone state flow with Info: both need the same
@@ -286,10 +423,14 @@ public sealed class ProfileWindow : Window
         line += $" · {race}";
       UiTheme.TextWrappedColored(UiTheme.Muted, line);
 
-      // The tag line, in the shape the mark actually carries. "No tags set" rather than an empty row, because
-      // an unmarked player is the common case and a blank gap reads as a rendering fault.
-      var tags = Tags(mark);
-      UiTheme.TextWrappedColored(tags is null ? UiTheme.Muted : UiTheme.AccentPurple, tags ?? "— No tags set —");
+      // The identity line: the user's OWN labels for this person — their custom tags if they filed any, otherwise
+      // the mark's status (Focused / Noted / Ignored). Always exactly one line, so the block's height (the
+      // `lines` count above) stays stable; "— No tags —" stands in when there is neither, because an unmarked
+      // player is the common case and a blank gap reads as a rendering fault.
+      if (mark is { HasTags: true } tagged)
+        UiTheme.TextWrappedColored(UiTheme.AccentPurple, string.Join(", ", tagged.Tags));
+      else
+        UiTheme.TextWrappedColored(UiTheme.Muted, StatusSummary(mark) ?? "— No tags —");
 
       if (row?.IsWatching == true)
         UiTheme.TextWrappedColored(Plugin.Configuration.ColorWatcher, "Looking at you right now.");
@@ -437,8 +578,9 @@ public sealed class ProfileWindow : Window
     return row?.HomeWorldName is { Length: > 0 } live ? live : _worldName;
   }
 
-  /// <summary>The mark's flags as one line, or null when there is nothing to say.</summary>
-  private static string? Tags(MarkedPlayer? mark)
+  /// <summary>The mark's status flags as one line, or null when there is nothing to say. Not the user's custom
+  /// tags — those are <see cref="MarkedPlayer.Tags"/>, shown ahead of this on the header when present.</summary>
+  private static string? StatusSummary(MarkedPlayer? mark)
   {
     if (mark is null)
       return null;
@@ -505,10 +647,11 @@ public sealed class ProfileWindow : Window
 
     draw.AddRect(pos, pos + box, ImGui.GetColorU32(UiTheme.AccentPurple with { W = 0.6f }), rounding, 0, 2f * scale);
 
-    // An invisible button over the frame so the state has somewhere to explain itself. Hover only — there is
-    // nothing to click, and a portrait that opened something on click would be a trap.
+    // An invisible button over the frame: it explains the face on hover, and on CLICK opens the in-game portrait
+    // window — the one gesture that loads a player's Adventurer Plate portrait (see PortraitWindow).
     ImGui.SetCursorScreenPos(pos);
-    ImGui.InvisibleButton("##avatar", box);
+    if (ImGui.InvisibleButton("##avatar", box))
+      Plugin.PortraitView?.Open(key, _worldName);
 
     var tip = portrait.State switch
     {
@@ -527,7 +670,7 @@ public sealed class ProfileWindow : Window
         ? "Showing their job."
         : "Lodestone portraits are switched off in settings.",
     };
-    UiTheme.Tooltip(tip);
+    UiTheme.Tooltip(tip + "\r\n\r\nClick to view their in-game portrait, from their Adventurer Plate.");
   }
 
   /// <summary>
@@ -1078,101 +1221,90 @@ public sealed class ProfileWindow : Window
       // feel like it dismissed something rather than deleted something.
       _note = string.Empty;
     }
-    UiTheme.Tooltip("Forget this player — deletes the note, the colour and both ticks. Does not close this.");
+    UiTheme.Tooltip("Forget this player — deletes the note, the tags, the colour, both ticks and everything "
+      + "observed about them (sightings, duties, name history). Does not close this.");
 
     ImGui.SameLine(0, 6f * scale);
     UiTheme.TextWrappedColored(UiTheme.Muted, "Forget this player");
   }
 
   /// <summary>
-  /// What they have actually done, as opposed to what the user wrote about them.
+  /// ENCOUNTERS — the duties you cleared with this player, one row per fight, newest first.
   ///
-  /// Reads the live in-memory log, and does NOT persist it. How often someone stared at you is an observation
-  /// about them, not something the user wrote — so it is shown here and forgotten at logout, exactly like the
-  /// history pane it comes from. See <see cref="WatcherLog"/>.
+  /// The structured home of what used to be "Cleared X together." lines appended to the note (see DutyService).
+  /// Reads <see cref="MarkedPlayer.Encounters"/>, which is written only for marked players and only when
+  /// "Record duties you clear together" is on. Empty is the common case and says so plainly — a duty completing
+  /// is not a reason to remember a stranger, so a player only shows rows here once they were already marked when
+  /// you cleared something together.
   /// </summary>
-  private static List<(string Text, Vector4 Color)> BuildHistory(WatcherKey key, MarkedPlayer? mark)
+  private void DrawEncountersTab(MarkedPlayer? mark, float scale)
   {
-    var lines = new List<(string, Vector4)>(2);
+    ImGui.Dummy(new Vector2(0, 2f * scale));
+    UiTheme.SectionHeader("Encounters");
 
-    var stares = Plugin.WatcherLog.Snapshot().FirstOrDefault(entry => entry.Key == key);
-    if (stares is null)
-      lines.Add(NoSightings());
-    else
+    if (mark is null || mark.Encounters.Count == 0)
     {
-      // Not "0s": the dwell is sampled per scan, so a glance shorter than one interval genuinely measures zero.
-      // Printing 0s would report "they looked for no time at all" about someone who did look.
-      var held = stares.TotalStareMs <= 0
-        ? "too briefly to time"
-        : $"targeted for {FormatDwell(stares.TotalStareMs)}";
-
-      // THE COUNT SURVIVES, in the only branch where it says anything. One episode has no "first" and no "most
-      // recently", so it takes the short form. More than one and the bare form would print ONE clock time for
-      // five separate episodes — reporting the last as if it were the whole story, and silently dropping four.
-      // Count is episodes, not scans; see WatcherEntry.Count.
-      lines.Add((stares.Count == 1
-        ? $"Targeted @ {stares.FirstSeen:HH:mm:ss}  ({held})"
-        : $"Targeted {stares.Count}x, last @ {stares.LastSeen:HH:mm:ss}  ({held} in total)", UiTheme.Muted));
+      UiTheme.TextWrappedColored(UiTheme.Muted,
+        "No duties recorded together. When you clear a duty with someone you've already marked, it lands here — "
+        + "one row per fight, with a count. Turn it off under Marks in settings.");
+      return;
     }
 
-    // The one durable observation, shown where it is made rather than only in a file. See MarkedPlayer.LastSeen.
-    if (mark?.LastSeen is { } lastSeen)
-      lines.Add((string.IsNullOrEmpty(mark.LastSeenZone)
-        ? $"Last Seen: {ScentWindow.FormatAgo(lastSeen)}"
-        : $"Last Seen: {ScentWindow.FormatAgo(lastSeen)}, {mark.LastSeenZone}", UiTheme.Muted));
+    var labelCol = 70f * scale;
 
-    return lines;
-  }
+    // Newest clear first — the roster you actually want when you open this is "who did I last run something with".
+    foreach (var enc in mark.Encounters.OrderByDescending(e => e.LastCleared))
+    {
+      ImGui.AlignTextToFramePadding();
+      ImGui.TextUnformatted(enc.DutyName);
+      if (enc.Count > 1)
+      {
+        ImGui.SameLine(0, 6f * scale);
+        UiTheme.TextWrappedColored(UiTheme.AccentPurple, $"×{enc.Count}");
+      }
 
-  private static void DrawHistory(List<(string Text, Vector4 Color)> lines)
-  {
-    // No separator: the "Scent" section header above already draws the break. This is only the lines.
-    foreach (var (text, color) in lines)
-      UiTheme.TextWrappedColored(color, text);
+      // The "when", indented under the name so the fight names still line up down the tab.
+      ImGui.SetCursorPosX(ImGui.GetCursorPosX() + labelCol);
+      var when = enc.Count > 1
+        ? $"Last cleared {ScentWindow.FormatAgo(enc.LastCleared)} · first {ScentWindow.FormatAgo(enc.FirstCleared)}"
+        : $"Cleared {ScentWindow.FormatAgo(enc.LastCleared)}";
+      UiTheme.TextWrappedColored(UiTheme.Muted, when);
+    }
   }
 
   /// <summary>
-  /// Why there is no sighting — FOUR reasons, not one, and only the last of them is "they never looked at you".
+  /// HISTORY — the names and worlds this player went by before you repaired the mark with Renamed?.
   ///
-  /// THE OTHER THREE ARE THE SAME LIE THIS PLUGIN EXISTS TO REFUSE. An absent entry does not mean an absent
-  /// watcher: KeepHistory drops everyone not staring at this instant, HistoryLimit silently evicts the
-  /// least-recent down to ten by DEFAULT — so the eleventh person to look at you this session erases the first —
-  /// and with RecordWhileClosed off nothing is recorded while the window is shut. In a city plaza the eviction
-  /// branch is an ordinary afternoon. Reporting any of those as "they have never targeted you" would be the
-  /// coast-is-clear lie, told about the exact subject the plugin was built for, with total confidence.
-  ///
-  /// ScentWindow's own history pane already refuses this in this same log, and its comment says why. This is
-  /// that refusal, in this window's voice, with the two branches it did not need and this one does.
-  ///
-  /// A precise explanation of the WRONG nothing is worse than a dash: a dash does not claim authority.
+  /// Reads <see cref="MarkedPlayer.NameHistory"/>, which the store fills only on that deliberate repair (see
+  /// MarkStore.Rename). Empty is honest and common: the game never tells us a rename happened, so nothing here is
+  /// guessed — the one thing a rename plugin is most tempted to invent, and the one this plugin refuses to. The
+  /// empty state says exactly that, so a blank tab does not read as "they never renamed".
   /// </summary>
-  private static (string Text, Vector4 Color) NoSightings()
+  private void DrawHistoryTab(MarkedPlayer? mark, float scale)
   {
-    var config = Plugin.Configuration;
+    ImGui.Dummy(new Vector2(0, 2f * scale));
+    UiTheme.SectionHeader("History");
 
-    if (!config.KeepHistory)
+    if (mark is null || mark.NameHistory.Count == 0)
     {
-      return ("Not remembering. History is switched off, so only people looking at you right now appear here — "
-        + "this cannot tell you whether they did earlier.", UiTheme.Warn);
+      UiTheme.TextWrappedColored(UiTheme.Muted,
+        "No former names recorded. The game never announces a rename or a world transfer, so nothing here is "
+        + "guessed — this fills in only when you use Renamed? in settings to point a mark at who someone is now, "
+        + "which is the one honest source for it.");
+      return;
     }
 
-    if (Plugin.WatcherLog.Forgotten is > 0 and var forgotten)
-    {
-      return ($"{forgotten} {(forgotten == 1 ? "watcher has" : "watchers have")} already been dropped from this "
-        + $"session's log — it keeps {Math.Max(1, config.HistoryLimit)}. If they were one of them, this says "
-        + "nothing about them.", UiTheme.Warn);
-    }
+    UiTheme.TextWrappedColored(UiTheme.Muted, "Names you've told me they used to go by, newest first:");
+    ImGui.Dummy(new Vector2(0, 4f * scale));
 
-    if (!config.RecordWhileClosed && !Plugin.IsMainWindowOpen)
+    // Already newest-first out of the store (CombineHistory sorts by ChangedOn desc), so no re-sort here.
+    foreach (var past in mark.NameHistory)
     {
-      return ("They have never targeted you while the Scent window was open — and staring is only recorded "
-        + "while it is open.", UiTheme.Muted);
+      ImGui.AlignTextToFramePadding();
+      UiTheme.TextWrappedColored(UiTheme.AccentBlue, past.FullName);
+      ImGui.SameLine(0, 8f * scale);
+      UiTheme.TextWrappedColored(UiTheme.Muted, $"— you repaired this {ScentWindow.FormatAgo(past.ChangedOn)}");
     }
-
-    // The true never. The second sentence is mandatory: FirstSeen is the first time they TARGETED you, so a
-    // null here must never be read as "never seen".
-    return ("They have never targeted you this session. That is not the same as never being near you — nothing "
-      + "here records who was merely around.", UiTheme.Muted);
   }
 
   /// <summary>Cumulative dwell, in the coarsest unit that is still true. Its own formatter rather than

@@ -14,10 +14,14 @@ namespace HrothgarScent.Scent;
 /// name the fight. The noise problem solves itself: the event IS the filter, so there is no per-zone capture
 /// policy to configure and no matrix to get wrong.
 ///
-/// DECORATION, NOT CAPTURE. This appends a line to the note of a player ALREADY IN THE MARK STORE, and creates
-/// nothing. A duty completing is not a deliberate user act, so it cannot be the reason a record exists — that
-/// is the store's one rule. Everyone else in the party is a stranger who happened to be there, and they stay
-/// strangers.
+/// DECORATION, NOT CAPTURE. This records a clear on a player ALREADY IN THE MARK STORE, and creates nothing. A
+/// duty completing is not a deliberate user act, so it cannot be the reason a record exists — that is the store's
+/// one rule. Everyone else in the party is a stranger who happened to be there, and they stay strangers.
+///
+/// The clear now lands as a structured <see cref="DutyEncounter"/> row — read by the profile's Encounters tab —
+/// rather than as a "Cleared X together." line appended to the note. The note is the user's prose again; the
+/// clears are data the plugin can count and sort. See <see cref="MarkStore.RecordEncounter"/> for why the
+/// aggregate-per-fight shape keeps this bounded, which was the whole reason the note append was defensible.
 /// </summary>
 public sealed class DutyService : IDisposable
 {
@@ -98,12 +102,12 @@ public sealed class DutyService : IDisposable
           continue;
 
         // ONLY someone already marked, and never someone ignored. Creating a record here would make a duty
-        // completing into a reason to remember a stranger, which is the one thing the store refuses; writing to
-        // an ignored player's note would be announcing them to themselves in the user's own file.
+        // completing into a reason to remember a stranger, which is the one thing the store refuses; recording on
+        // an ignored player would be logging them into the user's own file about a person they asked never to see.
         if (marks.Find(row.Key) is not { IsIgnored: false })
           continue;
 
-        Plugin.Marks.Update(row.Key, row.HomeWorldName, mark => Append(mark, name));
+        Plugin.Marks.RecordEncounter(row.Key, name, DateTimeOffset.Now);
         cleared++;
       }
 
@@ -123,27 +127,6 @@ public sealed class DutyService : IDisposable
     {
       Plugin.Log.Error(ex, "Recording a duty clear failed");
     }
-  }
-
-  /// <summary>
-  /// Adds a clear to a note, once.
-  ///
-  /// APPENDS TO THE NOTE rather than adding a field, and that is the whole design in one line: a field would be
-  /// a second observational member on the record, and MarkedPlayer's own rule is that a third needs the same
-  /// argument the first two made — plus a list of clears is a history, which is the shape that has to grow. A
-  /// note is a string the user already owns and can edit or delete like any other. It is their file.
-  ///
-  /// Never twice for the same fight: the note is the user's, and filling it with repeats of one duty name is
-  /// vandalism with extra steps.
-  /// </summary>
-  private static MarkedPlayer Append(MarkedPlayer mark, string dutyName)
-  {
-    var line = $"Cleared {dutyName} together.";
-    if (mark.Note.Contains(line, StringComparison.Ordinal))
-      return mark;
-
-    var note = mark.HasNote ? $"{mark.Note}\n{line}" : line;
-    return mark with { Note = note };
   }
 
   /// <summary>

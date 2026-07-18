@@ -79,17 +79,28 @@ public sealed class ScentScanner : IDisposable
   private string _zoneName = string.Empty;
 
   /// <summary>
-  /// Every nearby identity as of the previous scan — not just the focused ones.
+  /// When each nearby identity — the WHOLE crowd, not just the focused — was last seen in range, as a
+  /// TickCount64. The memory behind the focus-arrival edge, and it is timestamped rather than a one-scan set for
+  /// one concrete reason: a focus-marked player hovering at the object table's load boundary blips in and out
+  /// over seconds, and a one-scan "was nearby last frame" test re-announced them every time they blipped back.
+  /// Keeping WHEN they were last here lets an arrival require a genuine absence — see <see cref="FocusReArmMs"/>
+  /// — so a brief flicker stays silent while a real departure-and-return still speaks.
   ///
-  /// The whole crowd, because "arrived" must mean "was not in range a moment ago". A set of only the focused
-  /// would answer the wrong question: unfocusing a player standing in front of you and focusing them again
-  /// would drop them out and put them back, and the next scan would call that an arrival and announce a player
-  /// who never moved. Keyed on nearby-ness, the same edit is silent, which is correct — editing a list is not
-  /// an arrival.
+  /// The whole crowd, not focus-only, so re-focusing a player standing in front of you is silent: they were
+  /// nearby a moment ago regardless of the mark edit, and editing a list is not an arrival.
   ///
-  /// Framework-thread-owned, exactly like <see cref="_previousWatchers"/>.
+  /// Framework-thread-owned, exactly like <see cref="_previousWatchers"/>. Pruned each scan to entries seen
+  /// within the grace, so it stays bounded to the recent crowd rather than everyone ever seen this session.
   /// </summary>
-  private HashSet<WatcherKey> _previousNearby = [];
+  private readonly Dictionary<WatcherKey, long> _lastNearbyTick = [];
+
+  /// <summary>
+  /// How long a focus-marked player must be OUT of range before returning counts as a fresh arrival worth
+  /// announcing. Short enough that a genuine walk-away-and-back still greets them; long enough to swallow the
+  /// object-table edge flicker that was re-announcing a stationary friend. It is the answer to "stop telling me
+  /// they're here unless they actually left".
+  /// </summary>
+  private const long FocusReArmMs = 20_000;
 
   /// <summary>
   /// Guards <see cref="_forgetKeys"/> and <see cref="_forgetAllKeys"/>, the queue by which the render thread
@@ -289,8 +300,17 @@ public sealed class ScentScanner : IDisposable
     // to a file — it would read as nonsense the moment the machine restarts. And an offset rather than a bare
     // DateTime, so a record written in one time zone still means what it said in another.
     var wantLastSeen = config.RememberLastSeen && marks.Entries.Count > 0;
-    var seenAt = wantLastSeen ? DateTimeOffset.Now : default;
-    var zoneName = wantLastSeen ? ZoneName() : string.Empty;
+
+    // The opt-in durable log of EVERYONE nearby, off by default and its own bounded store (see SeenLog). Both
+    // halves want the same two facts below, so they are computed once when EITHER is on.
+    var wantNearbyLog = config.RecordAllNearby;
+    var record = wantLastSeen || wantNearbyLog;
+    var seenAt = record ? DateTimeOffset.Now : default;
+    var zoneName = record ? ZoneName() : string.Empty;
+
+    // Monotonic clock for the focus-arrival presence memory. TickCount64, not the DateTimeOffset above: this
+    // measures a gap between scans, never a wall-clock moment, and it must not lurch when the clock is set.
+    var nowTicks = Environment.TickCount64;
 
     // The two facts the info bar needs but cannot afford to work out for itself. See the loop below.
     var markedNearby = false;
@@ -308,6 +328,13 @@ public sealed class ScentScanner : IDisposable
       // cannot create a record for anyone. See MarkStore.RecordSeen.
       if (wantLastSeen)
         Plugin.Marks.RecordSeen(row.Key, zoneName, seenAt);
+
+      // Everyone nearby, into the opt-in log — never the mark store. It creates records (that is the point), which
+      // is why it is off by default; see SeenLog. Race is passed only once RESOLVED (RaceId 0 is the not-loaded
+      // sentinel, whose RaceName is a placeholder) so the auto-tag is never "Unknown"; SeenLog fills it in later.
+      if (wantNearbyLog)
+        Plugin.SeenLog.RecordSeen(row.Key, row.HomeWorldName, row.RaceId != 0 ? row.RaceName : string.Empty,
+          zoneName, seenAt);
 
       // Resolved HERE, in the loop that already walks every row, and published on the snapshot — never worked
       // out by the info bar. UpdateDtr runs on EVERY frame, unthrottled, and ahead of its own change guard, so
@@ -372,10 +399,17 @@ public sealed class ScentScanner : IDisposable
         current[row.Key] = state;
       }
 
-      // Arrival, not focus-change: the test is against who was NEARBY last scan, so re-focusing someone already
-      // standing there stays quiet. See _previousNearby.
-      if (wantFocusAlerts && !_previousNearby.Contains(row.Key) && marks.IsFocused(row.Key))
+      // Arrival, with hysteresis: a focus-marked player counts as arriving only if they have NOT been in range
+      // within the grace — so a friend flickering at the load boundary does not re-announce every blip, staying
+      // in range stays silent, and re-focusing a present player is silent too (their tick is recent regardless
+      // of the edit). A genuine departure past the grace, then a return, still speaks. See _lastNearbyTick.
+      if (wantFocusAlerts && marks.IsFocused(row.Key)
+          && !(_lastNearbyTick.TryGetValue(row.Key, out var lastNearby) && nowTicks - lastNearby <= FocusReArmMs))
         (arrived ??= []).Add(row);
+
+      // Stamped AFTER the arrival test reads it, and for EVERY nearby player so the whole crowd's presence is
+      // remembered — the property that keeps a mark edit from reading as an arrival.
+      _lastNearbyTick[row.Key] = nowTicks;
     }
 
     _log.Sync(rows, current);
@@ -457,7 +491,21 @@ public sealed class ScentScanner : IDisposable
     // Updated unconditionally, including when we chose not to record: otherwise every watcher already
     // present would re-fire the moment the window opened.
     _previousWatchers = current;
-    _previousNearby = nearbyKeys;
+
+    // Prune the presence memory to entries seen within the grace: an entry older than that can only ever answer
+    // "not recent", so dropping it changes no arrival decision and keeps the map bounded to the recent crowd
+    // rather than everyone seen this session. Current players were just stamped nowTicks, so they survive.
+    if (_lastNearbyTick.Count > 0)
+    {
+      var cutoff = nowTicks - FocusReArmMs;
+      List<WatcherKey>? stale = null;
+      foreach (var (key, tick) in _lastNearbyTick)
+        if (tick < cutoff)
+          (stale ??= []).Add(key);
+      if (stale is not null)
+        foreach (var key in stale)
+          _lastNearbyTick.Remove(key);
+    }
 
     // ToArray freezes the projection — the List must not escape, or a later scan could grow it under a
     // reader mid-draw. One reference write publishes the whole thing; reference assignment is atomic, so no
@@ -642,7 +690,11 @@ public sealed class ScentScanner : IDisposable
       return;
 
     _previousWatchers.Clear();
-    _previousNearby.Clear();
+
+    // Cleared on a zone change with the rest: a focus-marked player standing in the zone you just arrived in HAS
+    // arrived from your side of it, so their presence memory should not carry across the boundary. Same rule the
+    // whole-crowd set followed before.
+    _lastNearbyTick.Clear();
 
     _log.Sync([], NoWatchers);
     Volatile.Write(ref _snapshot, ScentSnapshot.Empty);

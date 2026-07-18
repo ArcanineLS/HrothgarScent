@@ -316,7 +316,55 @@ public sealed class MarkStore
     if (existing is null || !NeedsTouch(existing, zoneName, now))
       return;
 
-    Update(key, existing.HomeWorldName, mark => mark with { LastSeen = now, LastSeenZone = zoneName });
+    // A REUNION — a genuinely separate visit — advances the count and seeds FirstSeen. NeedsTouch also fires on a
+    // mere zone change (to keep LastSeenZone honest), and that path must NOT inflate the count: a marked friend
+    // zoning around beside you all evening is one encounter, not ten. So the count steps on the same 30-minute
+    // boundary LastSeen already treats as a reunion, and a first-ever sighting (LastSeen null) is a reunion too.
+    var reunion = existing.LastSeen is not { } last || now - last >= ReunionThreshold;
+
+    Update(key, existing.HomeWorldName, mark => mark with
+    {
+      LastSeen = now,
+      LastSeenZone = zoneName,
+
+      // Both seeded ONLY on a reunion, so they can never disagree. FirstSeen gated the same way as SeenCount is
+      // the whole point: a mark carried over from before this shipped has LastSeen but no FirstSeen, and a mere
+      // zone-change write (NeedsTouch true, reunion false) would otherwise backfill FirstSeen while leaving the
+      // count at zero — the profile then reading "First Seen: 3 days ago" beside "Seen Count: N/A". Coupling them
+      // keeps "there is a first sighting" and "there is at least one sighting" the same fact. It fills in on the
+      // next real reunion, exactly as the old note promised, just without the contradiction in between.
+      FirstSeen = reunion ? mark.FirstSeen ?? now : mark.FirstSeen,
+      SeenCount = reunion ? mark.SeenCount + 1 : mark.SeenCount,
+    });
+  }
+
+  /// <summary>
+  /// Notes that a marked player was in a duty you just cleared, aggregated by fight.
+  ///
+  /// The structured sibling of <see cref="RecordSeen"/>, and it keeps the same consent line in the same one
+  /// statement: it NEVER CREATES A RECORD — an absent mark returns, because clearing a duty with a stranger is
+  /// not a reason to remember them. DutyService already filters to marked, non-ignored players; this only
+  /// aggregates, which is why it is here and not a note append.
+  ///
+  /// One row per distinct fight: an existing row bumps its count and last-cleared, a new fight appends one. The
+  /// list is bounded by the number of duties in the game, never by the number of clears — <see cref="DutyEncounter"/>.
+  /// </summary>
+  public void RecordEncounter(WatcherKey key, string dutyName, DateTimeOffset now)
+  {
+    if (string.IsNullOrEmpty(dutyName) || Index.Find(key) is not { } existing)
+      return;
+
+    Update(key, existing.HomeWorldName, mark =>
+    {
+      var encounters = new List<DutyEncounter>(mark.Encounters);
+      var i = encounters.FindIndex(e => string.Equals(e.DutyName, dutyName, StringComparison.Ordinal));
+      if (i >= 0)
+        encounters[i] = encounters[i] with { Count = encounters[i].Count + 1, LastCleared = now };
+      else
+        encounters.Add(new DutyEncounter(dutyName, 1, now, now));
+
+      return mark with { Encounters = encounters };
+    });
   }
 
   /// <summary>
@@ -397,14 +445,24 @@ public sealed class MarkStore
       if (newKey == key)
         return;
 
+      // The identity we are moving AWAY from, captured before the move erases it, so History can show where the
+      // mark came from. ChangedOn is now — when the repair happened, not when the rename did, which the game
+      // never tells us (see PastIdentity).
+      var past = new PastIdentity(mark.Name, mark.HomeWorldId, mark.HomeWorldName, DateTimeOffset.Now);
+
       var moved = mark with { Name = newName, HomeWorldId = newWorldId, HomeWorldName = newWorldName };
 
-      if (_entries.TryGetValue(newKey, out var existing))
+      _entries.TryGetValue(newKey, out var existing);
+
+      if (existing is not null)
         moved = moved with
         {
           Marks = existing.Marks | moved.Marks,
           Note = existing.HasNote ? existing.Note : moved.Note,
           Color = existing.Color ?? moved.Color,
+
+          // Union: two records the user is declaring one person keep every tag either had.
+          Tags = UnionTags(existing.Tags, moved.Tags),
 
           // The earlier of the two: the user has been watching for this person since whichever came first.
           MarkedOn = existing.MarkedOn < moved.MarkedOn ? existing.MarkedOn : moved.MarkedOn,
@@ -412,7 +470,17 @@ public sealed class MarkStore
           // The later, and the one whose zone goes with it: the freshest sighting is the true one.
           LastSeen = Later(existing, moved)?.LastSeen,
           LastSeenZone = Later(existing, moved)?.LastSeenZone ?? string.Empty,
+
+          // FirstSeen is the earliest either record holds; SeenCount and the duty rows are the two combined —
+          // it is one person, so their sightings and clears are one history.
+          FirstSeen = EarlierNullable(existing.FirstSeen, moved.FirstSeen),
+          SeenCount = existing.SeenCount + moved.SeenCount,
+          Encounters = MergeEncounters(existing.Encounters, moved.Encounters),
         };
+
+      // The rename trail, newest-first: the from-identity, then whatever either side already remembered, deduped
+      // — and never listing the identity they now ARE. Computed after the merge so both branches feed it.
+      moved = moved with { NameHistory = CombineHistory(newKey, past, mark.NameHistory, existing?.NameHistory) };
 
       _entries.Remove(key);
       _entries[newKey] = moved;
@@ -430,6 +498,137 @@ public sealed class MarkStore
         (not null, null) => a,
         var (x, y) => x >= y ? a : b,
       };
+
+    static DateTimeOffset? EarlierNullable(DateTimeOffset? a, DateTimeOffset? b)
+      => (a, b) switch
+      {
+        (null, _) => b,
+        (_, null) => a,
+        var (x, y) => x <= y ? a : b,
+      };
+
+    static IReadOnlyList<string> UnionTags(IReadOnlyList<string> a, IReadOnlyList<string> b)
+    {
+      // OrdinalIgnoreCase and the same cap AddTag enforces, so a rename-merge cannot smuggle in "Static" beside
+      // "static", nor push a merged record past MaxTagsPerPlayer — the invariant AddTag holds everywhere else.
+      var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+      var merged = new List<string>(a.Count + b.Count);
+      foreach (var tag in a)
+        if (merged.Count < MaxTagsPerPlayer && seen.Add(tag)) merged.Add(tag);
+      foreach (var tag in b)
+        if (merged.Count < MaxTagsPerPlayer && seen.Add(tag)) merged.Add(tag);
+      return merged;
+    }
+
+    static IReadOnlyList<DutyEncounter> MergeEncounters(IReadOnlyList<DutyEncounter> a, IReadOnlyList<DutyEncounter> b)
+    {
+      var byName = new Dictionary<string, DutyEncounter>(StringComparer.Ordinal);
+      foreach (var e in a)
+        byName[e.DutyName] = e;
+      foreach (var e in b)
+        byName[e.DutyName] = byName.TryGetValue(e.DutyName, out var have)
+          ? have with
+          {
+            Count = have.Count + e.Count,
+            FirstCleared = have.FirstCleared <= e.FirstCleared ? have.FirstCleared : e.FirstCleared,
+            LastCleared = have.LastCleared >= e.LastCleared ? have.LastCleared : e.LastCleared,
+          }
+          : e;
+      return [.. byName.Values];
+    }
+
+    // The from-identity ahead of whatever either record remembered, deduped by (name, world) keeping the most
+    // recent ChangedOn, newest first, and never carrying the identity the mark now IS — a current name has no
+    // place in a list of former ones.
+    static IReadOnlyList<PastIdentity> CombineHistory(WatcherKey current, PastIdentity head,
+      IReadOnlyList<PastIdentity>? a, IReadOnlyList<PastIdentity>? b)
+    {
+      var byKey = new Dictionary<WatcherKey, PastIdentity>();
+      void Add(PastIdentity p)
+      {
+        var k = new WatcherKey(p.Name, p.HomeWorldId);
+        if (k == current)
+          return;
+        if (!byKey.TryGetValue(k, out var have) || p.ChangedOn > have.ChangedOn)
+          byKey[k] = p;
+      }
+
+      Add(head);
+      if (a is not null) foreach (var p in a) Add(p);
+      if (b is not null) foreach (var p in b) Add(p);
+
+      return [.. byKey.Values.OrderByDescending(p => p.ChangedOn)];
+    }
+  }
+
+  /// <summary>Longest a single tag may be, and the most tags one player may carry. Bounds on a hand-typed field,
+  /// not validation: the journal's filter chips and the profile's header both render tags inline, and an
+  /// unbounded tag is a way to push a novel into a chip. Same spirit as <see cref="ProfileWindow"/>'s note cap.</summary>
+  public const int TagMaxLength = 24;
+
+  /// <summary>How many tags one player may carry; see <see cref="TagMaxLength"/>.</summary>
+  public const int MaxTagsPerPlayer = 16;
+
+  /// <summary>
+  /// Files a player under a tag, creating the record if there is none — a tag is user-authored, so adding one to
+  /// an unmarked player is a deliberate act that marks them, exactly as a note would.
+  ///
+  /// Case-insensitive de-dupe keeping the FIRST casing the user typed, and a silent no-op once the cap is hit or
+  /// the tag is blank: the journal is a fast, forgiving surface, and a tag editor that threw error text would be
+  /// the wrong register for it.
+  /// </summary>
+  public void AddTag(WatcherKey key, string homeWorldName, string tag)
+  {
+    var clean = NormaliseTag(tag);
+    if (clean.Length == 0)
+      return;
+
+    Update(key, homeWorldName, mark =>
+    {
+      if (mark.Tags.Count >= MaxTagsPerPlayer
+          || mark.Tags.Any(t => string.Equals(t, clean, StringComparison.OrdinalIgnoreCase)))
+        return mark;
+
+      return mark with { Tags = [.. mark.Tags, clean] };
+    });
+  }
+
+  /// <summary>
+  /// Removes a tag, case-insensitively. If it was the last thing the user had said about this player, the record
+  /// goes with it — the delete-when-empty rule in <see cref="Update"/>, which now counts tags as something said.
+  /// </summary>
+  public void RemoveTag(WatcherKey key, string tag)
+  {
+    if (Index.Find(key) is not { } existing)
+      return;
+
+    Update(key, existing.HomeWorldName, mark => mark with
+    {
+      Tags = [.. mark.Tags.Where(t => !string.Equals(t, tag, StringComparison.OrdinalIgnoreCase))],
+    });
+  }
+
+  /// <summary>Trimmed and length-capped. A tag reduced to whitespace is nothing; a giant one is clipped rather
+  /// than refused, on the same forgiving-surface reasoning as <see cref="AddTag"/>.</summary>
+  private static string NormaliseTag(string tag)
+  {
+    var trimmed = tag.Trim();
+    return trimmed.Length <= TagMaxLength ? trimmed : trimmed[..TagMaxLength].Trim();
+  }
+
+  /// <summary>Every distinct tag in use across all marks, case-insensitively de-duped and ordered for a stable
+  /// filter row. Off the published index, so no gate.</summary>
+  public IReadOnlyList<string> AllTags()
+  {
+    var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    var tags = new List<string>();
+    foreach (var mark in Index.Entries.Values)
+      foreach (var tag in mark.Tags)
+        if (seen.Add(tag))
+          tags.Add(tag);
+
+    tags.Sort(StringComparer.OrdinalIgnoreCase);
+    return tags;
   }
 
   /// <summary>Forgets a player outright, whatever they were marked with. The config window's delete button.</summary>

@@ -88,6 +88,10 @@ public sealed class Plugin : IDalamudPlugin
   /// <summary>The game's own icons. Needs no caching and no disposal of ours — see ScentWindow's job cell.</summary>
   [PluginService] public static ITextureProvider Textures { get; private set; } = null!;
 
+  /// <summary>Reads a texture back to bytes and writes it to a file — the one that saves a captured portrait to
+  /// disk. A separate service from <see cref="Textures"/>; see <see cref="PortraitService"/>.</summary>
+  [PluginService] public static ITextureReadbackProvider TextureReadback { get; private set; } = null!;
+
   /// <summary>The nameplates over players' heads. Gate #6 of the PvP defence lives on this one; see
   /// <see cref="NameplateService.Sync"/>.</summary>
   [PluginService] public static INamePlateGui NamePlateGui { get; private set; } = null!;
@@ -96,14 +100,27 @@ public sealed class Plugin : IDalamudPlugin
   /// DutyService.RecordClear.</summary>
   [PluginService] public static IDutyState DutyState { get; private set; } = null!;
 
+  /// <summary>Addon open/refresh/close events. Backs <see cref="PortraitService"/>, which watches the Adventurer
+  /// Plate (CharaCard) to capture a player's rendered portrait.</summary>
+  [PluginService] public static IAddonLifecycle AddonLifecycle { get; private set; } = null!;
+
   public static Configuration Configuration { get; private set; } = null!;
   public static ScentScanner Scanner { get; private set; } = null!;
   public static WatcherLog WatcherLog { get; private set; } = null!;
   public static AlertService Alerts { get; private set; } = null!;
 
+  /// <summary>How many times each player has emoted at you this session — /pet, /hug and the rest. In memory,
+  /// dies at logout; the social-observation sibling of <see cref="WatcherLog"/>. See <see cref="EmoteLog"/>.</summary>
+  public static EmoteLog Emotes { get; private set; } = null!;
+
   /// <summary>The durable record of players the user pointed at. The counterpart to <see cref="WatcherLog"/>,
   /// which is the record of players who pointed at them, and which is never written down.</summary>
   public static MarkStore Marks { get; private set; } = null!;
+
+  /// <summary>The OPT-IN durable log of everyone seen nearby — off by default (Configuration.RecordAllNearby),
+  /// bounded, and NEVER the mark store. The one place the plugin writes a stranger to disk by proximity, and only
+  /// because the user asked. See <see cref="SeenLog"/>.</summary>
+  public static SeenLog SeenLog { get; private set; } = null!;
 
   /// <summary>The eye over their head. Off unless the user asks.</summary>
   public static NameplateService Nameplates { get; private set; } = null!;
@@ -115,9 +132,17 @@ public sealed class Plugin : IDalamudPlugin
   /// logout; see <see cref="LodestoneService"/> for why this is the one thing here that touches a network.</summary>
   public static LodestoneService Lodestone { get; private set; } = null!;
 
+  /// <summary>Rendered portraits captured from a player's own Adventurer Plate, on a click or (opt-in) as the
+  /// user opens plates. In memory, dies at logout; see <see cref="PortraitService"/>.</summary>
+  public static PortraitService Portraits { get; private set; } = null!;
+
   /// <summary>The profile. A window of its own rather than a popup inside the list, because the game's own
   /// right-click menus reach players the list has never seen and can open this with the list shut.</summary>
   internal static ProfileWindow? Profile { get; private set; }
+
+  /// <summary>The in-game portrait, on its own — opened only by clicking a profile picture. Static like
+  /// <see cref="Profile"/> so the profile's avatar can reach it without a plugin-instance reference.</summary>
+  internal static PortraitWindow? PortraitView { get; private set; }
 
   /// <summary>Notes a cleared duty on the marks who were there. Never creates one.</summary>
   private readonly DutyService _duties;
@@ -125,6 +150,7 @@ public sealed class Plugin : IDalamudPlugin
   public readonly WindowSystem WindowSystem = new("HrothgarScent");
   private ScentWindow ScentWindow { get; init; }
   private ConfigWindow ConfigWindow { get; init; }
+  private JournalWindow JournalWindow { get; init; }
 
   /// <summary>
   /// Static mirror of <see cref="ScentWindow"/>, backing <see cref="IsMainWindowOpen"/>. The scanner is
@@ -139,6 +165,11 @@ public sealed class Plugin : IDalamudPlugin
   /// plugin instance to reach the instance method with.
   /// </summary>
   private static ConfigWindow? _configWindow;
+
+  /// <summary>Static mirror of <see cref="JournalWindow"/>, backing <see cref="ToggleJournalWindow"/> — the same
+  /// reason as <see cref="_configWindow"/>: surfaces without a plugin-instance reference (a future toolbar
+  /// button, the command's static handler) still need to reach it.</summary>
+  private static JournalWindow? _journalWindow;
 
   /// <summary>
   /// The server info bar entry, or null if the bar refused us one. DtrBar.Get throws when the title is
@@ -174,7 +205,16 @@ public sealed class Plugin : IDalamudPlugin
     // then persist that as the user's choice.
     Configuration.Migrate();
 
+    // Beside the marks and before the scanner that feeds it. Its own bounded, opt-in store; blocking Load for
+    // the same reason Marks.Load blocks — the scanner must not write a one-entry file over the real one.
+    SeenLog = new SeenLog();
+    SeenLog.Load();
+
     WatcherLog = new WatcherLog();
+
+    // Session-only, like the watcher log. Subscribes to the emote chat log here; needs only ChatGui, which is up.
+    Emotes = new EmoteLog();
+    Emotes.Subscribe();
 
     // Before AlertService, which embeds it in the very first alert it prints.
     TargetLink = ChatGui.AddChatLinkHandler(TargetLinkCommandId, OnTargetLink);
@@ -192,18 +232,27 @@ public sealed class Plugin : IDalamudPlugin
     // Before the windows, which ask it for a face on their first frame.
     Lodestone = new LodestoneService();
 
+    // Before the windows too — the profile asks it for a captured portrait on its first frame. Registers its own
+    // Adventurer Plate listener in its constructor.
+    Portraits = new PortraitService();
+
     ScentWindow = new ScentWindow();
     ConfigWindow = new ConfigWindow();
+    JournalWindow = new JournalWindow();
     Profile = new ProfileWindow();
+    PortraitView = new PortraitWindow();
     _mainWindow = ScentWindow;
     _configWindow = ConfigWindow;
+    _journalWindow = JournalWindow;
     WindowSystem.AddWindow(ScentWindow);
     WindowSystem.AddWindow(ConfigWindow);
+    WindowSystem.AddWindow(JournalWindow);
     WindowSystem.AddWindow(Profile);
+    WindowSystem.AddWindow(PortraitView);
 
     CommandManager.AddHandler(CommandMain, new CommandInfo(OnCommand)
     {
-      HelpMessage = "Opens the Scent window. '/hrothgarscent config' opens settings.",
+      HelpMessage = "Opens the Scent window. 'config' opens settings, 'journal' opens everyone you've marked.",
       AllowedInMacros = true,
     });
     CommandManager.AddHandler(CommandShort, new CommandInfo(OnCommand)
@@ -278,11 +327,16 @@ public sealed class Plugin : IDalamudPlugin
     WindowSystem.RemoveAllWindows();
     _mainWindow = null;
     _configWindow = null;
+    _journalWindow = null;
     Profile = null;
+    PortraitView = null;
 
     // Owns GPU textures, so it goes explicitly rather than waiting on a finalizer. Also flips its disposed flag
     // under its own lock, so a lookup still in flight drops its texture instead of parking it in a dead cache.
     Lodestone.Dispose();
+
+    // Same reasons as Lodestone — owns GPU textures and an addon listener — so it goes explicitly too.
+    Portraits.Dispose();
 
     // The lines themselves stay in the log — chat cannot be unprinted — but the links in them go dead here, and
     // that is correct rather than a shortfall: after this there is no scanner, no PvP gate and no object table
@@ -293,6 +347,9 @@ public sealed class Plugin : IDalamudPlugin
 
     Scanner.Dispose();
 
+    // Unsubscribes from the emote chat log. In-memory only, so nothing to flush.
+    Emotes.Dispose();
+
     _duties.Dispose();
 
     // Detaches the handler and scrubs what it painted. Before the scanner's data goes, so the redraw it asks
@@ -302,6 +359,7 @@ public sealed class Plugin : IDalamudPlugin
     // After the scanner stops, so nothing can queue another write behind this one. Bounded internally: a hung
     // disk must not wedge a synchronous unload.
     Marks.Flush();
+    SeenLog.Flush();
 
     UiTheme.HeaderFont?.Dispose();
     UiTheme.HeaderFont = null;
@@ -320,6 +378,21 @@ public sealed class Plugin : IDalamudPlugin
   public void ToggleMainUI() => ScentWindow.Toggle();
 
   public void ToggleConfigUI() => ConfigWindow.Toggle();
+
+  public void ToggleJournalUI() => JournalWindow.Toggle();
+
+  /// <summary>The same action as <see cref="ToggleJournalUI"/>, reachable without the plugin instance — the same
+  /// reason <see cref="ToggleConfigWindow"/> exists.</summary>
+  internal static void ToggleJournalWindow() => _journalWindow?.Toggle();
+
+  /// <summary>Toggles HUD mode — the quiet, chrome-less Scent window. The one action shared by the /hscent hud
+  /// command and the title bar's HUD button, so the two cannot drift.</summary>
+  internal static void ToggleHud()
+  {
+    Configuration.HudMode = !Configuration.HudMode;
+    Configuration.Save();
+    ChatGui.Print(Configuration.HudMode ? "Going quiet." : "Coming back.", ChatTag, ChatTagColor);
+  }
 
   /// <summary>
   /// The same action as <see cref="ToggleConfigUI"/>, reachable without the plugin instance. Render thread
@@ -453,12 +526,16 @@ public sealed class Plugin : IDalamudPlugin
         ToggleConfigUI();
         return;
 
+      case "journal" or "j":
+        // Not PvP-gated at the command like the default is: the journal's own DrawConditions refuses to draw in
+        // a match, so a toggle here is harmless and a refusal would be a special case for no gain.
+        ToggleJournalUI();
+        return;
+
       case "hud":
         // Also the escape hatch out of click-through, which makes the Scent window itself unclickable —
         // including the control that would turn it back off.
-        Configuration.HudMode = !Configuration.HudMode;
-        Configuration.Save();
-        ChatGui.Print(Configuration.HudMode ? "Going quiet." : "Coming back.", ChatTag, ChatTagColor);
+        ToggleHud();
         return;
 
       default:
@@ -739,16 +816,34 @@ public sealed class Plugin : IDalamudPlugin
     // rather than easier.
     Lodestone.Clear();
 
+    // A captured plate is the same kind of session state about a stranger — it dies with the session too, on the
+    // same rule as the Lodestone face beside it.
+    Portraits.Clear();
+
     // The session-quiet judgements ("I've seen this stranger, I'm fine") go with the session that formed them,
     // on the same rule: a stranger the user merely stopped being pinged about earned no durable record.
     Alerts.ClearQuieted();
 
+    // Emote tallies are session social observations about strangers — they die with the session, like the watcher
+    // log they mirror.
+    Emotes.Clear();
+
     Marks.Flush();
+
+    // Persisted, NOT cleared: the nearby log is durable by design (that is the whole point of the opt-in), so it
+    // survives logout exactly as the marks do. Only the ephemeral stores — the watcher log, the faces, the
+    // portraits' textures, the session-quiet — die here.
+    SeenLog.Flush();
+
     ScentWindow.IsOpen = false;
 
     // The profile names a person and shows their face. Left open, it would greet the next character to log in
     // with the last one's stranger still on screen.
     if (Profile is not null)
       Profile.IsOpen = false;
+
+    // The portrait window shows a face too, and on the same reasoning it closes with the session.
+    if (PortraitView is not null)
+      PortraitView.IsOpen = false;
   }
 }
