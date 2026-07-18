@@ -18,5 +18,5 @@
   "ImageUrls": [
     ""
   ],
-  "Changelog": ""
+  "Changelog": "A near-total feature release. The window now splits into Nearby and Targeted tabs, and every row shows whether that player is watching you right now — a glance escalating to a stare to a fixation as they hold you. Marks let you keep durable notes, colours and focus/ignore flags on anyone. Alerts coalesce into one chat line and sound with a clickable link that targets the watcher, a one-click 'quiet this session', and notes for duties you clear together. Optional nameplate colouring for watchers and focused players. A full profile window — their Lodestone face and character page (Free Company, race, title, jobs by role, Eureka/Bozja/Occult Crescent progress and Phantom Jobs, their public comment) alongside everything you wrote — reachable from the game's own right-click menu anywhere a player is named. Nothing is collected in PvP."
 }
