@@ -20,6 +20,7 @@ A FFXIV [Dalamud](https://github.com/goatcorp/Dalamud) plugin that lists the pla
 - **Alerts** in chat and/or sound when someone *new* targets you, with a cooldown so a crowd can't spam it.
 - **Escalation** — a glance and a thirty-second stare are not the same event, and Hrothgar says which one it is.
 - **Marks** — remember the people you care about. A note, a colour, focus and ignore, all on one record. Mark them from the list, or from the game's own right-click menu anywhere it shows a name.
+- **Profile** — a full card for any player: their **Lodestone** face and character page (Free Company, race, jobs by role, Eureka/Bozja/Occult Crescent progress), your notes and colour, and what they've done to you — all in one window.
 - **Search** that means something — `note:griefer`, `world:sarg`, `job:whm`, `!bob`. No wait, no mode dropdown.
 - **Filters** — max distance, hide self/party/friends/dead/AFK.
 - **Highlighting** for friends, party, watchers and your own FC, all recolourable.
@@ -120,6 +121,19 @@ The game exposes two identifiers that would survive renames. Hrothgar reads **ne
 
 **Content IDs** — per-character, and *not* banned. Hrothgar still doesn't store one. A stable, cross-name handle on a stranger is what turns a notes file into a dossier. Name+world does everything a notes file needs, so we'd rather lose renames.
 
+## 🪪 Profile
+
+Right-click a player → **Profile** — from the list, or from the game's own menu anywhere a name shows, so it works on people the scanner never saw. Three tabs:
+
+- **Info** — who they are. Their **Lodestone** face and character page: Free Company, race, title, Grand Company, their public **comment**, and the city they started in. Then a **Scent** heading with what Hrothgar has seen — whether they've targeted you this session, and when you last crossed paths.
+- **Jobs** — every class and level, grouped by role, with the game's own job icons. Then **Field Operations / Occult Crescent**: Elemental Level (Eureka), Resistance Rank (Bozja), Knowledge Level, and the Phantom Jobs.
+- **Notes** — the one thing you write. Your note, and the button to forget them.
+
+Focus, Ignore and a colour sit above the tabs, beside Target · Examine · Link in chat · **Open on Lodestone**.
+
+> [!NOTE]
+> The Lodestone details are the **only** thing HrothgarScent fetches over the network, and only when you open a profile — never in the background, never for a list. It reads the player's own public page, the same one the **Search on Lodestone** button opens in your browser. It goes silent in PvP like everything else, and nothing it fetches is written to disk. There's a switch to load full profiles automatically, off by default.
+
 ## 🛡️ PvP
 
 The window, the info bar entry, the commands and the game-menu **Scent** entry all **hide and refuse in PvP**, and the scanner stops collecting entirely. This is not configurable — it's a competitive-integrity requirement and a condition of Dalamud plugin acceptance.
@@ -152,6 +166,7 @@ The config window (`/hscent config`) has a left icon rail: **General**, **Filter
 | Use job abbreviations | On | `WAR` instead of `Warrior`. |
 | Show job icons | On | The game's own job icon beside each job name. |
 | Show the eye over their head | **Off** | Colours the nameplate of anyone targeting you. Cosmetic only, and never in PvP. |
+| Also colour players you focused | Off | Paints a focused player's nameplate in the colour you gave them. Someone targeting you always wins; ignored players are never painted. |
 | Show server info bar entry | On | Adds the nearby/watcher count to the server info bar. The count turns red when someone is actually fixated on you, rather than just glancing, and a marker appears when someone you've marked is nearby. Hover it for the details. |
 | Rescan interval | 250 ms | How often Hrothgar sniffs. Lower is snappier and costs more CPU; below ~100 ms buys nothing. Floored at 50 ms. Double-click the slider to type an exact value. |
 
@@ -217,7 +232,9 @@ The config window (`/hscent config`) has a left icon rail: **General**, **Filter
 
 ### Right-click a row
 
-Target · Focus Target · Examine · Adventurer Plate · Link in chat · Copy name · Search on Lodestone · Focus / Unfocus · Ignore this player · **Remember this player…**
+Target · Focus Target · Examine · Adventurer Plate · Link in chat · Copy name · Search on Lodestone · Focus / Unfocus · **Quiet alerts this session** · Ignore this player · **Profile**
+
+**Quiet alerts this session** is the gentle sibling of Ignore: it stops the pings about one player without hiding them from the list or writing anything down, and it's forgotten at logout. Ignore is the permanent one — never shown or announced again.
 
 > [!NOTE]
 > There's no "Send Tell" button, on purpose. Dalamud exposes no supported way for a plugin to send chat or set a tell target, and faking it with an unsupported hook is how plugins get people banned. **Link in chat** posts the game's own clickable player link instead — click it and you get the game's real menu, Tell included.
