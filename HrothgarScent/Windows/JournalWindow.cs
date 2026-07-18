@@ -47,14 +47,24 @@ public sealed class JournalWindow : Window
   /// concrete "filter for the recorded-nearby": All shows both, Remembered shows marked, this shows seen-only.</summary>
   private bool _unmarkedOnly;
 
+  /// <summary>The active filter selections, ONE SET PER FACET. A row must satisfy every facet that has a selection
+  /// (AND across race/world/tags) while matching ANY selection within a facet (OR within) — the faceted-filter
+  /// shape. They are separate sets, not one bag of strings, for two reasons the old single set got wrong: a bag
+  /// cannot tell a race chip from a same-named world or tag chip apart, and it can only ever OR, so adding a second
+  /// facet widened the list instead of narrowing it.</summary>
+  private readonly HashSet<string> _activeRaces = new(StringComparer.OrdinalIgnoreCase);
+  private readonly HashSet<string> _activeWorlds = new(StringComparer.OrdinalIgnoreCase);
   private readonly HashSet<string> _activeTags = new(StringComparer.OrdinalIgnoreCase);
+
   private string _tagInput = string.Empty;
 
   /// <summary>The cached, filtered, sorted rows and the signature that produced them. Rebuilt only when a term of
   /// that signature moves — the same staleness discipline ScentWindow.RebuildViewIfStale uses, and the reason the
   /// All tab can hold a large nearby log without rebuilding it sixty times a second.</summary>
   private List<Row> _rows = [];
-  private List<string> _filterChips = [];
+  private List<string> _raceChips = [];
+  private List<string> _worldChips = [];
+  private List<string> _tagChips = [];
   private int _rowsSignature;
 
   /// <summary>A unified journal row over EITHER a mark or a seen entry, so the table draws one shape.</summary>
@@ -170,39 +180,58 @@ public sealed class JournalWindow : Window
   {
     // The seen revision is folded in on BOTH tabs, not just All: the Remembered tab supplements a mark's
     // last-seen from the seen log (see FromMark), so it too goes stale if the log moves and this does not notice.
-    var tagHash = _activeTags.Aggregate(17, (h, t) => h ^ StringComparer.OrdinalIgnoreCase.GetHashCode(t));
+    // Every facet's active set folds into the signature — leaving one out would make selecting a chip in that
+    // facet appear to do nothing until some OTHER input moved, the exact lag Configuration.FilterSignature warns of.
+    var filterHash = HashCode.Combine(
+      SetHash(_activeRaces), SetHash(_activeWorlds), SetHash(_activeTags),
+      _activeRaces.Count, _activeWorlds.Count, _activeTags.Count);
     var signature = HashCode.Combine(
       HashCode.Combine(all, Plugin.Marks.Index.Revision, Plugin.SeenLog.Index.Revision),
-      HashCode.Combine(_search, (int)_sort, _unmarkedOnly && all, tagHash, _activeTags.Count));
+      HashCode.Combine(_search, (int)_sort, _unmarkedOnly && all, filterHash));
 
     if (signature == _rowsSignature)
       return;
 
     _rowsSignature = signature;
     var built = BuildRows(all);
-    _filterChips = GatherFilterChips(built);
+    GatherFilterChips(built);
     _rows = Filter(built, all);
 
-    // Drop any active filter that no longer exists (its last holder was forgotten, retagged, or the tab changed),
-    // so the filter cannot silently hide everyone on a chip nothing carries.
-    _activeTags.RemoveWhere(t => !_filterChips.Contains(t, StringComparer.OrdinalIgnoreCase));
+    // Drop any active selection whose chip no longer exists (its last holder was forgotten, retagged, or the tab
+    // changed), so a facet cannot silently hide everyone on a value nothing carries.
+    _activeRaces.RemoveWhere(r => !_raceChips.Contains(r, StringComparer.OrdinalIgnoreCase));
+    _activeWorlds.RemoveWhere(w => !_worldChips.Contains(w, StringComparer.OrdinalIgnoreCase));
+    _activeTags.RemoveWhere(t => !_tagChips.Contains(t, StringComparer.OrdinalIgnoreCase));
   }
 
-  /// <summary>Every value that can filter the list — real tags plus the auto tags (race, world) — distinct and
-  /// sorted, cached with the rows so the chip row is not recomputed per frame.</summary>
-  private static List<string> GatherFilterChips(List<Row> rows)
+  /// <summary>Distinct, sorted chip values for EACH facet — race, world, and the real tags — cached with the rows
+  /// so the filter rows are not recomputed per frame. Kept apart (not one merged list) because each facet is its
+  /// own row and its own active set; see <see cref="_activeRaces"/>.</summary>
+  private void GatherFilterChips(List<Row> rows)
   {
-    var set = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+    var races = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+    var worlds = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+    var tags = new SortedSet<string>(StringComparer.OrdinalIgnoreCase);
+
     foreach (var row in rows)
     {
+      if (row.Race.Length > 0)
+        races.Add(row.Race);
+      if (row.HomeWorldName.Length > 0)
+        worlds.Add(row.HomeWorldName);
       foreach (var tag in row.Tags)
-        set.Add(tag);
-      foreach (var auto in row.AutoTags)
-        set.Add(auto);
+        tags.Add(tag);
     }
 
-    return [.. set];
+    _raceChips = [.. races];
+    _worldChips = [.. worlds];
+    _tagChips = [.. tags];
   }
+
+  /// <summary>Order-independent hash of a facet's active set for the rebuild signature — XOR, because the set's
+  /// enumeration order is not promised and must not change the signature.</summary>
+  private static int SetHash(HashSet<string> set)
+    => set.Aggregate(17, (h, t) => h ^ StringComparer.OrdinalIgnoreCase.GetHashCode(t));
 
   /// <summary>Marks, plus (on the All tab) the seen log beneath them — a marked player who was also seen appears
   /// once, the mark overwriting the seen row.</summary>
@@ -242,7 +271,7 @@ public sealed class JournalWindow : Window
     var term = _search.Trim();
     var query = rows.Where(r =>
       (!(_unmarkedOnly && all) || !r.Marked)
-      && MatchesTags(r)
+      && MatchesFilters(r)
       && MatchesSearch(r, term));
 
     query = _sort switch
@@ -255,10 +284,14 @@ public sealed class JournalWindow : Window
     return [.. query];
   }
 
-  // Real tags AND the auto tags (race, world) both satisfy a filter chip, so clicking a race or world chip
-  // narrows to it just like a real tag.
-  private bool MatchesTags(Row row)
-    => _activeTags.Count == 0 || row.Tags.Any(_activeTags.Contains) || row.AutoTags.Any(_activeTags.Contains);
+  // Faceted: a row must satisfy EVERY facet that has a selection (AND across race/world/tags) while matching ANY
+  // selection within a facet (OR within). So Hrothgar + Elezen widens to either race, but then adding a world
+  // narrows to those races ON that world — a filter that gets stricter as you add to it, which the old
+  // everything-in-one-OR-bag could not do. A facet with no selection is a pass, so an empty filter shows all.
+  private bool MatchesFilters(Row row)
+    => (_activeRaces.Count == 0 || (row.Race.Length > 0 && _activeRaces.Contains(row.Race)))
+    && (_activeWorlds.Count == 0 || (row.HomeWorldName.Length > 0 && _activeWorlds.Contains(row.HomeWorldName)))
+    && (_activeTags.Count == 0 || row.Tags.Any(_activeTags.Contains));
 
   private static bool MatchesSearch(Row row, string term)
     => term.Length == 0
@@ -290,7 +323,7 @@ public sealed class JournalWindow : Window
     if (all)
       DrawSeenControls(scale);
 
-    DrawTagFilter(scale);
+    DrawFilters(scale);
 
     ImGui.Dummy(new Vector2(0, 2f * scale));
   }
@@ -337,51 +370,86 @@ public sealed class JournalWindow : Window
   }
 
   /// <summary>
-  /// The filter chips — real tags AND the auto tags (race, world) — each toggling a filter. Wrapped, because
-  /// "record everyone" means the world set alone can run to dozens; a non-wrapping row would run them off the
-  /// edge where they cannot be clicked. Absent entirely when there is nothing to filter by.
+  /// The filter facets — Race, World and Tags — each on its OWN labelled row of toggle chips, so a big recorded
+  /// log reads as three tidy lists instead of one wall of mixed chips. A facet with no values is dropped; chips
+  /// wrap within the window and wrapped lines indent to the label column so the rows line up. Selecting chips
+  /// narrows the table (see <see cref="MatchesFilters"/>); the trailing button clears every facet at once.
   /// </summary>
-  private void DrawTagFilter(float scale)
+  private void DrawFilters(float scale)
   {
-    if (_filterChips.Count == 0)
+    if (_raceChips.Count == 0 && _worldChips.Count == 0 && _tagChips.Count == 0)
       return;
 
-    ImGui.Dummy(new Vector2(0, 2f * scale));
-    ImGui.AlignTextToFramePadding();
-    UiTheme.TextWrappedColored(UiTheme.Muted, "Filter:");
-
-    var windowRight = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMax().X;
     var gap = 4f * scale;
 
-    for (var i = 0; i < _filterChips.Count; i++)
+    // One label column wide enough for the widest of the three, so every row's chips begin at the same x.
+    var labelWidth = ImGui.CalcTextSize("World:").X + 10f * scale;
+
+    ImGui.Dummy(new Vector2(0, 2f * scale));
+
+    DrawChipRow("Race:", _raceChips, _activeRaces, "race", labelWidth, gap);
+    DrawChipRow("World:", _worldChips, _activeWorlds, "world", labelWidth, gap);
+    DrawChipRow("Tags:", _tagChips, _activeTags, "tag", labelWidth, gap);
+
+    if (_activeRaces.Count > 0 || _activeWorlds.Count > 0 || _activeTags.Count > 0)
     {
-      // The first chip rides the label's line; the rest are placed by the fit test at the end of the previous
-      // iteration, so nothing here starts a line — that is the wrap.
-      if (i == 0)
-        ImGui.SameLine(0, gap);
-
-      DrawFilterChip(_filterChips[i]);
-
-      if (NextFitsOnLine(i + 1 < _filterChips.Count ? _filterChips[i + 1] : "Clear", windowRight, gap))
-        ImGui.SameLine(0, gap);
+      ImGui.Dummy(new Vector2(0, 1f * scale));
+      if (ImGui.SmallButton("Clear filters##clearFilters"))
+      {
+        _activeRaces.Clear();
+        _activeWorlds.Clear();
+        _activeTags.Clear();
+      }
     }
-
-    if (_activeTags.Count > 0 && ImGui.SmallButton("Clear##clearTags"))
-      _activeTags.Clear();
   }
 
-  /// <summary>One filter chip — filled when active. Clicking toggles it in the active set.</summary>
-  private void DrawFilterChip(string label)
+  /// <summary>One facet's row: a fixed-width muted label, then its chips wrapping within the window with wrapped
+  /// lines indented to the label column so the rows align. <paramref name="idScope"/> keeps the chip IDs unique
+  /// across facets, so a world and a tag that happen to share a name do not collide into one shared button.</summary>
+  private void DrawChipRow(string label, List<string> chips, HashSet<string> active, string idScope,
+    float labelWidth, float gap)
   {
-    var active = _activeTags.Contains(label);
-    ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(UiTheme.AccentPurple.X, UiTheme.AccentPurple.Y,
-      UiTheme.AccentPurple.Z, active ? 0.55f : 0.14f));
-    ImGui.PushStyleColor(ImGuiCol.Text, active ? new Vector4(1f, 1f, 1f, 1f) : UiTheme.Muted);
+    if (chips.Count == 0)
+      return;
 
-    if (ImGui.SmallButton($"{label}##filter{label}"))
+    var chipX = ImGui.GetCursorPosX() + labelWidth;
+    var windowRight = ImGui.GetWindowPos().X + ImGui.GetWindowContentRegionMax().X;
+
+    ImGui.AlignTextToFramePadding();
+    ImGui.TextColored(UiTheme.Muted, label);
+    ImGui.SameLine(0, 0);
+    ImGui.SetCursorPosX(chipX);
+
+    for (var i = 0; i < chips.Count; i++)
     {
-      if (!_activeTags.Add(label))
-        _activeTags.Remove(label);
+      DrawFilterChip(chips[i], active, idScope);
+
+      if (i + 1 >= chips.Count)
+        break;
+
+      // Ride the same line while the next chip still fits; otherwise drop to a new line and indent it to the chip
+      // column. The cursor has already advanced to the next line by not calling SameLine, so this only sets the x.
+      if (NextFitsOnLine(chips[i + 1], windowRight, gap))
+        ImGui.SameLine(0, gap);
+      else
+        ImGui.SetCursorPosX(chipX);
+    }
+  }
+
+  /// <summary>One filter chip — filled when active. Clicking toggles it in that facet's active set.</summary>
+  private void DrawFilterChip(string label, HashSet<string> active, string idScope)
+  {
+    var isActive = active.Contains(label);
+    ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(UiTheme.AccentPurple.X, UiTheme.AccentPurple.Y,
+      UiTheme.AccentPurple.Z, isActive ? 0.55f : 0.14f));
+    ImGui.PushStyleColor(ImGuiCol.Text, isActive ? new Vector4(1f, 1f, 1f, 1f) : UiTheme.Muted);
+
+    // The visible label is just the value; the ID carries the facet scope so equal names in different facets stay
+    // distinct buttons (##scope-value), and equal names never appear within one facet (the chips are a set).
+    if (ImGui.SmallButton($"{label}##{idScope}-{label}"))
+    {
+      if (!active.Add(label))
+        active.Remove(label);
     }
 
     ImGui.PopStyleColor(2);
