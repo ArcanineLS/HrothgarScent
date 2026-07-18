@@ -586,13 +586,26 @@ public sealed class ProfileWindow : Window
     switch (profile.State)
     {
       case ProfileFetchState.Idle:
-        // The one deliberate fetch. Never on Open, never on a timer, never for a list (spec 4-E).
+        // Auto-load, when the user opted into the extra request. Fired from HERE rather than Open() for two
+        // reasons: RequestProfile refuses until the face is Ready, which Open() cannot wait for; and firing from
+        // the tab's own draw means a profile only ever opened to the Notes tab spends no request on a page the
+        // user never looked at. Single-flight makes the per-frame call safe — it launches once, then the state
+        // is Looking and this branch is not reached again.
+        if (Plugin.Configuration.AutoLoadLodestoneProfile)
+        {
+          Plugin.Lodestone.RequestProfile(key, _worldName);
+          UiTheme.TextWrappedColored(UiTheme.Muted, "Loading their profile…");
+          return null;
+        }
+
+        // The one deliberate fetch, when auto-load is off. Never on a timer, never for a list (spec 4-E).
         if (ImGui.Button("Load their full profile"))
           Plugin.Lodestone.RequestProfile(key, _worldName);
         UiTheme.Tooltip("Fetches their public character page: Free Company, race, title, Grand Company and every "
           + "job's level. None of this is in the game client.");
         UiTheme.TextWrappedColored(UiTheme.Muted,
-          "One more request to Square Enix. There is no API here, so this stays a click, not automatic.");
+          "One more request to Square Enix. There is no API here, so this stays a click unless you turn on "
+          + "automatic loading in settings.");
         return null;
 
       case ProfileFetchState.Looking:

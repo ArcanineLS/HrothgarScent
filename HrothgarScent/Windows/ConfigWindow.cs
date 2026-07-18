@@ -453,6 +453,36 @@ public sealed class ConfigWindow : Window
   {
     UiTheme.SectionHeader("Lodestone", FontAwesomeIcon.Globe);
 
+    // The one network switch in the plugin, and until now it had no toggle at all — only a JSON field. It
+    // governs whether a profile may reach the Lodestone for the face and the character page; off, the profile
+    // draws the job icon instead and fetches nothing.
+    var portraits = Plugin.Configuration.ShowLodestonePortraits;
+    if (ImGui.Checkbox("Show portraits and profiles", ref portraits))
+    {
+      Plugin.Configuration.ShowLodestonePortraits = portraits;
+      Plugin.Configuration.Save();
+    }
+    UiTheme.Tooltip("Lets a profile fetch that player's public Lodestone page — their face, and (on Load) their "
+      + "Free Company, race, title and jobs. This is the only thing here that touches a network. Off, the "
+      + "profile shows their job icon and nothing leaves your machine.");
+
+    // Subordinate, and disabled rather than hidden when the master is off — an option that vanished would leave
+    // no trace of why. Indented to read as belonging to the switch above.
+    using (ImRaii.Disabled(!portraits))
+    {
+      ImGui.Indent();
+      ConfigCheckbox("Load full profiles automatically",
+        () => Plugin.Configuration.AutoLoadLodestoneProfile,
+        v => Plugin.Configuration.AutoLoadLodestoneProfile = v,
+        "Loads the full character page the moment you open a profile, instead of waiting for the Load button.\r\n\r\n"
+        + "Costs one extra request to Square Enix per profile opened. The Lodestone has no API and rate-limits "
+        + "scraping, and being throttled takes the face down too — so this is off by default, for the many "
+        + "profiles you open just to jot a note.");
+      ImGui.Unindent();
+    }
+
+    ImGui.Dummy(new Vector2(0, 4f * ImGuiHelpers.GlobalScale));
+
     ImGui.AlignTextToFramePadding();
     ImGui.Text("Region:");
     ImGui.SameLine();
@@ -463,8 +493,8 @@ public sealed class ConfigWindow : Window
       Plugin.Configuration.LodestoneRegion = Enum.Parse<LodestoneRegion>(_lodestoneRegionStrings[index]);
       Plugin.Configuration.Save();
     }
-    UiTheme.Tooltip("Which Lodestone the 'Search on Lodestone' row action opens. They all hold the same " +
-            "characters; this only picks the language.");
+    UiTheme.Tooltip("Which regional Lodestone the profile reads and the 'Search on Lodestone' action opens. " +
+            "They all hold the same characters; this only picks the language.");
   }
 
   // ---- Filters ----

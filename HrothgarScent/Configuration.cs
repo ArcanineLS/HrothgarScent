@@ -644,6 +644,21 @@ public sealed class Configuration : IPluginConfiguration
   public bool ShowLodestonePortraits { get; set; } = true;
 
   /// <summary>
+  /// Whether opening a profile also loads the full character page, without waiting for a click.
+  ///
+  /// OFF by default, and that default is the whole reason it is a setting. Opening a profile ALREADY fires one
+  /// Lodestone request — the face lookup — automatically. This adds a second per open, and the Lodestone has no
+  /// API and rate-limits scraping: trip the limit and the face stops loading too, so over-fetching does not
+  /// degrade gracefully, it goes dark. The click keeps the expensive full page opt-in for the many opens that
+  /// are a quick glance to jot a note. On, for the user who opens few profiles and wants them complete.
+  ///
+  /// SUBORDINATE to <see cref="ShowLodestonePortraits"/>: that switch answers "may this plugin reach the
+  /// Lodestone at all", and nothing is fetched while it is off. Also naturally conservative even when on — the
+  /// fetch fires from the Info/Jobs tab's own draw, so a profile only ever opened to Notes spends no request.
+  /// </summary>
+  public bool AutoLoadLodestoneProfile { get; set; } = false;
+
+  /// <summary>
   /// Hash of every option the view is filtered or sorted by. ScentWindow rebuilds its cached view when this
   /// changes, so a filter toggle applies on the next frame instead of whenever the next rescan happens to
   /// land.
