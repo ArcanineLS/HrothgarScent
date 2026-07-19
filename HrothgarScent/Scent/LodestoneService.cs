@@ -245,6 +245,49 @@ public sealed class LodestoneService : IDisposable
   };
 
   /// <summary>
+  /// Caps how many Lodestone requests are in flight AT ONCE, across every player and all three fetch paths.
+  ///
+  /// Opening one profile can burst up to ~7 requests — the face search and its image, the character page and its
+  /// three FC-crest layers, and the class_job sub-page — and clicking through several profiles in a row would
+  /// otherwise fire them all at once and trip the Lodestone's own rate limiter, which comes back as
+  /// <see cref="ProfileFetchState.Failed"/> for everyone. Two at a time paces the burst without fixed delays: the
+  /// requests queue on the semaphore and drain in order, and the ten-second <see cref="Http"/> timeout only starts
+  /// once a request is actually let through, so waiting in the queue never counts as a timeout. Static, so the cap
+  /// is plugin-wide.
+  /// </summary>
+  private static readonly SemaphoreSlim RequestGate = new(2, 2);
+
+  /// <summary>A GET-string through <see cref="RequestGate"/> — the paced door every network read here goes through
+  /// instead of calling <see cref="Http"/> directly.</summary>
+  private static async Task<string> GetStringPaced(string url)
+  {
+    await RequestGate.WaitAsync().ConfigureAwait(false);
+    try
+    {
+      return await Http.GetStringAsync(url).ConfigureAwait(false);
+    }
+    finally
+    {
+      RequestGate.Release();
+    }
+  }
+
+  /// <summary>A GET-bytes through <see cref="RequestGate"/>. The texture upload that usually follows is NOT gated —
+  /// only the network read is — so a slow upload never holds a request slot.</summary>
+  private static async Task<byte[]> GetBytesPaced(string url)
+  {
+    await RequestGate.WaitAsync().ConfigureAwait(false);
+    try
+    {
+      return await Http.GetByteArrayAsync(url).ConfigureAwait(false);
+    }
+    finally
+    {
+      RequestGate.Release();
+    }
+  }
+
+  /// <summary>
   /// A real result anchor, and the ONLY thing here that may be treated as a search hit.
   ///
   /// The class="entry__link" href is what separates a result from the sidebar the Lodestone renders on a
@@ -487,7 +530,7 @@ public sealed class LodestoneService : IDisposable
       var url = $"https://{Region()}.finalfantasyxiv.com/lodestone/character/"
               + $"?q={Uri.EscapeDataString(key.Name)}&worldname={Uri.EscapeDataString(worldName)}";
 
-      var html = await Http.GetStringAsync(url).ConfigureAwait(false);
+      var html = await GetStringPaced(url).ConfigureAwait(false);
 
       if (Match(html, key, worldName) is not { } hit)
       {
@@ -495,7 +538,7 @@ public sealed class LodestoneService : IDisposable
         return;
       }
 
-      var bytes = await Http.GetByteArrayAsync(hit.Face).ConfigureAwait(false);
+      var bytes = await GetBytesPaced(hit.Face).ConfigureAwait(false);
 
       // Dalamud owns the upload; this just hands it bytes. Not marshalled to the framework thread because
       // CreateFromImageAsync is explicitly the async, any-thread door.
@@ -648,7 +691,7 @@ public sealed class LodestoneService : IDisposable
 
       // UTF-8 explicitly, NOT GetStringAsync: a charset guess turns the ♀/♂ glyph into silent mojibake, and the
       // glyph is the only source of the character's gender.
-      var bytes = await Http.GetByteArrayAsync(url).ConfigureAwait(false);
+      var bytes = await GetBytesPaced(url).ConfigureAwait(false);
       var html = Encoding.UTF8.GetString(bytes);
 
       if (ParseProfile(html, key, worldName) is not { } profile)
@@ -698,7 +741,7 @@ public sealed class LodestoneService : IDisposable
     {
       foreach (var url in urls)
       {
-        var bytes = await Http.GetByteArrayAsync(url).ConfigureAwait(false);
+        var bytes = await GetBytesPaced(url).ConfigureAwait(false);
         wraps.Add(await Plugin.Textures.CreateFromImageAsync(bytes).ConfigureAwait(false));
       }
 
@@ -1006,7 +1049,7 @@ public sealed class LodestoneService : IDisposable
 
       // UTF-8 explicitly, matching FetchProfile: a charset guess is not worth the risk on a page read for exact
       // labels and numbers.
-      var bytes = await Http.GetByteArrayAsync(url).ConfigureAwait(false);
+      var bytes = await GetBytesPaced(url).ConfigureAwait(false);
       var html = Encoding.UTF8.GetString(bytes);
 
       if (ParseFieldOps(html, key, worldName) is not { } progress)
