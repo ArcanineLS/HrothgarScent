@@ -6,6 +6,7 @@ using System.Threading;
 using Dalamud.Game.ClientState.Objects.Enums;
 using Dalamud.Game.ClientState.Objects.SubKinds;
 using Dalamud.Plugin.Services;
+using Lumina.Excel;
 using Lumina.Excel.Sheets;
 
 namespace HrothgarScent.Scent;
@@ -242,18 +243,21 @@ public sealed class ScentScanner : IDisposable
                 && tag == myFc
                 && pc.HomeWorld.RowId == myWorld;
 
-      // ValueNullable, never .Value: .Value throws on a row that has not loaded, and a missing job name is
-      // not worth taking the whole scan down for.
+      // World and job display text off the id caches rather than a per-player ExtractText() (a fresh string
+      // allocation) every scan — see WorldName/JobStrings. ValueNullable inside them, never .Value: .Value throws
+      // on a row that has not loaded, and a missing job name is not worth taking the whole scan down for.
+      var (jobName, jobAbbreviation) = JobStrings(pc.ClassJob);
+
       rows.Add(new ScentRow(
         GameObjectId: pc.GameObjectId,
         EntityId: pc.EntityId,
         ObjectIndex: pc.ObjectIndex,
         Name: pc.Name.TextValue,
         HomeWorldId: pc.HomeWorld.RowId,
-        HomeWorldName: pc.HomeWorld.ValueNullable?.Name.ExtractText() ?? string.Empty,
+        HomeWorldName: WorldName(pc.HomeWorld),
         JobId: pc.ClassJob.RowId,
-        JobAbbreviation: pc.ClassJob.ValueNullable?.Abbreviation.ExtractText() ?? "???",
-        JobName: pc.ClassJob.ValueNullable?.Name.ExtractText() ?? "Unknown",
+        JobAbbreviation: jobAbbreviation,
+        JobName: jobName,
         Level: pc.Level,
         RaceId: raceId,
         RaceName: RacePalette.NameOf(raceId, sex),
@@ -411,6 +415,12 @@ public sealed class ScentScanner : IDisposable
       // remembered — the property that keeps a mark edit from reading as an arrival.
       _lastNearbyTick[row.Key] = nowTicks;
     }
+
+    // One publish for the whole scan's proximity records. RecordSeen only mutated the log above; committing here
+    // rebuilds the published index (and evicts, under a cap) ONCE rather than once per recorded player — the
+    // difference between O(players × entries) and O(entries) on a zone-in. A no-op when nothing was recorded.
+    if (wantNearbyLog)
+      Plugin.SeenLog.CommitScan();
 
     _log.Sync(rows, current);
 
@@ -650,6 +660,50 @@ public sealed class ScentScanner : IDisposable
   /// </summary>
   private static byte ReadCustomize(ReadOnlySpan<byte> customize, CustomizeIndex index)
     => (int)index < customize.Length ? customize[(int)index] : (byte)0;
+
+  /// <summary>Extracted world/job display text keyed by row id. Framework-thread only, like the rest of the scan —
+  /// no lock. Bounded to the game's small set of worlds (~100) and jobs (~40), so it never grows meaningfully.</summary>
+  private readonly Dictionary<uint, string> _worldNameCache = [];
+  private readonly Dictionary<uint, (string Name, string Abbreviation)> _jobCache = [];
+
+  /// <summary>
+  /// A world's display name, cached by its row id.
+  ///
+  /// World and job names are stable game data drawn from a tiny set of ids — a world's name never changes — but a
+  /// live row's <c>SeString.ExtractText()</c> ALLOCATES a fresh string on every call. Reading it straight off
+  /// every player every scan therefore churned a string per player per scan (hundreds a second in a crowd) for a
+  /// value that never moves. Extract once per distinct id, then hand back the cached string. A row that has not
+  /// loaded yet returns "" and is NOT cached, so it resolves on a later scan rather than being pinned blank.
+  /// </summary>
+  private string WorldName(RowRef<World> world)
+  {
+    var id = world.RowId;
+    if (_worldNameCache.TryGetValue(id, out var name))
+      return name;
+
+    name = world.ValueNullable?.Name.ExtractText() ?? string.Empty;
+    if (name.Length > 0)
+      _worldNameCache[id] = name;
+
+    return name;
+  }
+
+  /// <summary>A job's name and abbreviation, cached by its row id — the same stable-data, allocation-per-call
+  /// reasoning as <see cref="WorldName"/>, for the two strings the row carries. An unresolved row returns the same
+  /// ("Unknown", "???") fallback the inline read used, and is not cached so it resolves on a later scan.</summary>
+  private (string Name, string Abbreviation) JobStrings(RowRef<ClassJob> job)
+  {
+    var id = job.RowId;
+    if (_jobCache.TryGetValue(id, out var cached))
+      return cached;
+
+    if (job.ValueNullable is not { } row)
+      return ("Unknown", "???");
+
+    var pair = (row.Name.ExtractText(), row.Abbreviation.ExtractText());
+    _jobCache[id] = pair;
+    return pair;
+  }
 
   /// <summary>
   /// Publishes the empty snapshot and forgets who was watching, for the states where nearby players are

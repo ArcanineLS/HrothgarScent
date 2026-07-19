@@ -67,6 +67,11 @@ public sealed class SeenLog
   private SeenIndex _index = SeenIndex.Empty;
   private int _revision;
 
+  /// <summary>Set by <see cref="RecordSeen"/> when it mutated the log, cleared by <see cref="CommitScan"/> which
+  /// does the one publish/evict/flush per scan. Guarded by <see cref="_gate"/>. See CommitScan for why the publish
+  /// is batched rather than done per recorded player.</summary>
+  private bool _pendingPublish;
+
   /// <summary>Same debounce and reasoning as <see cref="MarkStore.FlushDebounceMs"/>: proximity writes come in
   /// bursts as a crowd loads, and coalescing them keeps this off the hot path.</summary>
   private const int FlushDebounceMs = 2000;
@@ -135,6 +140,9 @@ public sealed class SeenLog
   /// is one lock-free probe of the published index and a couple of compares, exactly like
   /// <see cref="MarkStore.RecordSeen"/>. UNLIKE that one, it DOES create a record: creating the record is the
   /// whole point here, which is why it is behind an off-by-default switch and a hard cap.
+  ///
+  /// Only MUTATES; it does not publish, evict or flush — <see cref="CommitScan"/> does those once, after the
+  /// scanner's per-player loop. That batching is what keeps a zone-in cheap: see CommitScan.
   /// </summary>
   public void RecordSeen(WatcherKey key, string worldName, string race, string zoneName, DateTimeOffset now)
   {
@@ -170,6 +178,30 @@ public sealed class SeenLog
         _entries[key] = new SeenPlayer(key.Name, key.HomeWorldId, worldName, now, now, zoneName, 1, race);
       }
 
+      _pendingPublish = true;
+    }
+  }
+
+  /// <summary>
+  /// Publishes, evicts and schedules a flush for everything <see cref="RecordSeen"/> accumulated this scan — ONCE.
+  /// FRAMEWORK THREAD; the scanner calls it after its per-player record loop.
+  ///
+  /// WHY THE BATCH. RecordSeen used to publish and evict per player, and on a zone-in EVERY nearby player is a
+  /// create-or-zone-touch — so a crowd of N players each triggered a whole-dictionary rebuild (the
+  /// <see cref="Publish"/> ToFrozenDictionary, O(entries)) and, under a positive cap, an O(entries log entries)
+  /// eviction sort. That made one framework-thread scan O(players × entries) and grew without bound as the
+  /// UNLIMITED log did, hitching the frame you zoned into a crowd. Doing it once per scan is O(entries) total, and
+  /// it also collapses the journal's rebuild (keyed on the published revision) from once-per-player to once-per-scan.
+  /// A no-op when nothing was recorded, so calling it every scan is free.
+  /// </summary>
+  public void CommitScan()
+  {
+    lock (_gate)
+    {
+      if (!_pendingPublish)
+        return;
+
+      _pendingPublish = false;
       EvictToCap();
       Publish();
     }
